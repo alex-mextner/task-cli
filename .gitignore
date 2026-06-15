@@ -13,3 +13,6 @@ dist/
 # uv writes a lockfile when run via `uv run`; the dev/CI path is pip, so the lock is a
 # local artifact — never commit it.
 uv.lock
+
+# Per-machine Claude Code harness overrides (shared settings.json IS committed).
+.claude/settings.local.json
