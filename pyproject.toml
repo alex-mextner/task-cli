@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "task-cli"
+version = "0.1.0"
+description = "task — the enforced ticket interface: every request becomes a well-formed ticket (GitHub Issues / Linear), with quality enforced by the tool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+# pyyaml is the only hard runtime dep (task.yaml parse). It is imported lazily so
+# `task --help` runs even if it is missing; the tool degrades to built-in defaults.
+# tomllib (Linear credentials) is stdlib on 3.11+. The HTTP backends use stdlib urllib.
+dependencies = ["pyyaml"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+task = "tasklib.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/task-cli"
+
+# Explicit package list (NOT setuptools flat-layout autodiscovery, which would silently
+# pull stray top-level dirs into the wheel). backends/ is a SUBpackage of tasklib.
+[tool.setuptools.packages.find]
+include = ["tasklib*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
