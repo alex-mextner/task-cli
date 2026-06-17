@@ -66,6 +66,33 @@ def test_default_backend_applies_when_entry_omits_it():
     assert projs[0].backend == "linear"
 
 
+def test_github_shorthand_survives_linear_merged_default():
+    # Inside a Linear-backed repo the merged top-level backend is `linear`. A global GitHub
+    # shorthand entry must still be read as GitHub (inferred from its `repo` shape), NOT
+    # reinterpreted as a teamless Linear entry and dropped from `task list --all`.
+    projs = projects_from_config(
+        {"backend": "linear", "projects": [{"repo": "acme/web"}, {"team": "HYP"}]}
+    )
+    by_coord = {p.coordinate for p in projs}
+    assert by_coord == {"github-issues:acme/web", "linear:HYP"}
+    gh = next(p for p in projs if p.backend == "github-issues")
+    assert gh.overlay == {"backend": "github-issues", "github": {"repo": "acme/web"}}
+
+
+def test_linear_shorthand_survives_github_merged_default():
+    # The mirror case: a Linear team shorthand inside a GitHub-default cascade stays Linear.
+    projs = projects_from_config(
+        {"backend": "github-issues", "projects": [{"team": "HYP"}, {"repo": "acme/web"}]}
+    )
+    assert {p.coordinate for p in projs} == {"linear:HYP", "github-issues:acme/web"}
+
+
+def test_explicit_entry_backend_still_wins_over_shape():
+    # An explicit per-entry `backend` overrides shape inference (a teamless linear entry is
+    # then correctly rejected, not silently treated as GitHub).
+    assert projects_from_config({"projects": [{"backend": "linear", "repo": "acme/web"}]}) == []
+
+
 def test_duplicate_coordinates_deduped():
     projs = projects_from_config(
         {"projects": [{"repo": "acme/x"}, {"repo": "acme/x"}, {"repo": "acme/y"}]}

@@ -104,6 +104,26 @@ def test_list_in_repo_with_broken_remote_surfaces_error_not_outside_repo(capsys,
     assert "remote" in out.lower() or "github" in out.lower()
 
 
+def test_list_in_repo_linear_missing_team_surfaces_config_error_not_outside_repo(capsys, tmp_path):
+    # INSIDE a git repo whose task.yaml selects `backend: linear` but omits `linear.team`: this
+    # is a real, actionable in-repo misconfiguration. It must surface the backend's "requires a
+    # team key" error (exit 2), NOT be demoted to the "outside a repo" / "no projects" path.
+    # Regression for the codex P2 (a teamless in-repo linear backend masked as outside-a-repo).
+    import subprocess
+
+    repo = tmp_path / "lin"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "task.yaml").write_text("version: 1\nbackend: linear\n", encoding="utf-8")
+    rc = main(["list", "-C", str(repo)])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no projects to list" not in out
+    assert "outside a git repo" not in out
+    # the actionable backend error, anchored so a reworded message can't pass on a stray "team"
+    assert "requires a team key" in out
+
+
 # ── outside a repo, WITH a registry → grouped cross-project list ─────────────────────
 
 

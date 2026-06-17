@@ -92,11 +92,30 @@ def projects_from_config(data: dict[str, Any]) -> list[Project]:
 def _project_from_entry(entry: Any, default_backend: str) -> Project | None:
     if not isinstance(entry, dict):
         return None
-    backend = str(entry.get("backend", default_backend))
+    backend = str(entry.get("backend") or _backend_from_shape(entry) or default_backend)
     if backend == "github-issues":
         return _github_project(entry, backend)
     if backend == "linear":
         return _linear_project(entry, backend)
+    return None
+
+
+def _backend_from_shape(entry: dict[str, Any]) -> str | None:
+    """Infer a registry entry's backend from its OWN coordinate keys, before the merged default.
+
+    A global ``projects:`` entry carries an unambiguous coordinate (``repo``/``github`` → GitHub,
+    ``team``/``linear`` → Linear). The top-level ``backend`` is the cwd repo's choice and must NOT
+    reinterpret these: inside a Linear-backed repo the merged default is ``linear``, which would
+    otherwise turn a registered ``{repo: acme/web}`` GitHub shorthand into a teamless Linear entry
+    and silently drop it from ``task list --all``. An entry with neither shape (or both) falls back
+    to ``default_backend`` unchanged.
+    """
+    has_github = bool(entry.get("repo") or isinstance(entry.get("github"), dict))
+    has_linear = bool(entry.get("team") or isinstance(entry.get("linear"), dict))
+    if has_github and not has_linear:
+        return "github-issues"
+    if has_linear and not has_github:
+        return "linear"
     return None
 
 

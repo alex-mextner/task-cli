@@ -262,7 +262,14 @@ def _current_project_overlay(cfg) -> tuple[str, dict[str, Any]] | None:
     if backend == "linear":
         team = str(cfg.section("linear").get("team", "")).strip()
         if not team:
-            return None
+            # A teamless `backend: linear` INSIDE a repo is a real, actionable misconfig — surface
+            # the backend's "requires a team key" error (mirrors the github `repo: auto` branch
+            # below) instead of masking it as "outside a repo". Only genuinely outside a work tree
+            # do we return None to route to the grouped/registry view.
+            if not _in_git_repo(cfg.repo_root):
+                return None
+            _backend(cfg)  # NoReturn here: raises _UserError("linear backend requires a team key")
+            raise AssertionError("unreachable: _backend raises on a teamless linear config")
         project = str(cfg.section("linear").get("project", "")).strip()
         name = f"{team}/{project}" if project else team
         return name, {"backend": "linear", "linear": {"team": team, "project": project}}
