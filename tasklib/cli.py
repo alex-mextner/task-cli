@@ -16,7 +16,9 @@ import argparse
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .model import Screenshot, State, Ticket
@@ -223,6 +225,190 @@ def _backend(cfg):
         raise _UserError(str(exc)) from exc
 
 
+# ── repo presence + project resolution (the outside-a-repo / cross-repo machinery) ──
+
+
+def _in_git_repo(repo_root) -> bool:
+    """``True`` if ``repo_root`` is inside a git work tree (cheap, no network)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def _current_project_overlay(cfg) -> tuple[str, dict[str, Any]] | None:
+    """The single project to scope the cwd to (name + config overlay), or ``None``.
+
+    This is the "do I have ONE concrete target?" predicate that routes every command between
+    the single-project path and the cross-project/outside-a-repo path. It returns a target when
+    the coordinate is pinned — an explicit ``github.repo``/``linear.team`` in config (works even
+    without git) — or when ``github.repo: auto`` resolves a git ``origin`` (inside a repo).
+    ``None`` means no single target (genuinely outside a git work tree), which sends
+    ``list``/``find`` to the grouped registry view and makes ``create`` emit its 3-part error.
+    The overlay is what :func:`tasklib.backends.get_backend` resolves unchanged.
+
+    Crucially, ``None`` is returned ONLY for the real outside-a-repo case (no git work tree). A
+    repo with a broken/unsupported ``origin`` is NOT silently demoted to "outside a repo" — the
+    backend's resolution error surfaces normally, rather than being masked as "no projects".
+    """
+    backend = cfg.backend
+    if backend == "linear":
+        team = str(cfg.section("linear").get("team", "")).strip()
+        if not team:
+            # A teamless `backend: linear` INSIDE a repo is a real, actionable misconfig — surface
+            # the backend's "requires a team key" error (mirrors the github `repo: auto` branch
+            # below) instead of masking it as "outside a repo". Only genuinely outside a work tree
+            # do we return None to route to the grouped/registry view.
+            if not _in_git_repo(cfg.repo_root):
+                return None
+            _backend(cfg)  # NoReturn here: raises _UserError("linear backend requires a team key")
+            raise AssertionError("unreachable: _backend raises on a teamless linear config")
+        project = str(cfg.section("linear").get("project", "")).strip()
+        name = f"{team}/{project}" if project else team
+        return name, {"backend": "linear", "linear": {"team": team, "project": project}}
+
+    # github-issues
+    gh = cfg.section("github")
+    repo_spec = str(gh.get("repo", "auto")).strip()
+    if repo_spec and repo_spec != "auto" and "/" in repo_spec:
+        return repo_spec, {"backend": "github-issues", "github": {"repo": repo_spec}}
+    # repo: auto → no git work tree is the genuine "outside a repo" signal. INSIDE a work tree
+    # we resolve the origin and let any resolution error surface (a broken remote is not the
+    # same as being outside a repo — don't mask it as "no projects").
+    if not _in_git_repo(cfg.repo_root):
+        return None
+    from .backends import BackendError
+    from .backends.github_issues import _resolve_repo
+
+    try:
+        owner, repo = _resolve_repo("auto", cfg.repo_root)
+    except BackendError as exc:
+        # inside a repo, but the origin is broken/unsupported → a real, user-facing error
+        # (not "outside a repo"). Surface it as a clean _UserError, never a traceback.
+        raise _UserError(str(exc)) from exc
+    full = f"{owner}/{repo}"
+    return full, {"backend": "github-issues", "github": {"repo": full}}
+
+
+def _config_for_overlay(cfg, overlay: dict):
+    """Clone ``cfg`` with ``overlay`` deep-merged over its data (so a project resolves).
+
+    Returns a fresh ``LoadedConfig`` — the base ``cfg`` is never mutated, so aggregating
+    across projects can't leak one project's coordinates into the next.
+    """
+    return cfg.with_overlay(overlay)
+
+
+def _known_projects(cfg) -> tuple[list, str | None]:
+    """Return ``(projects, current_coordinate)`` — the groups + which one is the cwd's repo.
+
+    The registry projects, plus (when inside a repo) the synthetic current-repo project if its
+    coordinate isn't already registered. ``current_coordinate`` is the cwd repo's coordinate (or
+    ``None`` outside a repo) — currentness is tracked by COORDINATE, kept separate from registry
+    explicitness, so the cwd repo is flagged ``(current)`` even when it IS in the registry.
+    """
+    from .projects import current_repo_project, projects_from_config
+
+    projects = projects_from_config(cfg.data)
+    current = _current_project_overlay(cfg)
+    current_coordinate: str | None = None
+    if current is not None:
+        name, overlay = current
+        cur_backend = str(overlay.get("backend", cfg.backend))
+        cur = current_repo_project(name, cur_backend, overlay)
+        current_coordinate = cur.coordinate
+        # match by COORDINATE (repo/team), not display name: a registry entry for the same repo
+        # under a different label is still the same project — append the synthetic one only when
+        # the coordinate isn't already registered (the registry entry keeps its own label).
+        if not any(p.coordinate == cur.coordinate for p in projects):
+            projects.append(cur)
+    return projects, current_coordinate
+
+
+def _backend_for_id(cfg, ticket_id: str):
+    """Resolve the backend that owns ``ticket_id`` — works inside a repo AND outside one.
+
+    Inside a repo (or with a pinned coordinate / ``--repo``) the cwd's backend is used. Outside
+    a repo the ticket is routed to a registered project: a Linear id (``HYP-456``) by its team
+    prefix; a GitHub id (``#123``) when exactly one GitHub project is registered. An ambiguous
+    or unroutable id fails with a 3-part error rather than a cryptic backend failure.
+    """
+    if _current_project_overlay(cfg) is not None:
+        return _backend(cfg)
+
+    projects, _ = _known_projects(cfg)
+    candidates = [p for p in projects if p.explicit]
+    chosen = _route_id_to_project(ticket_id, candidates)
+    if chosen is None:
+        raise _UserError(_unroutable_id_error(ticket_id, candidates))
+    pcfg = _config_for_overlay(cfg, chosen.overlay)
+    return _backend(pcfg)
+
+
+def _route_id_to_project(ticket_id: str, projects: list):
+    """Pick the registered project that owns ``ticket_id``, or ``None`` if ambiguous/none."""
+    tid = ticket_id.strip()
+    if tid.startswith("#") or tid.lstrip("#").isdigit():
+        gh = [p for p in projects if p.backend == "github-issues"]
+        return gh[0] if len(gh) == 1 else None
+    # Linear-shaped id: TEAM-123 → route by the team prefix. A Linear identifier is team-scoped,
+    # and get/update resolve by the identifier alone (they ignore the project), so ANY registered
+    # project on that team can fetch it — pick the first deterministically rather than calling two
+    # same-team projects "ambiguous" (they'd resolve the same issue either way).
+    prefix = tid.partition("-")[0].upper() if "-" in tid else ""
+    if prefix:
+        matches = [p for p in projects if p.backend == "linear" and _linear_team_of(p) == prefix]
+        if matches:
+            return matches[0]
+    return None
+
+
+def _linear_team_of(project) -> str:
+    return str(project.overlay.get("linear", {}).get("team", "")).strip().upper()
+
+
+def _unroutable_id_error(ticket_id: str, projects: list) -> str:
+    names = ", ".join(p.name for p in projects) or "(none registered)"
+    return (
+        f"cannot resolve which project ticket {ticket_id!r} belongs to (you are outside a git repo).\n"
+        f"  why: the id maps to no single known project. registered projects: {names}.\n"
+        "  fix: run inside the repo, or pass --repo owner/name (GitHub), "
+        "or register the project under `projects:` in ~/.config/task-cli/config.yaml."
+    )
+
+
+def _create_without_repo_error(cfg) -> str:
+    """The honest 3-part (WHAT/WHY/HOW) error for `task create` run outside a repo.
+
+    The HOW must not lie: it points at the real escape hatches that exist — ``--repo`` (which
+    pins the GitHub coordinate), a Linear team in config, or simply running inside the repo.
+    """
+    backend = cfg.backend
+    if backend == "linear":
+        how = (
+            "  fix: run inside the repo whose `task.yaml` sets `linear.team`, "
+            "or set `linear: {team: KEY}` in ~/.config/task-cli/config.yaml."
+        )
+    else:
+        how = (
+            "  fix: run inside the target git repo, or pass `--repo owner/name` "
+            "to pin the GitHub project explicitly."
+        )
+    return (
+        "cannot create a ticket: no project context (you are outside a git repo).\n"
+        "  why: `create` is repo-bound — it writes the ticket into ONE specific project, "
+        "so it must know which backend/repo to target; `github.repo: auto` needs a git origin.\n"
+        f"{how}"
+    )
+
+
 def _enforce_config(cfg):
     from .policy import EnforceConfig
 
@@ -333,6 +519,11 @@ def _attach_screenshots(backend, ticket_id: str, screenshots) -> None:
 
 def cmd_create(args: argparse.Namespace) -> int:
     cfg = _load(args)
+    # create is the one repo-BOUND op: it writes a ticket into a specific project, so it needs
+    # to know which one. Outside a repo (and with no pinned coordinate) fail with an honest
+    # 3-part error — never the cryptic "no 'origin' remote" the backend would otherwise throw.
+    if _current_project_overlay(cfg) is None:
+        raise _UserError(_create_without_repo_error(cfg))
     session = _detect_session(cfg)
 
     title = args.title
@@ -390,30 +581,197 @@ def cmd_create(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    """List tickets. Three shapes, chosen by where you are and what you ask for:
+
+    - **Session scope** (default, inside a repo, in an agent session with tickets) — this
+      session's tickets in the current repo.
+    - **All-tasks fallback** — same as session scope BUT when there's no agent session, or the
+      session has no tickets: fall back to ALL tickets in the current repo, and SAY SO.
+    - **Cross-project grouped** — ``--all``, or run OUTSIDE any repo: every known project's
+      tickets, grouped under a heading per project. A project whose backend errors shows a
+      degraded group; it never aborts the whole aggregation.
+    """
     cfg = _load(args)
-    backend = _backend(cfg)
+    state = _parse_state(args.state) if args.state else None
+    current = _current_project_overlay(cfg)
+
+    # Cross-project grouped view: an explicit --all, or there's no current repo to scope to.
+    if args.all or current is None:
+        return _list_grouped(args, cfg, state, outside_repo=current is None)
+
+    # Inside a repo, no --all → session scope, with the all-tasks fallback.
+    return _list_session_scoped(args, cfg, state, current)
+
+
+def _list_session_scoped(args, cfg, state, current) -> int:
+    """The default in-repo view: this session's tickets, falling back to all repo tasks."""
     from .backends import BackendError
 
-    state = _parse_state(args.state) if args.state else None
+    backend = _backend(cfg)
+    session = _detect_session(cfg)
+    no_session = session.source == "none"
+    want_labels = set(args.label or [])
     try:
-        if args.all or args.label:
-            tickets = backend.list(labels=args.label or None, state=state, limit=args.limit)
-        else:
-            session = _detect_session(cfg)
-            tickets = backend.session_tickets(session.label, limit=args.limit)
-            if state is not None:
-                tickets = [t for t in tickets if t.state == state]
-            if not args.json:
-                print(_dim(f"session {session.id} ({session.source}):"))
+        # Whether to fall back is decided on the UNFILTERED session result: a session that HAS
+        # tickets but none match --state/--label is a legitimately-empty FILTERED view, NOT a
+        # reason to spill every other session's tickets. Only a truly empty session falls back.
+        session_tickets = [] if no_session else backend.session_tickets(session.label, limit=args.limit)
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
+
+    if no_session or not session_tickets:
+        # Fallback: no agent session, or the session has NO tickets at all → show ALL repo tasks
+        # and SAY SO, so the user understands why they're seeing everything (not just theirs).
+        if not args.json:
+            print(_dim("showing all project tasks (`task list` defaults to tasks created in the agent session)"))
+        try:
+            tickets = backend.list(labels=args.label or None, state=state, limit=args.limit)
+        except BackendError as exc:
+            raise _UserError(str(exc)) from exc
+        _print_tickets(tickets, args.json)
+        return 0
+
+    # session HAS tickets → scope to it, then apply the --state/--label filters within that view.
+    tickets = session_tickets
+    if state is not None:
+        tickets = [t for t in tickets if t.state == state]
+    if want_labels:
+        tickets = [t for t in tickets if want_labels <= set(t.labels)]
+    if not args.json:
+        print(_dim(f"session {session.id} ({session.source}):"))
     _print_tickets(tickets, args.json)
     return 0
 
 
+def _list_grouped(args, cfg, state, *, outside_repo: bool) -> int:
+    """Cross-project view: query every known project and group tickets under its heading."""
+    projects, current_coordinate = _known_projects(cfg)
+    if not projects:
+        # No registry and no current repo: there is nothing to aggregate. Guide the user to
+        # register a project rather than printing a bare empty list (informative > silent).
+        raise _UserError(
+            "no projects to list. You are outside a git repo and no projects are registered.\n"
+            "  why: `task list` aggregates across known projects; none are configured.\n"
+            "  fix: add a `projects:` entry to ~/.config/task-cli/config.yaml "
+            "(e.g. `projects: [{repo: owner/name}]`), or run inside a repo."
+        )
+
+    groups = _aggregate_projects(
+        cfg, projects, labels=args.label or None, state=state, limit=args.limit,
+        current_coordinate=current_coordinate,
+    )
+
+    if args.json:
+        _print_groups_json(groups)
+        return 0
+
+    # The session-vs-all line: an implicit aggregate (outside a repo) must explain itself; an
+    # explicit `--all` was asked for, so no apology is needed there.
+    if outside_repo:
+        print(_dim("showing all project tasks (`task list` defaults to tasks created in the agent session)"))
+
+    _print_groups(groups)
+    return 0
+
+
+@dataclass
+class _ProjectGroup:
+    """One project's slice of the aggregated list: its tickets, or a degraded error."""
+
+    name: str
+    backend: str
+    tickets: list[Ticket]
+    error: str | None = None
+    current: bool = False  # True for the repo the user is currently inside
+
+
+def _aggregate_projects(base_cfg, projects, *, labels, state, limit, current_coordinate=None) -> list:
+    """Query each project's backend; a failing one becomes a degraded group, not a hard stop.
+
+    Each project's config is the base config with the project's overlay deep-merged in, so the
+    existing :func:`tasklib.backends.get_backend` resolves it unchanged. The aggregation is
+    best-effort by design: one unreachable/unauthed/empty project must not sink the rest of the
+    cross-repo view (the "never aborts the whole aggregation" rule).
+    """
+    return _query_projects(
+        base_cfg, projects, lambda b: b.list(labels=labels, state=state, limit=limit), current_coordinate
+    )
+
+
+def _query_projects(base_cfg, projects, call, current_coordinate=None) -> list:
+    """Run ``call(backend)`` for each project's backend, capturing a failure as a degraded group.
+
+    The single best-effort fan-out used by both the grouped ``list`` and ``find`` — ``call`` is
+    the per-backend query (``.list`` or ``.search``). One project's error never aborts the rest.
+    ``current_coordinate`` flags the cwd's repo (by coordinate, so it works whether or not that
+    repo is also in the registry).
+    """
+    from .backends import BackendError, get_backend
+    from .credentials import CredentialError
+
+    groups: list[_ProjectGroup] = []
+    for proj in projects:
+        cur = current_coordinate is not None and proj.coordinate == current_coordinate
+        try:
+            backend = get_backend(_config_for_overlay(base_cfg, proj.overlay))
+            tickets = call(backend)
+            groups.append(_ProjectGroup(name=proj.name, backend=proj.backend, tickets=tickets, current=cur))
+        except (BackendError, CredentialError) as exc:
+            groups.append(_ProjectGroup(name=proj.name, backend=proj.backend, tickets=[], error=str(exc), current=cur))
+    return groups
+
+
+def _print_groups(groups) -> None:
+    """Render the grouped, cross-project list — a heading per project, tickets beneath.
+
+    Heading shape: ``<name> · <backend> · <N> (current)`` — informative at a glance (which
+    backend, how many, is this the repo I'm in). A degraded project shows its one-line error.
+    """
+    total = sum(len(g.tickets) for g in groups)
+    if total == 0 and all(g.error is None for g in groups):
+        print(_dim("(no tickets)"))
+        return
+    first = True
+    for g in groups:
+        if not first:
+            print()
+        first = False
+        marker = _dim(" (current)") if g.current else ""
+        if g.error is not None:
+            head = f"{g.backend} · " + _err("degraded")
+        else:
+            head = f"{g.backend} · {len(g.tickets)}"
+        print(_bold(g.name) + _dim(" · ") + head + marker)
+        if g.error is not None:
+            print(_dim(f"  ! {g.error.splitlines()[0]}"))
+            continue
+        if not g.tickets:
+            print(_dim("  (none)"))
+            continue
+        for t in g.tickets:
+            print("  " + _ticket_line(t))
+
+
+def _print_groups_json(groups) -> None:
+    """The machine-readable grouped shape: ``[{project, backend, current, error, tickets}]``."""
+    import json
+
+    payload = [
+        {
+            "project": g.name,
+            "backend": g.backend,
+            "current": g.current,
+            "error": g.error,
+            "tickets": [_ticket_dict(t) for t in g.tickets],
+        }
+        for g in groups
+    ]
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    backend = _backend(cfg)
+    backend = _backend_for_id(cfg, args.id)
     from .backends import BackendError
     from .render import render
 
@@ -440,10 +798,30 @@ def cmd_read(args: argparse.Namespace) -> int:
 
 def cmd_find(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    backend = _backend(cfg)
     from .backends import BackendError
 
     state = _parse_state(args.state) if args.state else None
+
+    # Inside a repo: search the cwd's backend (current behavior). Outside one: search across
+    # every known project and group the hits, so `find` is a true global op anywhere.
+    if _current_project_overlay(cfg) is None:
+        projects, current_coordinate = _known_projects(cfg)
+        if not projects:
+            raise _UserError(
+                "no projects to search. You are outside a git repo and no projects are registered.\n"
+                "  why: `task find` searches known projects; none are configured.\n"
+                "  fix: add a `projects:` entry to ~/.config/task-cli/config.yaml, or run inside a repo."
+            )
+        groups = _search_projects(
+            cfg, projects, args.query, state=state, limit=args.limit, current_coordinate=current_coordinate
+        )
+        if args.json:
+            _print_groups_json(groups)
+            return 0
+        _print_groups(groups)
+        return 0
+
+    backend = _backend(cfg)
     try:
         tickets = backend.search(args.query, state=state, limit=args.limit)
     except BackendError as exc:
@@ -452,9 +830,16 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def _search_projects(base_cfg, projects, query, *, state, limit, current_coordinate=None) -> list:
+    """Cross-project search — the search analogue of :func:`_aggregate_projects`."""
+    return _query_projects(
+        base_cfg, projects, lambda b: b.search(query, state=state, limit=limit), current_coordinate
+    )
+
+
 def cmd_change(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    backend = _backend(cfg)
+    backend = _backend_for_id(cfg, args.id)
     from .backends import BackendError
 
     try:
@@ -508,7 +893,7 @@ def cmd_change(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    backend = _backend(cfg)
+    backend = _backend_for_id(cfg, args.id)
     from .backends import BackendError
 
     if not args.new_state:

@@ -219,9 +219,14 @@ class LinearBackend:
         flt: dict = {"team": {"key": {"eq": self.team_key}}}
         if labels:
             flt["labels"] = {"some": {"name": {"in": labels}}}
+        if self.project:
+            # When a project id is pinned, scope the list to it — otherwise two registry entries
+            # for the same team but different projects would list the SAME team-wide issues, so
+            # the cross-project grouped view would double-count them under each group.
+            flt["project"] = {"id": {"eq": self.project}}
         data = self._gql(
             "query($filter:IssueFilter,$n:Int){issues(filter:$filter,first:$n,"
-            "orderBy:updatedAt){nodes{" + self._ISSUE_FIELDS + "}}}",
+            "orderBy:updatedAt){nodes{" + self._ISSUE_FIELDS + " team{key} project{id}}}}",
             {"filter": flt, "n": min(limit, 100)},
         )
         tickets = [self._node_to_ticket(n) for n in data.get("issues", {}).get("nodes", [])]
@@ -230,13 +235,21 @@ class LinearBackend:
         return tickets[:limit]
 
     def search(self, query: str, *, state=None, limit=30) -> list[Ticket]:
+        # searchIssues has no team/project filter argument, so scope the results client-side to
+        # THIS backend's team (and project, if pinned). Without this a cross-project `find` would
+        # return workspace-wide hits and attribute the whole workspace to each Linear group.
+        # NOTE: ``limit`` bounds the rows FETCHED from Linear; the team/project filter then runs
+        # client-side, so the returned count can be < limit (matches are a subset of the fetch).
         data = self._gql(
             "query($q:String!,$n:Int){searchIssues(term:$q,first:$n){nodes{"
             + self._ISSUE_FIELDS
-            + "}}}",
+            + " team{key} project{id}}}}",
             {"q": query, "n": min(limit, 100)},
         )
         nodes = data.get("searchIssues", {}).get("nodes", [])
+        nodes = [n for n in nodes if (n.get("team") or {}).get("key") == self.team_key]
+        if self.project:
+            nodes = [n for n in nodes if (n.get("project") or {}).get("id") == self.project]
         tickets = [self._node_to_ticket(n) for n in nodes]
         if state is not None:
             tickets = [t for t in tickets if t.state == state]

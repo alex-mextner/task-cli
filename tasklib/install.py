@@ -35,12 +35,12 @@ ticket that lacks the required fields, so work is always traceable back to an as
 ## Commands
 ```
 task create --title "..." --acceptance "..." --why "..." --impact "..." --if-not-done "..."
-task list                        # THIS session's tickets (status + first paragraph)
-task list --all                  # all open tickets
-task read <id>                   # full ticket (every section)
-task find "<query>"              # search title+body
+task list                        # THIS session's tickets (falls back to all when empty)
+task list --all                  # every known project's tickets, grouped by project
+task read <id>                   # full ticket (every section) — works outside a repo
+task find "<query>"              # search title+body (cross-project when outside a repo)
 task change <id> --acceptance "..." --screenshot proof.png
-task status <id>                 # read state
+task status <id>                 # read state (works outside a repo)
 task status <id> done            # transition (runs the on-done gates)
 task classify "<text>" --create  # change|justAsk; on `change`, create/dedup a ticket
 task session                     # show current session + its tickets
@@ -55,6 +55,10 @@ task session                     # show current session + its tickets
   `~/.config/linear/credentials.toml` — no extra setup if you've already authed those CLIs.
 - **Session-scoped**: `task list` defaults to the current session (env:TASK_SESSION →
   tmux pane → git branch); tickets are labelled `session:<id>`.
+- **Works outside a repo**: `read`/`status`/`find`/`list` run anywhere; outside a git repo
+  `list` aggregates the `projects:` registry (in `~/.config/task-cli/config.yaml`) grouped by
+  project. Only `create` is repo-bound (it writes into one project) — outside a repo it fails
+  with a clear 3-part error.
 """
 
 

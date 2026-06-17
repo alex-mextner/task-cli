@@ -45,6 +45,15 @@ cheap message classification and is wired into a `tg-cli` inbound hook.
 - **`task list` defaults to THIS session.** Session id = `env:TASK_SESSION` → tmux pane → git
   branch. Tickets are labelled `session:<id>` (durable) AND recorded in a local sidecar
   (`~/.local/state/task-cli/sessions/<id>.jsonl`, a cache). The label is the source of truth.
+  It **falls back** to all of the repo's tickets — and says so — when there's no agent session
+  or the session has none.
+- **Read/global ops work OUTSIDE a git repo; only `create` is repo-bound.** `list` outside a
+  repo (or `--all` anywhere) aggregates the `projects:` registry and groups by project;
+  `read`/`status`/`find` route an id to a registered project; a degraded project never aborts
+  the aggregation. `create` writes into ONE project, so outside a repo it fails with a 3-part
+  WHAT/WHY/HOW error. The registry parsing/overlay shaping is pure (`tasklib/projects.py`); the
+  multi-backend orchestration is an effect and lives in `cli.py`. Add a project backend
+  coordinate, not a special case.
 
 ## Backend seam
 

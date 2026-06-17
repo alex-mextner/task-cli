@@ -156,3 +156,47 @@ def test_linear_label_ids_creates_missing_labels(monkeypatch):
     assert "lbl-ui" in ids
     assert "new-session:abc" in ids and "new-needs-triage" in ids
     assert created == ["session:abc", "needs-triage"]  # only the missing ones were created
+
+
+def test_linear_list_scopes_filter_to_team_and_project(monkeypatch):
+    # the IssueFilter must carry the team, and the project too when pinned — otherwise two
+    # registry entries on the same team but different projects would list identical issues.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP", project="proj-9")
+    be._team_id = "team-1"
+    seen: dict = {}
+
+    def fake_gql(query, variables=None):
+        seen["filter"] = variables["filter"]
+        return {"issues": {"nodes": []}}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    be.list()
+    assert seen["filter"]["team"] == {"key": {"eq": "HYP"}}
+    assert seen["filter"]["project"] == {"id": {"eq": "proj-9"}}
+
+
+def test_linear_search_filters_results_to_team(monkeypatch):
+    # searchIssues is workspace-wide; the backend must drop hits from other teams so a
+    # cross-project `find` doesn't attribute the whole workspace to this Linear group.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+
+    def fake_gql(query, variables=None):
+        return {
+            "searchIssues": {
+                "nodes": [
+                    {"identifier": "HYP-1", "title": "mine", "team": {"key": "HYP"}, "project": None,
+                     "state": {"type": "started"}, "labels": {"nodes": []}},
+                    {"identifier": "OTH-9", "title": "theirs", "team": {"key": "OTH"}, "project": None,
+                     "state": {"type": "started"}, "labels": {"nodes": []}},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    hits = be.search("anything")
+    ids = {t.id for t in hits}
+    assert ids == {"HYP-1"}  # the OTH team's hit is scoped out

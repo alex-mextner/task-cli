@@ -122,6 +122,19 @@ class LoadedConfig:
         sec = self.data.get(name)
         return sec if isinstance(sec, dict) else {}
 
+    def with_overlay(self, overlay: dict[str, Any]) -> "LoadedConfig":
+        """A fresh config with ``overlay`` deep-merged over this one's data (self untouched).
+
+        Used to resolve a registered project's backend coordinates against the same base
+        config (so per-repo ``enforce``/``classify`` defaults carry, but the project's
+        ``backend``/``github``/``linear`` win). The clone is deep so aggregating across
+        projects can't leak one project's coordinates into the next.
+        """
+        import copy
+
+        merged = _deep_merge(copy.deepcopy(self.data), overlay)
+        return LoadedConfig(data=merged, repo_root=self.repo_root, layers=list(self.layers))
+
     @property
     def enforce(self) -> dict[str, Any]:
         return self.section("enforce")

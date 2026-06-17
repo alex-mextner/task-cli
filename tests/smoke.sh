@@ -48,6 +48,21 @@ assert cfg.backend == "github-issues", cfg.backend
 PYEOF
 pass "zero-config defaults (github-issues)"
 
+# ── 4b. read/global ops degrade cleanly OUTSIDE a git repo (no traceback) ──────
+# Point `task list` at a dir that is NOT a git work tree (-C "$TMP"), with an empty config
+# home, so there's no origin and no registry. It must fail with a clean 3-part error
+# (exit 2), never a Python traceback — proving "commands work outside a repo" degrades well.
+set +e
+OUT="$(XDG_CONFIG_HOME="$TMP/cfg2" $TASK list -C "$TMP" 2>&1)"; RC=$?
+set -e
+if [ "$RC" -ne 2 ]; then fail "task list outside a repo (expected exit 2, got $RC)"; fi
+case "$OUT" in
+  *Traceback*) fail "task list outside a repo printed a traceback" ;;
+  # match a stable substring of the 3-part error (resilient to docs/wording tweaks).
+  *"outside a git repo"*) pass "outside-a-repo task list -> clean 3-part error" ;;
+  *) fail "task list outside a repo: unexpected output" ;;
+esac
+
 # ── 5. pytest unit suite ──────────────────────────────────────────────────────
 if $PY -c 'import pytest' 2>/dev/null; then
   ( cd "$ROOT" && $PY -m pytest -q ) || fail "pytest"
