@@ -47,6 +47,11 @@ cheap message classification and is wired into a `tg-cli` inbound hook.
   (`~/.local/state/task-cli/sessions/<id>.jsonl`, a cache). The label is the source of truth.
   It **falls back** to all of the repo's tickets — and says so — when there's no agent session
   or the session has none.
+- **`list`/`find` page like git.** Human (non-`--json`) output goes through `less` ONLY on an
+  interactive TTY; piped/scripted output is plain text (scriptable). The result cap is 100
+  interactive vs 30 piped unless `-n` is given. Opt out with `--no-pager`/`NO_PAGER`/empty
+  `$PAGER` or `$TASK_PAGER`. `--json` is never paged. The decision + piping live in
+  `tasklib/pager.py` (pure decision, defensive routing); `cli._emit_list` is the single call site.
 - **Read/global ops work OUTSIDE a git repo; only `create` is repo-bound.** `list` outside a
   repo (or `--all` anywhere) aggregates the `projects:` registry and groups by project;
   `read`/`status`/`find` route an id to a registered project; a degraded project never aborts
