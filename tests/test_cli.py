@@ -161,6 +161,35 @@ def test_list_all_shows_everything(capsys, _inject_fake):
     assert "#1" in out and "#2" in out
 
 
+def test_list_label_filters_session_view(capsys, _inject_fake):
+    # --label narrows the SESSION list too (not only the --all path): a session ticket WITHOUT
+    # the requested label is excluded. Regression for the codex finding that --label was ignored
+    # whenever the current session had tickets.
+    main(_create_argv())  # #1: session:testsess, no extra label
+    main(_create_argv() + ["--label", "urgent"])  # #2: session:testsess + urgent
+    capsys.readouterr()
+    rc = main(["list", "--label", "urgent"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "#2" in out
+    assert "#1" not in out
+
+
+def test_list_filter_excludes_all_session_tickets_does_not_fall_back(capsys, _inject_fake):
+    # a session that HAS tickets but none match the filter is a legitimately-empty FILTERED view
+    # — it must NOT fall back to all tasks (which would spill other sessions' tickets). Regression
+    # for the codex P1 (fallback decided on filtered result leaked cross-session tickets).
+    main(_create_argv())  # #1: this session, state=todo
+    _inject_fake.create(type(_inject_fake.list()[0])(title="other-session", labels=["session:elsewhere"]))
+    capsys.readouterr()
+    rc = main(["list", "--label", "nonexistent-label"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # no fallback line, and the OTHER session's ticket must not appear
+    assert "showing all project tasks" not in out
+    assert "other-session" not in out and "#2" not in out
+
+
 # ── read / change / status ──────────────────────────────────────────────────────────
 
 

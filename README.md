@@ -40,12 +40,12 @@ linear auth        # Linear (per-repo, via task.yaml)
 
 ```
 task create   --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..."
-task list                          # THIS session's tickets (status + first paragraph)
-task list --all                    # all tickets
-task read <id>     (alias: view)   # the full ticket — every section
-task find "<query>"                # search title+body via the backend
+task list                          # THIS session's tickets (falls back to all when empty)
+task list --all                    # every known project's tickets, grouped by project
+task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
+task find "<query>"                # search title+body (cross-project when outside a repo)
 task change <id>  [--done]         # update; --done runs the on-done gates (close)
-task status <id> [<new-state>]     # read or transition state
+task status <id> [<new-state>]     # read or transition state (works outside a repo)
 task classify "<text>" [--create]  # change|justAsk via review; --create makes/dedups a ticket
 task session [show|bind <id>]      # show/bind the current session and its tickets
 ```
@@ -123,6 +123,43 @@ Every ticket created/touched in a session is labelled `session:<id>` (portable) 
 recorded in a local sidecar (`~/.local/state/task-cli/sessions/<id>.jsonl`, fast/offline).
 `task list` defaults to the current session's tickets.
 
+## Working outside a repo / across projects
+
+A tool's *read* and *global* operations should not demand you stand inside a git repo. So:
+
+- **`task list` outside any repo** → shows **all** tickets across the projects you've
+  registered, **grouped by project** (a heading per project, tickets beneath). The output
+  says `showing all project tasks` so it's clear why you see everything.
+- **`task list` inside a repo** → scopes to that repo's current session. With **no agent
+  session**, or a session with **no tickets**, it falls back to *all* of that repo's tickets
+  and says so. **`task list --all`** gives the cross-project grouped view from anywhere.
+- **`task read` / `task status` / `task find`** work outside a repo too. An id is routed to a
+  registered project (a Linear `HYP-3` by its team; a `#123` when exactly one GitHub project
+  is registered); an ambiguous id fails with a clear, actionable error.
+- **Only `task create` is repo-bound** — it writes a ticket into one specific project, so it
+  needs a repo (or `--repo owner/name`). Outside one it fails with a 3-part WHAT/WHY/HOW error.
+- A project whose backend errors (auth, offline, unknown team) is shown as a **degraded
+  group** — it never aborts the whole cross-project listing.
+
+`--json` follows the view: the session/single-repo list is a flat `[ticket]`, while the
+grouped cross-project view (outside a repo, or `--all`) is `[{project, backend, current, error,
+tickets}]` — one object per project group, so a degraded project is visible to scripts too. The
+in-repo fallback (session empty → all of *this* repo's tickets) stays the flat `[ticket]` shape,
+scoped to the current repo, even though the text output prints the `showing all project tasks`
+line. Only the cross-project view is grouped.
+
+The cross-project view reads a **`projects:`** registry from the config cascade — usually the
+**global** `~/.config/task-cli/config.yaml`, since it spans repos:
+
+```yaml
+projects:
+  - { repo: acme/frontend }                       # GitHub shorthand → group "acme/frontend"
+  - { name: Backend, github: { repo: acme/api } }  # explicit block + display name
+  - { name: HYP, backend: linear, team: HYP }      # a Linear team/project
+```
+
+The repo you're currently inside is always one of the groups, even if it isn't (yet) listed.
+
 ## Classification
 
 `task classify "<text>"` decides `change` (→ a ticket) vs `justAsk` (a pure question) by
@@ -140,6 +177,9 @@ version: 1
 backend: github-issues            # or: linear
 github:   { repo: auto, default_labels: [agent] }   # repo: auto = origin owner/name
 linear:   { team: HYP, project: "" }
+projects:                          # cross-project registry (mostly in the GLOBAL config)
+  - { repo: acme/frontend }        # `task list` outside a repo / `--all` aggregates these
+  - { name: HYP, backend: linear, team: HYP }
 enforce:
   acceptance_criteria: required
   motivation: required
