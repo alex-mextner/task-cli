@@ -105,7 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--mine", action="store_true", help="only tickets assigned to me")
     lp.add_argument("--state", help="filter by state (todo|in-progress|in-review|done|cancelled)")
     lp.add_argument("--label", action="append", default=[], help="filter by label (repeatable)")
-    lp.add_argument("-n", type=int, default=30, dest="limit", help="max results (default 30)")
+    # default=None so the limit is chosen by interactivity: 100 in a TTY (the pager scrolls),
+    # 30 when piped/scripted. An explicit -n always wins (see _effective_limit).
+    lp.add_argument("-n", type=int, default=None, dest="limit", help="max results (default 100 interactive, 30 piped)")
+    lp.add_argument("--no-pager", action="store_true", dest="no_pager", help="never page output (also honors NO_PAGER, $PAGER='')")
 
     # read / view
     rp = sub.add_parser("read", parents=[common], help="show a full ticket")
@@ -118,7 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("query", help="search query")
     fp.add_argument("--state", help="filter by state")
     fp.add_argument("--all", action="store_true", help="(reserved) include all; search is global by default")
-    fp.add_argument("-n", type=int, default=30, dest="limit", help="max results (default 30)")
+    fp.add_argument("-n", type=int, default=None, dest="limit", help="max results (default 100 interactive, 30 piped)")
+    fp.add_argument("--no-pager", action="store_true", dest="no_pager", help="never page output (also honors NO_PAGER, $PAGER='')")
 
     # change
     chp = sub.add_parser("change", parents=[common], help="update a ticket (enforces on-done gates when closing)")
@@ -453,17 +457,18 @@ def _ticket_line(t: Ticket) -> str:
     return f"{_bold(t.id or '(new)')} {state} {t.title}{sep}"
 
 
-def _print_tickets(tickets: list[Ticket], as_json: bool) -> None:
-    if as_json:
-        import json
-
-        print(json.dumps([_ticket_dict(t) for t in tickets], ensure_ascii=False, indent=2))
-        return
+def _format_tickets(tickets: list[Ticket]) -> str:
+    """The flat (non-grouped) human view as a single string — fed to the pager by the caller."""
     if not tickets:
-        print(_dim("(no tickets)"))
-        return
-    for t in tickets:
-        print(_ticket_line(t))
+        return _dim("(no tickets)")
+    return "\n".join(_ticket_line(t) for t in tickets)
+
+
+def _print_tickets_json(tickets: list[Ticket]) -> None:
+    """The flat machine-readable view — straight to stdout, never paged (must stay parseable)."""
+    import json
+
+    print(json.dumps([_ticket_dict(t) for t in tickets], ensure_ascii=False, indent=2))
 
 
 def _ticket_dict(t: Ticket) -> dict:
@@ -580,6 +585,35 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+# Limit defaults: a small one when piped/scripted (machine-readable, bounded), a larger one
+# in an interactive TTY where the pager scrolls and a 30-row cap would just hide tickets.
+_LIMIT_PIPED = 30
+_LIMIT_INTERACTIVE = 100
+
+
+def _effective_limit(args: argparse.Namespace) -> int:
+    """The result cap: an explicit ``-n`` wins; otherwise pick by interactivity.
+
+    Without ``-n``, a TTY gets the higher cap (the pager handles scrolling) and a pipe gets the
+    small one (scriptable, bounded). Decided off the real stdout so a piped run is deterministic.
+    """
+    if getattr(args, "limit", None) is not None:
+        return args.limit
+    return _LIMIT_INTERACTIVE if sys.stdout.isatty() else _LIMIT_PIPED
+
+
+def _emit_list(args: argparse.Namespace, blocks: list[str]) -> None:
+    """Join the human-readable list output and route it through the pager (interactive only).
+
+    ``blocks`` are the already-rendered sections (e.g. the "showing all project tasks" notice
+    then the ticket/group body). Empty blocks are dropped so we don't emit blank separators.
+    """
+    from .pager import page
+
+    text = "\n".join(b for b in blocks if b)
+    page(text, no_pager_flag=getattr(args, "no_pager", False))
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     """List tickets. Three shapes, chosen by where you are and what you ask for:
 
@@ -590,6 +624,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     - **Cross-project grouped** — ``--all``, or run OUTSIDE any repo: every known project's
       tickets, grouped under a heading per project. A project whose backend errors shows a
       degraded group; it never aborts the whole aggregation.
+
+    Human output (non-``--json``) is paged through ``less`` when stdout is an interactive TTY
+    and the user hasn't opted out (``--no-pager`` / ``NO_PAGER`` / ``$PAGER=''``); a piped run
+    prints plain text so it stays scriptable.
     """
     cfg = _load(args)
     state = _parse_state(args.state) if args.state else None
@@ -611,24 +649,27 @@ def _list_session_scoped(args, cfg, state, current) -> int:
     session = _detect_session(cfg)
     no_session = session.source == "none"
     want_labels = set(args.label or [])
+    limit = _effective_limit(args)
     try:
         # Whether to fall back is decided on the UNFILTERED session result: a session that HAS
         # tickets but none match --state/--label is a legitimately-empty FILTERED view, NOT a
         # reason to spill every other session's tickets. Only a truly empty session falls back.
-        session_tickets = [] if no_session else backend.session_tickets(session.label, limit=args.limit)
+        session_tickets = [] if no_session else backend.session_tickets(session.label, limit=limit)
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
 
     if no_session or not session_tickets:
         # Fallback: no agent session, or the session has NO tickets at all → show ALL repo tasks
         # and SAY SO, so the user understands why they're seeing everything (not just theirs).
-        if not args.json:
-            print(_dim("showing all project tasks (`task list` defaults to tasks created in the agent session)"))
         try:
-            tickets = backend.list(labels=args.label or None, state=state, limit=args.limit)
+            tickets = backend.list(labels=args.label or None, state=state, limit=limit)
         except BackendError as exc:
             raise _UserError(str(exc)) from exc
-        _print_tickets(tickets, args.json)
+        if args.json:
+            _print_tickets_json(tickets)
+            return 0
+        notice = _dim("showing all project tasks (`task list` defaults to tasks created in the agent session)")
+        _emit_list(args, [notice, _format_tickets(tickets)])
         return 0
 
     # session HAS tickets → scope to it, then apply the --state/--label filters within that view.
@@ -637,9 +678,10 @@ def _list_session_scoped(args, cfg, state, current) -> int:
         tickets = [t for t in tickets if t.state == state]
     if want_labels:
         tickets = [t for t in tickets if want_labels <= set(t.labels)]
-    if not args.json:
-        print(_dim(f"session {session.id} ({session.source}):"))
-    _print_tickets(tickets, args.json)
+    if args.json:
+        _print_tickets_json(tickets)
+        return 0
+    _emit_list(args, [_dim(f"session {session.id} ({session.source}):"), _format_tickets(tickets)])
     return 0
 
 
@@ -657,7 +699,7 @@ def _list_grouped(args, cfg, state, *, outside_repo: bool) -> int:
         )
 
     groups = _aggregate_projects(
-        cfg, projects, labels=args.label or None, state=state, limit=args.limit,
+        cfg, projects, labels=args.label or None, state=state, limit=_effective_limit(args),
         current_coordinate=current_coordinate,
     )
 
@@ -667,10 +709,12 @@ def _list_grouped(args, cfg, state, *, outside_repo: bool) -> int:
 
     # The session-vs-all line: an implicit aggregate (outside a repo) must explain itself; an
     # explicit `--all` was asked for, so no apology is needed there.
-    if outside_repo:
-        print(_dim("showing all project tasks (`task list` defaults to tasks created in the agent session)"))
-
-    _print_groups(groups)
+    notice = (
+        _dim("showing all project tasks (`task list` defaults to tasks created in the agent session)")
+        if outside_repo
+        else ""
+    )
+    _emit_list(args, [notice, _format_groups(groups)])
     return 0
 
 
@@ -721,35 +765,33 @@ def _query_projects(base_cfg, projects, call, current_coordinate=None) -> list:
     return groups
 
 
-def _print_groups(groups) -> None:
-    """Render the grouped, cross-project list — a heading per project, tickets beneath.
+def _format_groups(groups) -> str:
+    """Render the grouped, cross-project list as a string — a heading per project, tickets beneath.
 
     Heading shape: ``<name> · <backend> · <N> (current)`` — informative at a glance (which
     backend, how many, is this the repo I'm in). A degraded project shows its one-line error.
+    Returned as one string so the caller can route it through the pager (interactive only).
     """
     total = sum(len(g.tickets) for g in groups)
     if total == 0 and all(g.error is None for g in groups):
-        print(_dim("(no tickets)"))
-        return
-    first = True
+        return _dim("(no tickets)")
+    sections: list[str] = []
     for g in groups:
-        if not first:
-            print()
-        first = False
+        lines = []
         marker = _dim(" (current)") if g.current else ""
         if g.error is not None:
             head = f"{g.backend} · " + _err("degraded")
         else:
             head = f"{g.backend} · {len(g.tickets)}"
-        print(_bold(g.name) + _dim(" · ") + head + marker)
+        lines.append(_bold(g.name) + _dim(" · ") + head + marker)
         if g.error is not None:
-            print(_dim(f"  ! {g.error.splitlines()[0]}"))
-            continue
-        if not g.tickets:
-            print(_dim("  (none)"))
-            continue
-        for t in g.tickets:
-            print("  " + _ticket_line(t))
+            lines.append(_dim(f"  ! {g.error.splitlines()[0]}"))
+        elif not g.tickets:
+            lines.append(_dim("  (none)"))
+        else:
+            lines.extend("  " + _ticket_line(t) for t in g.tickets)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)  # blank line BETWEEN project groups (was the per-iter print())
 
 
 def _print_groups_json(groups) -> None:
@@ -802,6 +844,7 @@ def cmd_find(args: argparse.Namespace) -> int:
 
     state = _parse_state(args.state) if args.state else None
 
+    limit = _effective_limit(args)
     # Inside a repo: search the cwd's backend (current behavior). Outside one: search across
     # every known project and group the hits, so `find` is a true global op anywhere.
     if _current_project_overlay(cfg) is None:
@@ -813,20 +856,23 @@ def cmd_find(args: argparse.Namespace) -> int:
                 "  fix: add a `projects:` entry to ~/.config/task-cli/config.yaml, or run inside a repo."
             )
         groups = _search_projects(
-            cfg, projects, args.query, state=state, limit=args.limit, current_coordinate=current_coordinate
+            cfg, projects, args.query, state=state, limit=limit, current_coordinate=current_coordinate
         )
         if args.json:
             _print_groups_json(groups)
             return 0
-        _print_groups(groups)
+        _emit_list(args, [_format_groups(groups)])
         return 0
 
     backend = _backend(cfg)
     try:
-        tickets = backend.search(args.query, state=state, limit=args.limit)
+        tickets = backend.search(args.query, state=state, limit=limit)
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
-    _print_tickets(tickets, args.json)
+    if args.json:
+        _print_tickets_json(tickets)
+        return 0
+    _emit_list(args, [_format_tickets(tickets)])
     return 0
 
 

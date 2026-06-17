@@ -59,6 +59,9 @@ task session                     # show current session + its tickets
   `list` aggregates the `projects:` registry (in `~/.config/task-cli/config.yaml`) grouped by
   project. Only `create` is repo-bound (it writes into one project) — outside a repo it fails
   with a clear 3-part error.
+- **Paged like git**: `list`/`find` page through `less` only on an interactive terminal;
+  piped/scripted output is plain text. Cap is 100 interactive / 30 piped (override with `-n`).
+  Disable with `--no-pager`, `NO_PAGER`, or empty `$PAGER`. `--json` is never paged.
 """
 
 

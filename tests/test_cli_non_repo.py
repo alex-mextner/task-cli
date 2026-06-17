@@ -245,6 +245,36 @@ def test_find_outside_repo_searches_all_projects_grouped(capsys, tmp_path, monke
     assert "acme/backend" in out and "#2" in out
 
 
+def test_grouped_list_is_paged_on_tty(capsys, tmp_path, monkeypatch):
+    # the cross-project GROUPED view must page like the flat one: on a TTY the section headings +
+    # tickets flow THROUGH the pager (sentinel file), not to stdout. Covers the grouped path.
+    from tasklib import cli as _cli
+
+    store = {
+        "acme/frontend": [Ticket(title="Fix header", state=State.IN_PROGRESS, id="#12")],
+        "acme/backend": [Ticket(title="DB migration", state=State.TODO, id="#7")],
+    }
+    monkeypatch.setattr("tasklib.backends.get_backend", _ByCoordBackend.factory(store))
+    monkeypatch.setenv(
+        "XDG_CONFIG_HOME",
+        _gh_config(tmp_path, "projects:\n  - {repo: acme/frontend}\n  - {repo: acme/backend}\n"),
+    )
+    sink = tmp_path / "sink.txt"
+    fake_pager = tmp_path / "pg.sh"
+    fake_pager.write_text(f'#!/bin/sh\ncat > "{sink}"\n', encoding="utf-8")
+    fake_pager.chmod(0o755)
+    monkeypatch.setenv("TASK_PAGER", str(fake_pager))
+    monkeypatch.setattr(_cli.sys.stdout, "isatty", lambda: True, raising=False)
+
+    rc = main(["list", "-C", str(tmp_path)])
+    assert rc == 0
+    paged = sink.read_text(encoding="utf-8")
+    # the heading-per-project body reached the pager, including the session-vs-all notice.
+    assert "showing all project tasks" in paged
+    assert "acme/frontend" in paged and "#12" in paged
+    assert "acme/backend" in paged and "#7" in paged
+
+
 def test_read_outside_repo_routes_to_single_github_project(capsys, tmp_path, monkeypatch):
     # exactly one github project registered → a `#id` routes there unambiguously.
     store = {"acme/only": [Ticket(title="The one", state=State.TODO, id="#42")]}

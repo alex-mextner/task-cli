@@ -148,6 +148,19 @@ in-repo fallback (session empty → all of *this* repo's tickets) stays the flat
 scoped to the current repo, even though the text output prints the `showing all project tasks`
 line. Only the cross-project view is grouped.
 
+### Pagination (`list` / `find`)
+
+Like `git log`, the human (non-`--json`) output is paged through `less` **only when stdout is an
+interactive terminal**. Piped or scripted (`task list | …`, CI), it prints plain text so it stays
+parseable — no pager, no surprises. Short output that fits one screen prints directly (`less -F`).
+
+- The result cap follows the same split: **100** in a terminal (the pager scrolls), **30** when
+  piped. An explicit **`-n N`** always wins.
+- Opt out of the pager with **`--no-pager`**, **`NO_PAGER=1`** (any non-empty value), or an empty
+  **`$PAGER`/`$TASK_PAGER`** (git's "cat, don't page"). Choose the pager via `$TASK_PAGER` →
+  `$PAGER` → `less` → `more`. `$LESS` defaults to `FRX` (quit-if-one-screen, raw colors, no screen
+  clear) unless you set it.
+
 The cross-project view reads a **`projects:`** registry from the config cascade — usually the
 **global** `~/.config/task-cli/config.yaml`, since it spans repos:
 
