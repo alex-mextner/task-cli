@@ -201,6 +201,74 @@ def test_rig_yaml_broken_yaml_via_load_falls_through(tmp_path, monkeypatch):
     assert cfg.backend == "github-issues"
 
 
+def test_rig_yaml_present_but_pyyaml_missing_falls_through(tmp_path, monkeypatch):
+    # The installer can continue without PyYAML (built-in defaults promised). A repo that merely
+    # CONTAINS a rig.yaml must NOT traceback with ModuleNotFoundError when `import yaml` fails in
+    # _load_yaml — it falls through to the github default, same as an unreadable rig.yaml, and
+    # logs a WARN (the contract: ignore-and-warn, not silently drop).
+    import sys
+
+    import tasklib.logging as task_logging
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "rig.yaml").write_text("task: {backend: linear, team: HYP}\n", encoding="utf-8")
+
+    warns: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        task_logging,
+        "log_event",
+        lambda event, level="INFO", **f: warns.append((level, event)),
+    )
+    # Stub yaml out of the import system. On CPython a None entry makes `import yaml` raise a
+    # real ModuleNotFoundError with name="yaml" (verified: "import of yaml halted; None in
+    # sys.modules") — a true integration check that drives the actual `import yaml` in _load_yaml,
+    # unlike the sibling tests that mock _load_yaml. Do NOT "fix" this to a message-match shim.
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+    cfg = load(tmp_path)  # must not raise
+    assert cfg.backend == "github-issues"
+    assert not any(layer.startswith("rig:") for layer in cfg.layers)
+    assert ("WARN", "rig.yaml not loaded; ignoring") in warns
+
+
+@pytest.mark.parametrize("missing", ["something_else", "yaml_processor", "my_yaml_utils"])
+def test_rig_yaml_unrelated_modulenotfound_propagates(tmp_path, monkeypatch, missing):
+    # The PyYAML-missing tolerance is narrow and keyed on exc.name only: a ModuleNotFoundError for
+    # anything OTHER than the yaml package is a genuinely broken environment and must surface, not
+    # masquerade as "no rig.yaml". Includes substring-collision names (yaml_processor) that a
+    # message-based match would have wrongly swallowed.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "rig.yaml").write_text("task: {backend: linear}\n", encoding="utf-8")
+
+    import tasklib.config as config_mod
+
+    def _boom(_path):
+        raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+
+    monkeypatch.setattr(config_mod, "_load_yaml", _boom)
+
+    with pytest.raises(ModuleNotFoundError):
+        load(tmp_path)
+
+
+@pytest.mark.parametrize("yaml_name", ["yaml", "_yaml", "yaml.cyaml"])
+def test_rig_yaml_pyyaml_submodule_missing_falls_through(tmp_path, monkeypatch, yaml_name):
+    # A partially-broken PyYAML whose C-extension or a submodule is missing (exc.name in the yaml
+    # package) is treated the same as PyYAML wholly absent: ignore-and-warn, github default.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "rig.yaml").write_text("task: {backend: linear}\n", encoding="utf-8")
+
+    import tasklib.config as config_mod
+
+    def _boom(_path):
+        raise ModuleNotFoundError(f"No module named '{yaml_name}'", name=yaml_name)
+
+    monkeypatch.setattr(config_mod, "_load_yaml", _boom)
+
+    cfg = load(tmp_path)  # must not raise
+    assert cfg.backend == "github-issues"
+
+
 def test_rig_yaml_task_version_subkey_ignored_not_fatal(tmp_path, monkeypatch):
     # `version` under task: is NOT task-cli's schema version (rig.yaml has its own top-level
     # version); a stray one is warn-and-ignored, not fail-closed — forward-compat with rig-cli.

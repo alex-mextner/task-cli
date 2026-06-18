@@ -203,6 +203,24 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _ignore_rig(exc: Exception) -> dict[str, Any]:
+    """Log a foreign-rig.yaml problem at WARN and yield an empty overlay (clean fall-through).
+
+    Shared by the rig.yaml load's tolerated failures — unreadable/invalid content
+    (``ConfigError``) and PyYAML being absent (``ModuleNotFoundError`` on the yaml import) — so
+    both warn-and-ignore identically. The message says "not loaded" rather than "unreadable": a
+    missing-PyYAML file is perfectly readable, only unparsed.
+
+    The ``log_event`` import is deliberately call-time (not hoisted to module top): tests patch
+    ``tasklib.logging.log_event`` to assert the WARN, which only works while the lookup is
+    deferred to call time. Keep it here.
+    """
+    from .logging import log_event
+
+    log_event("rig.yaml not loaded; ignoring", level="WARN", error=str(exc))
+    return {}
+
+
 def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for k, v in over.items():
@@ -316,10 +334,20 @@ def load(
         try:
             rig_data = _load_yaml(rig_path)
         except ConfigError as exc:
-            from .logging import log_event
-
-            log_event("rig.yaml unreadable; ignoring", level="WARN", error=str(exc))
-            rig_data = {}
+            rig_data = _ignore_rig(exc)
+        except ModuleNotFoundError as exc:
+            # PyYAML absent — the installer may continue without it, promising built-in defaults.
+            # A repo merely CONTAINING a rig.yaml must NOT traceback then; it falls through to the
+            # github default, same as any other foreign-file problem above. ModuleNotFoundError
+            # (not the broader ImportError: a circular/broken-init ImportError is a real bug that
+            # must surface) scoped to the yaml package by exc.name keeps this to "PyYAML not
+            # installed" — any other missing module is a broken environment and is re-raised.
+            # Matched on exc.name only (CPython always sets it), never the message, so a missing
+            # module that merely has "yaml" in its name (e.g. yaml_processor) still surfaces.
+            name = exc.name or ""
+            if not (name == "yaml" or name == "_yaml" or name.startswith("yaml.")):
+                raise
+            rig_data = _ignore_rig(exc)
         overlay = rig_task_overlay(rig_data)
         if overlay:
             merged = _deep_merge(merged, overlay)
