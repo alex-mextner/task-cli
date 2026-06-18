@@ -1,16 +1,23 @@
-"""Config cascade loader for ``task.yaml`` (per-repo) + ``~/.config/task-cli/config.yaml``.
+"""Config cascade loader for the per-repo ``rig.yaml`` / ``task.yaml`` + global config.
 
-Two layers, cascaded by **location** (no scope flag), exactly like rig-cli:
+Layers, cascaded by **location** (no scope flag), exactly like rig-cli — later layers win:
 
-1. **Global** — ``~/.config/task-cli/config.yaml`` (or ``$XDG_CONFIG_HOME/...``). Machine-wide
+1. **Built-in defaults** — GitHub Issues, every gate on (the zero-config path).
+2. **Global** — ``~/.config/task-cli/config.yaml`` (or ``$XDG_CONFIG_HOME/...``). Machine-wide
    defaults a developer carries across repos.
-2. **Per-repo** — ``task.yaml`` at the repo root. Committed by default; the reproducible
-   source of truth; **overrides** the global layer.
+3. **Per-repo ``rig.yaml`` ``task:`` block** — the repo's committed ``rig.yaml`` is the single
+   source of truth for the whole agent toolchain (rig provisions it). Its ``task:`` block
+   selects the tracker backend per repo (CTO decision #4136.4: hyperide → Linear/HYP, every
+   other repo → GitHub Issues by default). See :func:`rig_task_overlay` for the shape.
+4. **Per-repo ``task.yaml``** — the native task-cli config, if a repo keeps one. It still wins
+   over ``rig.yaml`` so an existing repo with a hand-tuned ``task.yaml`` is untouched.
+5. **``--config P``** — an explicit file replaces the ``task.yaml`` layer.
 
-The merge is a deep dict merge: per-repo keys win, dicts merge recursively, scalars and
-lists replace wholesale. ``yaml`` is imported lazily so ``task --help`` works without PyYAML;
-the loader degrades to built-in defaults if no config file is present (so the tool works with
-**zero config** on any GitHub repo, as promised in §2).
+The merge is a deep dict merge: later keys win, dicts merge recursively, scalars and lists
+replace wholesale. ``yaml`` is imported lazily so ``task --help`` works without PyYAML; the
+loader degrades to built-in defaults if no config file is present (so the tool works with
+**zero config** on any GitHub repo — and a repo with only a ``rig.yaml`` task: block needs no
+``task.yaml`` at all).
 
 Validation is fail-closed on the few enum-ish keys (backend, version), lenient on the rest —
 this is a personal-tooling config, not a hostile-input parser.
@@ -24,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_FILENAME = "task.yaml"
+RIG_CONFIG_FILENAME = "rig.yaml"
 
 VALID_BACKENDS = {"github-issues", "linear"}
 
@@ -40,6 +48,105 @@ def global_config_path(env: dict[str, str] | None = None) -> Path:
 
 def repo_config_path(repo_root: Path) -> Path:
     return repo_root / CONFIG_FILENAME
+
+
+def rig_config_path(repo_root: Path) -> Path:
+    return repo_root / RIG_CONFIG_FILENAME
+
+
+# Aliases in the rig.yaml ``task:`` block → the dotted path they map onto in task-cli's own
+# config shape. The block is intentionally flat (a CTO drops `task: {backend: linear, team:
+# HYP}` into rig.yaml without learning task-cli's nesting), so we translate the shorthands.
+# ``team``/``project`` are Linear coordinates; ``repo`` is the GitHub coordinate.
+_RIG_TASK_ALIASES: dict[str, tuple[str, ...]] = {
+    "team": ("linear", "team"),
+    "project": ("linear", "project"),
+    "repo": ("github", "repo"),
+}
+# Keys passed through verbatim (same name in both shapes): the backend selector + the nested
+# sections a power user might want to override straight from rig.yaml. ``version`` is
+# intentionally NOT here — that is task-cli's own config-schema version (rig.yaml carries its
+# OWN top-level version), and passing it through would make it fail-closed, so a future rig
+# bumping a stray task.version would crash an older task-cli — the opposite of forward-compat.
+_RIG_TASK_PASSTHROUGH = frozenset(
+    {"backend", "github", "linear", "projects", "enforce", "classify", "session"}
+)
+
+
+def rig_task_overlay(rig_data: dict[str, Any]) -> dict[str, Any]:
+    """Translate a ``rig.yaml`` ``task:`` block into a task-cli config overlay.
+
+    The block is the per-repo tracker selection the CTO drops into a repo's ``rig.yaml``::
+
+        task:
+          backend: linear      # or github-issues (the default)
+          team: HYP            # → linear.team
+          project: ""          # → linear.project
+          # repo: owner/name   # → github.repo (for the github-issues backend)
+
+    Returns ``{}`` when there is no ``task:`` block, so a ``rig.yaml`` that says nothing about
+    the tracker leaves the cascade untouched (clean fall-through to the github default). The
+    same for a ``rig.yaml`` whose document root is not a mapping (defensive — ``_load_yaml``
+    already guards this, but this keeps the function safe on any caller). A non-mapping
+    ``task:`` is a config error (fail-closed before any backend call).
+
+    Unknown sub-keys inside ``task:`` are **warned-and-ignored**, not fatal: ``rig.yaml`` is
+    owned and evolved by rig-cli, so a sub-key a newer rig writes must not crash every ``task``
+    command in a repo just because this task-cli predates it (forward-compat across two tools
+    that ship independently). This mirrors the lenient handling of the native ``task.yaml``.
+    """
+    if not isinstance(rig_data, dict):
+        return {}
+    block = rig_data.get("task")
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise ConfigError(f"'task' block in {RIG_CONFIG_FILENAME} must be a mapping, got {type(block).__name__}")
+
+    # Each key contributes a fragment; we deep-merge them so a flat shorthand (team: HYP →
+    # {linear: {team}}) and a same-named nested section (linear: {project}) in the SAME block
+    # combine instead of clobbering. Order-independent: deep-merge is commutative on disjoint
+    # leaves, and a true leaf collision (same dotted path set twice) is caught explicitly.
+    import copy
+
+    overlay: dict[str, Any] = {}
+    for key, value in block.items():
+        if key in _RIG_TASK_ALIASES:
+            *parents, leaf = _RIG_TASK_ALIASES[key]
+            fragment: dict[str, Any] = {}
+            cursor = fragment
+            for part in parents:
+                cursor = cursor.setdefault(part, {})
+            cursor[leaf] = value
+        elif key in _RIG_TASK_PASSTHROUGH:
+            fragment = {key: copy.deepcopy(value)} if isinstance(value, dict) else {key: value}
+        else:
+            # Forward-compat: a sub-key a newer rig-cli writes that this task-cli doesn't know.
+            # Skip it (don't crash); log so a genuine typo is still discoverable (TASK_LOG=json).
+            from .logging import log_event
+
+            log_event("rig.task: ignoring unknown key", level="WARN", key=str(key))
+            continue
+        _assert_no_leaf_conflict(overlay, fragment, prefix=f"{RIG_CONFIG_FILENAME} task")
+        overlay = _deep_merge(overlay, fragment)
+    return overlay
+
+
+def _assert_no_leaf_conflict(base: dict[str, Any], over: dict[str, Any], *, prefix: str) -> None:
+    """Raise ConfigError if ``over`` would overwrite a leaf that ``base`` already set.
+
+    Deep-merge silently lets a later scalar replace an earlier one; for the ``task:`` block we
+    want a true collision (e.g. ``team: HYP`` AND ``linear: {team: X}`` both setting
+    ``linear.team``) to be a hard error, not a last-writer-wins surprise.
+    """
+    for k, v in over.items():
+        if k not in base:
+            continue
+        bv = base[k]
+        if isinstance(bv, dict) and isinstance(v, dict):
+            _assert_no_leaf_conflict(bv, v, prefix=f"{prefix}.{k}")
+        elif bv != v:
+            raise ConfigError(f"conflicting value for '{prefix}.{k}' in {RIG_CONFIG_FILENAME}")
 
 
 # Built-in defaults — what the tool uses with zero config (GitHub Issues, everything enforced).
@@ -175,9 +282,12 @@ def load(
 ) -> LoadedConfig:
     """Cascade-load config for ``repo_root``, layered over the built-in :data:`DEFAULTS`.
 
-    ``explicit_config`` (from ``--config P``) replaces the per-repo layer. The result is
-    validated (fail-closed on backend/version) before return. With no config file at all,
-    the built-in defaults are returned (the zero-config path).
+    Layer order (later wins): defaults → global → ``rig.yaml`` ``task:`` block → ``task.yaml``
+    → ``--config P`` (the last replaces the ``task.yaml`` layer). The ``rig.yaml`` block is the
+    canonical per-repo tracker selector (rig provisions it); a native ``task.yaml`` still wins
+    so a repo that keeps one is unaffected. The result is validated (fail-closed on
+    backend/version) before return. With no config file at all the built-in defaults are
+    returned (the zero-config GitHub-Issues path).
     """
     import copy
 
@@ -193,6 +303,27 @@ def load(
         if gpath.is_file():
             merged = _deep_merge(merged, _load_yaml(gpath))
             layers.append(f"global:{gpath}")
+
+    # rig.yaml task: block — the per-repo tracker selector, below the native task.yaml so a
+    # repo keeping a hand-tuned task.yaml is untouched. Read whether or not --config is given:
+    # --config replaces the task.yaml layer, not the toolchain's rig.yaml selection.
+    # rig.yaml is a FOREIGN file (owned/evolved by rig-cli): a parse error or unexpected root
+    # shape must NOT crash every `task` command in the repo — it falls through to the github
+    # default (forward-compat). This tolerance is rig.yaml-only; task-cli's own task.yaml/global
+    # stay fail-closed below.
+    rig_path = rig_config_path(repo_root)
+    if rig_path.is_file():
+        try:
+            rig_data = _load_yaml(rig_path)
+        except ConfigError as exc:
+            from .logging import log_event
+
+            log_event("rig.yaml unreadable; ignoring", level="WARN", error=str(exc))
+            rig_data = {}
+        overlay = rig_task_overlay(rig_data)
+        if overlay:
+            merged = _deep_merge(merged, overlay)
+            layers.append(f"rig:{rig_path}")
 
     if explicit_config is not None:
         rpath = explicit_config.resolve()
@@ -222,7 +353,10 @@ def validate(data: dict[str, Any]) -> None:
         raise ConfigError(f"unsupported config version {version} (this task supports v1)")
 
     backend = data.get("backend", "github-issues")
-    if backend not in VALID_BACKENDS:
+    # isinstance guard BEFORE the membership test: VALID_BACKENDS is a set, so a non-hashable
+    # value (a dict/list from a malformed `backend:` in the foreign rig.yaml) would raise an
+    # unhandled TypeError on `in`. Convert that into a clean fail-closed ConfigError.
+    if not isinstance(backend, str) or backend not in VALID_BACKENDS:
         raise ConfigError(f"backend must be one of {sorted(VALID_BACKENDS)}, got {backend!r}")
 
     for key in ("github", "linear", "enforce", "classify", "session"):

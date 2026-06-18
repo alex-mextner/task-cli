@@ -30,7 +30,7 @@ runtime dep is `pyyaml` (for `task.yaml`); without it the tool falls back to bui
 
 ```bash
 gh auth login      # GitHub Issues (the default backend)
-linear auth        # Linear (per-repo, via task.yaml)
+linear auth        # Linear (per-repo, via the rig.yaml task: block)
 ```
 
 `task` reads `gh auth token` / `~/.config/linear/credentials.toml` (or `$GITHUB_TOKEN` /
@@ -183,7 +183,30 @@ ollama, or on any one key. **Bias is to `change` on ambiguity** — most questio
 are latent change requests. `task classify "<text>" --create` is the entry point the `tg-cli`
 inbound hook calls.
 
-## Config — `task.yaml` (per-repo) + `~/.config/task-cli/config.yaml` (global)
+## Config — `rig.yaml` `task:` block (per-repo) + `task.yaml` + global
+
+The per-repo tracker backend is selected from the repo's committed **`rig.yaml`** — the single
+source of truth for the whole agent toolchain (rig provisions it). Drop a `task:` block in:
+
+```yaml
+# rig.yaml (repo root) — selects the tracker backend for this repo
+task:
+  backend: linear      # or github-issues (the default for every other repo)
+  team: HYP            # → linear.team (Linear coordinate)
+  # project: ""        # → linear.project
+  # repo: owner/name   # → github.repo (for the github-issues backend)
+```
+
+The block is intentionally flat: `team`/`project`/`repo` are shorthands translated onto
+task-cli's own config shape, and the full sections (`github:`/`linear:`/`enforce:`/`classify:`/
+`session:`/`projects:`) may be nested in verbatim for fine control. Unknown
+sub-keys under `task:` are warned-and-ignored, never fatal — `rig.yaml` is owned by rig-cli and
+a newer key must not crash an older task-cli. **DEFAULT = GitHub Issues**: a repo with no
+`task:` block (or no `rig.yaml`) falls through cleanly to `github-issues`. A repo that keeps a
+native `task.yaml` still has it win (the cascade is defaults → global → `rig.yaml` task: →
+`task.yaml` → `--config`).
+
+The full native shape (also accepted as `task.yaml`, or nested under `rig.yaml` `task:`):
 
 ```yaml
 version: 1
@@ -217,8 +240,8 @@ session:
   label_prefix: "session:"
 ```
 
-`task.yaml` is committed by default and overrides the global layer. Scope is by location,
-never a flag. With no config at all the tool defaults to `github-issues` with every gate on.
+Config is committed by default and scoped by location, never a flag. With no config at all the
+tool defaults to `github-issues` with every gate on.
 
 ## Architecture
 
