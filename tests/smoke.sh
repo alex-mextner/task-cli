@@ -63,6 +63,24 @@ case "$OUT" in
   *) fail "task list outside a repo: unexpected output" ;;
 esac
 
+# ── 4c. a repo rig.yaml `task:` block selects the tracker backend (CTO #4136.4) ─
+# Drop the hyperide-shaped `task: {backend: linear, team: HYP}` into a repo rig.yaml; the
+# config cascade must select Linear/HYP from it with no task.yaml present. The rig dir lives
+# under $TMP (already trap-cleaned on EXIT) so a `fail` mid-check leaves nothing behind.
+RIGDIR="$TMP/rig-repo"
+mkdir -p "$RIGDIR"
+printf 'task: {backend: linear, team: HYP}\n' > "$RIGDIR/rig.yaml"
+XDG_CONFIG_HOME="$TMP/cfg3" $PY - "$RIGDIR" <<'PYEOF' || fail "rig.yaml task: block load"
+import sys
+sys.path.insert(0, ".")
+from pathlib import Path
+from tasklib.config import load
+cfg = load(Path(sys.argv[1]))
+assert cfg.backend == "linear", cfg.backend
+assert cfg.section("linear")["team"] == "HYP", cfg.section("linear")
+PYEOF
+pass "rig.yaml task: block -> linear/HYP"
+
 # ── 5. pytest unit suite ──────────────────────────────────────────────────────
 if $PY -c 'import pytest' 2>/dev/null; then
   ( cd "$ROOT" && $PY -m pytest -q ) || fail "pytest"
