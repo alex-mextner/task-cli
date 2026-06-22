@@ -1,8 +1,15 @@
 """install-skill — register the ``task`` agent skill so harnesses auto-discover it.
 
-Writes a SKILL.md (Agent Skills standard) into ``~/.agents/skills/task/`` so Claude Code,
-Codex, opencode, Gemini, and Cursor surface ``task`` as a usable capability. Idempotent:
-skips when the SKILL.md is already current. Stdlib-only.
+Writes two files, mirroring how the sibling personal CLIs (draw/tg/review) are installed:
+
+1. A SKILL.md (Agent Skills standard) into ``~/.agents/skills/task/`` so Claude Code,
+   Codex, opencode, Gemini, and Cursor surface ``task`` as a usable capability.
+2. A one-line blurb into ``~/.agents/skills/.blurbs/task.md``. A SessionStart hook cats
+   every ``.blurbs/*.md`` into each new agent session ("Agent CLI tools installed on this
+   machine"). Without the blurb the tool is installed but invisible at session start while
+   its siblings are advertised — so this write is what makes ``task`` an equal citizen.
+
+Idempotent: skips a write when the target is already current. Stdlib-only.
 """
 
 from __future__ import annotations
@@ -65,14 +72,32 @@ task session                     # show current session + its tickets
   Disable with `--no-pager`, `NO_PAGER`, or empty `$PAGER`. `--json` is never paged.
 """
 
+# One-line SessionStart blurb, same shape the siblings (draw/tg/review) use. The hook cats
+# every ``.blurbs/*.md`` verbatim, so keep this a single bullet line ending in a newline.
+BLURB = (
+    "- `task` — the enforced ticket interface (task-cli). Every request → a durable, "
+    "well-formed ticket (acceptance criteria, motivation, user-impact, cost-of-inaction, "
+    "screenshots for UI). Use INSTEAD of raw `gh issue` / `linear` by hand. "
+    "`task new --title \"...\" --acceptance \"...\" --why \"...\" --impact \"...\" "
+    "--if-not-done \"...\"`, `task list` (this session), `task read <id>`, "
+    "`task find \"<q>\"`, `task done <id>`, `task classify \"<text>\"`. Backends: "
+    "GitHub Issues (default) + Linear (per-repo); credentials harvested from `gh`/`linear`.\n"
+)
+
+
+def _write_if_changed(target: Path, content: str) -> bool:
+    """Write ``content`` to ``target`` unless it is already current. Returns True on write."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and target.read_text(encoding="utf-8") == content:
+        print(f"task: already current at {target}")
+        return False
+    target.write_text(content, encoding="utf-8")
+    print(f"task: wrote {target}")
+    return True
+
 
 def install_skill() -> int:
-    skills_dir = Path(os.path.expanduser("~/.agents/skills")) / SKILL_NAME
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    target = skills_dir / "SKILL.md"
-    if target.is_file() and target.read_text(encoding="utf-8") == SKILL_MD:
-        print(f"task: skill already current at {target}")
-        return 0
-    target.write_text(SKILL_MD, encoding="utf-8")
-    print(f"task: wrote skill → {target}")
+    skills_root = Path(os.path.expanduser("~/.agents/skills"))
+    _write_if_changed(skills_root / SKILL_NAME / "SKILL.md", SKILL_MD)
+    _write_if_changed(skills_root / ".blurbs" / f"{SKILL_NAME}.md", BLURB)
     return 0
