@@ -9,9 +9,6 @@ file, so we assert the text actually reached the pager (not a mock of our own co
 from __future__ import annotations
 
 import io
-import sys
-
-import pytest
 
 from tasklib import pager
 
