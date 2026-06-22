@@ -13,7 +13,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
-from ..model import Screenshot, State, Ticket
+from ..model import State, Ticket
 from ..render import parse, render
 from . import BackendError
 from .http import HttpError, request_json

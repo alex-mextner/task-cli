@@ -41,6 +41,9 @@ def test_no_command_prints_help(capsys):
     "argv",
     [
         ["create", "--title", "t"],
+        ["new", "--title", "t"],
+        ["done", "#1"],
+        ["done", "#1", "--screenshot", "after.png"],
         ["list"],
         ["list", "--all", "--state", "todo"],
         ["read", "#1"],
@@ -133,6 +136,71 @@ def test_create_records_session_sidecar(_inject_fake):
 
     main(_create_argv())
     assert read_ids("testsess") == ["#1"]
+
+
+# ── `new` alias + `done` close verb (CTO-requested ergonomics, issue #8) ─────────────
+
+
+def test_new_is_an_alias_of_create(capsys, _inject_fake):
+    # `new` takes the identical argument set and creates a ticket just like `create`.
+    argv = _create_argv()
+    argv[0] = "new"
+    rc = main(argv)
+    assert rc == 0
+    assert "created #1" in capsys.readouterr().out
+    assert len(_inject_fake.list()) == 1
+
+
+def test_new_enforces_the_create_gates(capsys, _inject_fake):
+    # the alias is not an escape hatch: a missing motivation still refuses.
+    rc = main(["new", "--title", "t", "--what", "c", "--impact", "u", "--if-not-done", "p", "--acceptance", "w"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "refusing to create" in out and "motivation" in out
+
+
+def test_done_closes_a_non_ui_ticket(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["done", "#1"])
+    assert rc == 0
+    assert "→ done" in capsys.readouterr().out
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_done_runs_the_on_done_gates(capsys, _inject_fake):
+    # a UI ticket with only a creation screenshot cannot be closed via `done` — the on-done
+    # gate demands the implementation proof (same enforcement as `change --done`/`status done`).
+    main(_create_argv() + ["--label", "ui", "--screenshot", "creation.png"])
+    capsys.readouterr()
+    rc = main(["done", "#1"])
+    assert rc == 2
+    assert "implementation" in capsys.readouterr().out
+
+
+def test_done_with_implementation_screenshot_closes_and_attaches(_inject_fake):
+    main(_create_argv() + ["--label", "ui", "--screenshot", "creation.png"])
+    rc = main(["done", "#1", "--screenshot", "after.png"])
+    assert rc == 0
+    assert ("#1", "after.png") in _inject_fake.attachments
+
+
+def test_done_persists_skip_justification(_inject_fake):
+    # `done --skip-screenshots` records the waiver in the body, not lost to a re-fetch.
+    main(_create_argv() + ["--label", "ui", "--skip-screenshots", "no proof at create"])
+    rc = main(["done", "#1", "--skip-screenshots", "config-only change, no UI"])
+    assert rc == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "## Skipped gates" in body and "config-only change, no UI" in body
+
+
+def test_done_on_unknown_id_is_clean_error_not_traceback(capsys, _inject_fake):
+    # a backend lookup miss surfaces as a clean `error:` (exit 2), never a traceback.
+    rc = main(["done", "#999"])
+    assert rc == 2
+    assert "error:" in capsys.readouterr().out
 
 
 # ── list session-scoping ────────────────────────────────────────────────────────────

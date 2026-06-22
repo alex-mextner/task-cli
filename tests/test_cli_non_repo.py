@@ -277,8 +277,6 @@ def test_grouped_list_is_paged_on_tty(capsys, tmp_path, monkeypatch):
 
 def test_read_outside_repo_routes_to_single_github_project(capsys, tmp_path, monkeypatch):
     # exactly one github project registered → a `#id` routes there unambiguously.
-    store = {"acme/only": [Ticket(title="The one", state=State.TODO, id="#42")]}
-
     class _Get:
         def __call__(self, cfg, env=None):
             assert cfg.section("github").get("repo") == "acme/only"

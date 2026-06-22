@@ -39,11 +39,13 @@ linear auth        # Linear (per-repo, via the rig.yaml task: block)
 ## Commands
 
 ```
-task create   --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..."
+task new      --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..."
+task create                        # alias of `new` (same arguments, same gates)
 task list                          # THIS session's tickets (falls back to all when empty)
 task list --all                    # every known project's tickets, grouped by project
 task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
 task find "<query>"                # search title+body (cross-project when outside a repo)
+task done <id>    [--screenshot p] # close a ticket — runs the on-done gates
 task change <id>  [--done]         # update; --done runs the on-done gates (close)
 task status <id> [<new-state>]     # read or transition state (works outside a repo)
 task classify "<text>" [--create]  # change|justAsk via review; --create makes/dedups a ticket
@@ -56,7 +58,7 @@ hatch `--skip-<gate> "<reason>"`.
 ### Example
 
 ```bash
-task create \
+task new \
   --title "Add a logout button to the header" \
   --what "A button in the top-right that ends the session and redirects to /login." \
   --why "Users have no way to sign out on shared machines." \
@@ -136,8 +138,8 @@ A tool's *read* and *global* operations should not demand you stand inside a git
 - **`task read` / `task status` / `task find`** work outside a repo too. An id is routed to a
   registered project (a Linear `HYP-3` by its team; a `#123` when exactly one GitHub project
   is registered); an ambiguous id fails with a clear, actionable error.
-- **Only `task create` is repo-bound** — it writes a ticket into one specific project, so it
-  needs a repo (or `--repo owner/name`). Outside one it fails with a 3-part WHAT/WHY/HOW error.
+- **Only `task new`/`create` is repo-bound** — it writes a ticket into one specific project, so
+  it needs a repo (or `--repo owner/name`). Outside one it fails with a 3-part WHAT/WHY/HOW error.
 - A project whose backend errors (auth, offline, unknown team) is shown as a **degraded
   group** — it never aborts the whole cross-project listing.
 
@@ -262,6 +264,20 @@ tool defaults to `github-issues` with every gate on.
 python3 -m pytest -q     # the unit suite (FakeBackend; never hits live GitHub/Linear)
 bash tests/smoke.sh      # --help, every subcommand --help, lazy-import invariant, pytest
 ```
+
+## Roadmap (what v1 does NOT do yet)
+
+v1 is the usable core: `new`/`create`, `list`, `read`, `find`, `change`, `done`, `status`,
+`classify`, `session` against GitHub Issues (default) and Linear, with the enforcement gates.
+Deferred to follow-up issues:
+
+- **Dependency system + Gantt rendering** — [#1](https://github.com/alex-mextner/task-cli/issues/1).
+- **Daemon service + webhooks** (adapter-based trackers, survives restarts) —
+  [#2](https://github.com/alex-mextner/task-cli/issues/2).
+- **Completion + due-date notifications** (tmux-inject into the agent pane) —
+  [#3](https://github.com/alex-mextner/task-cli/issues/3).
+- **Integrations** — tg classify-on-inbound hook, the agent-tools `require-ticket-before-commit`
+  guard, and rig cross-repo provisioning — [#4](https://github.com/alex-mextner/task-cli/issues/4).
 
 ## License
 

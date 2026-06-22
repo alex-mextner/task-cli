@@ -19,9 +19,9 @@ description: >-
   well-formed ticket — task-cli enforces acceptance criteria, motivation, user-impact,
   cost-of-inaction, screenshots (for UI), and the section template, so a ticket and its
   PR speak one shape. Use INSTEAD of raw `gh issue` / `linear` by hand. Backends: GitHub
-  Issues (default) and Linear (per-repo). Commands: `task create`, `task list` (this
-  session's tickets), `task read <id>`, `task find <q>`, `task change <id>`,
-  `task status <id> [<state>]`, `task classify "<text>"`, `task session`.
+  Issues (default) and Linear (per-repo). Commands: `task new`/`task create`, `task list`
+  (this session's tickets), `task read <id>`, `task find <q>`, `task change <id>`,
+  `task done <id>`, `task status <id> [<state>]`, `task classify "<text>"`, `task session`.
 metadata:
   author: alex-mextner
   repo: https://github.com/alex-mextner/task-cli
@@ -34,12 +34,13 @@ ticket that lacks the required fields, so work is always traceable back to an as
 
 ## Commands
 ```
-task create --title "..." --acceptance "..." --why "..." --impact "..." --if-not-done "..."
+task new --title "..." --acceptance "..." --why "..." --impact "..." --if-not-done "..."
 task list                        # THIS session's tickets (falls back to all when empty)
 task list --all                  # every known project's tickets, grouped by project
 task read <id>                   # full ticket (every section) — works outside a repo
 task find "<query>"              # search title+body (cross-project when outside a repo)
 task change <id> --acceptance "..." --screenshot proof.png
+task done <id>                   # close a ticket (runs the on-done gates)
 task status <id>                 # read state (works outside a repo)
 task status <id> done            # transition (runs the on-done gates)
 task classify "<text>" --create  # change|justAsk; on `change`, create/dedup a ticket
@@ -57,8 +58,8 @@ task session                     # show current session + its tickets
   tmux pane → git branch); tickets are labelled `session:<id>`.
 - **Works outside a repo**: `read`/`status`/`find`/`list` run anywhere; outside a git repo
   `list` aggregates the `projects:` registry (in `~/.config/task-cli/config.yaml`) grouped by
-  project. Only `create` is repo-bound (it writes into one project) — outside a repo it fails
-  with a clear 3-part error.
+  project. Only `new`/`create` is repo-bound (it writes into one project) — outside a repo it
+  fails with a clear 3-part error.
 - **Paged like git**: `list`/`find` page through `less` only on an interactive terminal;
   piped/scripted output is plain text. Cap is 100 interactive / 30 piped (override with `-n`).
   Disable with `--no-pager`, `NO_PAGER`, or empty `$PAGER`. `--json` is never paged.

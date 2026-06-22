@@ -6,7 +6,7 @@ filesystem (sidecar). All pure logic lives in the sibling modules (``model``/``r
 ``policy``/``classify``/``session``/``config``). Heavy/optional imports (yaml via config,
 the backends) are lazy so ``task --help`` stays fast and dependency-light.
 
-Subcommands: create · list · read/view · find · change · status · classify · session.
+Subcommands: create/new · list · read/view · find · change · status · done · classify · session.
 Global flags: --backend, --repo, --config, --json, --yes, and per-gate --skip-<gate>.
 """
 
@@ -68,6 +68,21 @@ def _add_skip_flags(p: argparse.ArgumentParser) -> None:
         p.add_argument(flag, dest=dest, metavar="REASON", help=f"skip the {gate} gate with a recorded justification")
 
 
+def _add_create_args(p: argparse.ArgumentParser) -> None:
+    """The ticket-creation argument set, shared by `create` and its `new` alias."""
+    p.add_argument("--title", help="ticket title")
+    p.add_argument("--from-message", dest="from_message", metavar="TEXT", help="raw user text → derive title/body")
+    p.add_argument("--what", help="the change (one paragraph)")
+    p.add_argument("--acceptance", action="append", default=[], metavar="CRIT", help="acceptance criterion (repeatable)")
+    p.add_argument("--why", help="motivation")
+    p.add_argument("--impact", help="user impact")
+    p.add_argument("--if-not-done", dest="if_not_done", help="cost of inaction")
+    p.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="screenshot (repeatable)")
+    p.add_argument("--label", action="append", default=[], help="label (repeatable)")
+    p.add_argument("--yes", action="store_true", help="non-interactive; do not prompt")
+    _add_skip_flags(p)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="task",
@@ -85,19 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command", metavar="<command>")
 
-    # create
-    cp = sub.add_parser("create", parents=[common], help="create a ticket (enforces the policy gates)")
-    cp.add_argument("--title", help="ticket title")
-    cp.add_argument("--from-message", dest="from_message", metavar="TEXT", help="raw user text → derive title/body")
-    cp.add_argument("--what", help="the change (one paragraph)")
-    cp.add_argument("--acceptance", action="append", default=[], metavar="CRIT", help="acceptance criterion (repeatable)")
-    cp.add_argument("--why", help="motivation")
-    cp.add_argument("--impact", help="user impact")
-    cp.add_argument("--if-not-done", dest="if_not_done", help="cost of inaction")
-    cp.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="screenshot (repeatable)")
-    cp.add_argument("--label", action="append", default=[], help="label (repeatable)")
-    cp.add_argument("--yes", action="store_true", help="non-interactive; do not prompt")
-    _add_skip_flags(cp)
+    # create (+ `new` alias — same arguments, same handler)
+    for verb, blurb in (
+        ("create", "create a ticket (enforces the policy gates)"),
+        ("new", "alias of create (enforces the policy gates)"),
+    ):
+        cp = sub.add_parser(verb, parents=[common], help=blurb)
+        _add_create_args(cp)
 
     # list
     lp = sub.add_parser("list", parents=[common], help="list THIS session's tickets (default)")
@@ -144,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
     stp.add_argument("new_state", nargs="?", help="new state (todo|in-progress|in-review|done|cancelled)")
     _add_skip_flags(stp)
 
+    # done — close a ticket by id (the on-done gates run; the close-verb the CTO reaches for)
+    dnp = sub.add_parser("done", parents=[common], help="close a ticket (runs the on-done gates)")
+    dnp.add_argument("id", help="ticket id (#123 or HYP-456)")
+    dnp.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="add implementation screenshot")
+    _add_skip_flags(dnp)
+
     # classify
     clp = sub.add_parser("classify", parents=[common], help="classify a message change|justAsk (the tg hook entry)")
     clp.add_argument("text", help="the message text")
@@ -169,12 +184,14 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "create": cmd_create,
+        "new": cmd_create,  # `new` is an alias of `create` (CTO-requested verb)
         "list": cmd_list,
         "read": cmd_read,
         "view": cmd_read,
         "find": cmd_find,
         "change": cmd_change,
         "status": cmd_status,
+        "done": cmd_done,
         "classify": cmd_classify,
         "session": cmd_session,
         "install-skill": cmd_install_skill,
@@ -978,6 +995,40 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     log_event("ticket.transition", ticket_id=updated.id, state=new_state.value)
     print(_ok(f"{updated.id} → {new_state.value}"))
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    """Close a ticket by id — the dedicated close verb. Runs the on-done gates (and the
+    `--skip-<gate>` hatches), and accepts `--screenshot` for the implementation proof a
+    UI ticket needs to close. The same close path `change --done` takes, minus the edits.
+    """
+    cfg = _load(args)
+    backend = _backend_for_id(cfg, args.id)
+    from .backends import BackendError
+    from .policy import Phase
+
+    try:
+        ticket = backend.get(args.id)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    new_shots = [Screenshot(ref=path, kind="implementation") for path in args.screenshot]
+    ticket.screenshots.extend(new_shots)
+    ticket.skips.update(_collect_skips(args))
+    ticket.state = State.DONE
+    _enforce_or_die(ticket, cfg, Phase.DONE)
+
+    try:
+        updated = backend.update(ticket)
+        _attach_screenshots(backend, updated.id, new_shots)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    from .logging import log_event
+
+    log_event("ticket.transition", ticket_id=updated.id, state=State.DONE.value)
+    print(_ok(f"{updated.id} → {State.DONE.value}"))
     return 0
 
 

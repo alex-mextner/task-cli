@@ -9,7 +9,7 @@ import pytest
 
 from tasklib.backends import BackendError
 from tasklib.backends.github_issues import _parse_remote
-from tasklib.model import Screenshot, State, Ticket
+from tasklib.model import State, Ticket
 
 from .conftest import assert_protocol
 
