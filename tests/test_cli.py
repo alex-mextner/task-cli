@@ -364,6 +364,147 @@ def test_change_close_recorded_waiver_persists(capsys, _inject_fake):
     assert rc == 0
 
 
+# ── close-path transition legality (issue #10) ───────────────────────────────────────
+
+
+def _force_state(backend, ticket_id, state):
+    """Put a stored ticket into ``state`` directly (bypassing the close paths under test)."""
+    from tasklib.model import State
+
+    backend.get(ticket_id).state = State(state) if not isinstance(state, State) else state
+
+
+# Every (close-verb argv) the three close paths reach DONE through. Parametrizing over these
+# proves the SHARED validator gates all three, not just one. ``#1`` is the ticket each test seeds.
+_CLOSE_PATHS = [
+    pytest.param(["done", "#1"], id="done"),
+    pytest.param(["change", "#1", "--done"], id="change--done"),
+    pytest.param(["status", "#1", "done"], id="status-done"),
+]
+
+
+@pytest.mark.parametrize("close_argv", _CLOSE_PATHS)
+def test_close_on_cancelled_ticket_refuses(capsys, _inject_fake, close_argv):
+    # a CANCELLED ticket must NOT be silently resurrected to done by any close path.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    capsys.readouterr()
+    rc = main(close_argv)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "error:" in out
+    assert "cancelled" in out and "illegal transition" in out
+    # the refusal must NOT have re-written the ticket to done.
+    assert _inject_fake.get("#1").state.value == "cancelled"
+
+
+@pytest.mark.parametrize("close_argv", _CLOSE_PATHS)
+def test_close_on_already_done_ticket_refuses(capsys, _inject_fake, close_argv):
+    # a re-close of an already-DONE ticket is a no-op re-write → clean error, not a silent rerun.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "done")
+    _inject_fake.attachments.clear()
+    capsys.readouterr()
+    rc = main(close_argv)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "error:" in out and "already done" in out
+    # the no-op refusal must not re-fire side effects (attachments).
+    assert _inject_fake.attachments == []
+
+
+@pytest.mark.parametrize("close_argv", _CLOSE_PATHS)
+def test_close_on_open_ticket_still_works(capsys, _inject_fake, close_argv):
+    # the legal todo → done path is UNCHANGED: a fresh ticket still closes cleanly via every verb.
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(close_argv)
+    out = capsys.readouterr().out
+    assert rc == 0
+    # done/status print "→ done"; change prints "updated ..." — either way it reached done.
+    assert "→ done" in out or "updated" in out
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_force_reopens_a_cancelled_ticket_via_status(capsys, _inject_fake):
+    # --force is the explicit override the acceptance criteria require: it bypasses the legality
+    # check so an operator can deliberately move a cancelled ticket back into an active state.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    capsys.readouterr()
+    rc = main(["status", "#1", "in-progress", "--force"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "in-progress"
+
+
+def test_status_illegal_non_done_transition_refuses(capsys, _inject_fake):
+    # the validator guards the GENERAL status transition too, not only the close-to-done path:
+    # cancelled → in-review is illegal without --force.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    capsys.readouterr()
+    rc = main(["status", "#1", "in-review"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "illegal transition" in out
+    assert _inject_fake.get("#1").state.value == "cancelled"
+
+
+def test_status_read_only_never_validates(capsys, _inject_fake):
+    # `task status <id>` with NO new state is a pure read — it must short-circuit BEFORE the
+    # validator (a None target would otherwise crash). A cancelled ticket still reads cleanly.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    capsys.readouterr()
+    rc = main(["status", "#1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "#1" in out and "cancelled" in out
+
+
+def test_done_force_overrides_on_cancelled(_inject_fake):
+    # `task done --force` is the explicit override: it re-closes a cancelled ticket to done.
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    rc = main(["done", "#1", "--force"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_change_done_force_overrides_on_done(_inject_fake):
+    # `task change --done --force` re-closes an already-done ticket (the no-op block is bypassed).
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "done")
+    rc = main(["change", "#1", "--done", "--force"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_illegal_change_done_with_screenshot_fires_no_attachment(capsys, _inject_fake):
+    # the core of #10: an illegal `change --done --screenshot --title --label` on a cancelled
+    # ticket must refuse BEFORE any side effect OR edit — no attachment uploaded, no re-write, and
+    # the fetched ticket object left UNDIRTIED (validation precedes both update() and the edits).
+    main(_create_argv())
+    _force_state(_inject_fake, "#1", "cancelled")
+    _inject_fake.attachments.clear()
+    stored = _inject_fake.get("#1")
+    shots_before = list(stored.screenshots)
+    labels_before = list(stored.labels)
+    title_before = stored.title
+    capsys.readouterr()
+    rc = main(["change", "#1", "--done", "--screenshot", "after.png", "--title", "HIJACK", "--label", "x"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "illegal transition" in out
+    assert _inject_fake.attachments == []
+    # the refusal must not have dirtied the live ticket object with the would-be edits.
+    fetched = _inject_fake.get("#1")
+    assert fetched.state.value == "cancelled"
+    assert fetched.screenshots == shots_before
+    assert fetched.labels == labels_before
+    assert fetched.title == title_before
+
+
 # ── classify ─────────────────────────────────────────────────────────────────────────
 
 

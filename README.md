@@ -48,6 +48,8 @@ task find "<query>"                # search title+body (cross-project when outsi
 task done <id>    [--screenshot p] # close a ticket — runs the on-done gates
 task change <id>  [--done]         # update; --done runs the on-done gates (close)
 task status <id> [<new-state>]     # read or transition state (works outside a repo)
+#   close/transition verbs validate legality first: a cancelled ticket is a dead-end and a
+#   re-close of an already-done ticket is rejected (no silent re-write). `--force` overrides.
 task classify "<text>" [--create]  # change|justAsk via review; --create makes/dedups a ticket
 task session [show|bind <id>]      # show/bind the current session and its tickets
 ```
