@@ -2,7 +2,10 @@
 # entrypoint.sh — orchestrates the in-container integration test.
 #
 # 1. Starts the hermetic mock GitHub server.
-# 2. Runs the DETERMINISTIC (no-LLM) assertions — always.
+# 2. Runs the DETERMINISTIC (no-LLM) legs — always:
+#      2a. advertised + usable (assertions.sh)
+#      2b. require-ticket ENFORCEMENT — ticketless commit blocked, ticketed passes (enforce_test.sh)
+#      2c. real-agent tool-gating config self-check, key-free (agent_tools_gating.sh --check)
 # 3. Runs the GATED real-agent leg IFF $ANTHROPIC_API_KEY is set; otherwise SKIPS with a clear
 #    message (never a silent pass, never a hard failure for the un-credentialed normal-CI run).
 #
@@ -53,7 +56,18 @@ PY
 done
 
 # ── 2. DETERMINISTIC leg (always) ──────────────────────────────────────────────────────
+# 2a. advertised + usable
 bash "$HERE/assertions.sh"
+# 2b. require-ticket ENFORCEMENT — ticketless commit blocked (exit 10 + marker), ticketed passes.
+#     No LLM / key needed, so it runs on every PR alongside 2a.
+echo
+bash "$HERE/enforce_test.sh"
+# 2c. real-agent TOOL-GATING config self-check (issue #16) — the to-do/task built-ins are denied and
+#     not allowlisted. Key-free, so it runs HERE (deterministic, every PR) rather than hidden behind
+#     the credentialed + continue-on-error agent leg: a regression that un-gates a built-in fails CI.
+echo
+echo "── deterministic: real-agent tool-gating config self-check (key-free) ──"
+bash "$HERE/agent_tools_gating.sh" --check
 
 # ── 3. GATED real-agent leg ────────────────────────────────────────────────────────────
 should_run_agent() {
