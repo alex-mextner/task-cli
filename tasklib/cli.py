@@ -22,6 +22,7 @@ from typing import Any
 
 from . import __version__
 from .model import Screenshot, State, Ticket
+from .transitions import TransitionError, validate_transition
 
 # ── tiny output helpers (no color dep; honor NO_COLOR) ──────────────────────────────
 _USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -145,18 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
     chp.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="add implementation screenshot")
     chp.add_argument("--label", action="append", default=[], help="add label")
     chp.add_argument("--done", action="store_true", help="close the ticket (runs the on-done gates)")
+    chp.add_argument("--force", action="store_true", help="override the legal-transition check (e.g. re-close a cancelled ticket)")
     _add_skip_flags(chp)
 
     # status
     stp = sub.add_parser("status", parents=[common], help="read or transition a ticket's state")
     stp.add_argument("id", help="ticket id")
     stp.add_argument("new_state", nargs="?", help="new state (todo|in-progress|in-review|done|cancelled)")
+    stp.add_argument("--force", action="store_true", help="override the legal-transition check (e.g. reopen a cancelled ticket)")
     _add_skip_flags(stp)
 
     # done — close a ticket by id (the on-done gates run; the close-verb the CTO reaches for)
     dnp = sub.add_parser("done", parents=[common], help="close a ticket (runs the on-done gates)")
     dnp.add_argument("id", help="ticket id (#123 or HYP-456)")
     dnp.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="add implementation screenshot")
+    dnp.add_argument("--force", action="store_true", help="override the legal-transition check (re-close a cancelled/done ticket)")
     _add_skip_flags(dnp)
 
     # classify
@@ -198,6 +202,13 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[args.command](args)
+    except TransitionError as exc:
+        # an illegal state transition (issue #10): clean error, no traceback. It returns the
+        # structured exit code the TransitionError pins — the agenttools_errors USAGE class (2),
+        # the same "the request is invalid" class _UserError already uses, NOT a transition-only
+        # code (a script sees "usage error", not "illegal transition specifically").
+        print(_err(f"error: {exc}"))
+        return exc.exit_code
     except _UserError as exc:
         print(_err(f"error: {exc}"))
         return 2
@@ -910,6 +921,12 @@ def cmd_change(args: argparse.Namespace) -> int:
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
 
+    # legality FIRST, before any edit mutates the fetched ticket: an illegal `change --done` on a
+    # cancelled/already-done ticket must refuse without touching title/labels/screenshots/skips —
+    # so a backend that hands back a live/cached Ticket object isn't left dirtied (#10).
+    if args.done:
+        validate_transition(ticket.state, State.DONE, force=args.force)
+
     if args.title:
         ticket.title = args.title
     if args.what:
@@ -973,6 +990,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         ticket = backend.get(args.id)
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
+    # legality first: status guards EVERY transition (not only close-to-done) so a cancelled
+    # ticket can't be silently revived and a same-state re-write is rejected (#10).
+    validate_transition(ticket.state, new_state, force=args.force)
     ticket.skips.update(skips)
     ticket.state = new_state
     try:
@@ -1013,6 +1033,8 @@ def cmd_done(args: argparse.Namespace) -> int:
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
 
+    # legality first: refuse re-closing a cancelled/already-done ticket before any mutation (#10).
+    validate_transition(ticket.state, State.DONE, force=args.force)
     new_shots = [Screenshot(ref=path, kind="implementation") for path in args.screenshot]
     ticket.screenshots.extend(new_shots)
     ticket.skips.update(_collect_skips(args))

@@ -32,6 +32,7 @@ sys.path.insert(0, ".")
 import tasklib.cli  # noqa: F401
 assert "yaml" not in sys.modules, "yaml imported at module load"
 assert "urllib.request" not in sys.modules, "urllib.request imported at module load"
+assert "agenttools_errors" not in sys.modules, "agenttools_errors imported at module load"
 PYEOF
 pass "stdlib-only at import time"
 

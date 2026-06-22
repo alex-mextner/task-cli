@@ -88,7 +88,7 @@ complete create/enforce loop:
 | `task read <id>` (`view`) | Full ticket: every section, state, attachments, links. |
 | `task find <query>` | Search tickets (title+body) via the backend; same line format; `--state`, `--all`. |
 | `task change <id>` | Update: append/replace sections, add acceptance criteria, `--screenshot` (implementation proof), `--why/--impact/--if-not-done`, `--title`, `--label`. Enforces the on-done gates when used to close. |
-| `task status <id> [<new-state>]` | Read or transition state (`todo / in-progress / in-review / done / cancelled`, mapped per backend). Transition → `done` runs on-done enforcement. |
+| `task status <id> [<new-state>]` | Read or transition state (`todo / in-progress / in-review / done / cancelled`, mapped per backend). Transition → `done` runs on-done enforcement. **All transition paths validate legality first** (one shared table in `tasklib/transitions.py`): a `cancelled` ticket is a dead-end and a re-entry into the same state is rejected — `--force` overrides. |
 | `task classify "<text>" [--create \| --update <id>]` | Classify `change \| justAsk` via `review just-ask`; with `--create`, a `change` verdict creates (or dedups → updates) a ticket. **This is what the tg hook calls.** |
 | `task session [show \| bind <id>]` | Show/bind the current session and list its tickets. |
 
