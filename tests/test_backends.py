@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from tasklib.backends import BackendError
-from tasklib.backends.github_issues import _parse_remote
+from tasklib.backends.github_issues import GitHubIssuesBackend, _api_root, _parse_remote
 from tasklib.model import State, Ticket
 
 from .conftest import assert_protocol
@@ -97,6 +97,52 @@ def test_parse_github_remote(url, expected):
 def test_parse_github_remote_rejects_garbage():
     with pytest.raises(BackendError):
         _parse_remote("https://gitlab.com/x/y.git")
+
+
+def test_api_root_defaults_to_public_github(monkeypatch):
+    monkeypatch.delenv("GITHUB_API_URL", raising=False)
+    assert _api_root() == "https://api.github.com"
+
+
+def test_api_root_honors_loopback_http_mock(monkeypatch):
+    # A hermetic mock server on loopback may be http; the trailing slash is normalized.
+    monkeypatch.setenv("GITHUB_API_URL", "http://127.0.0.1:8771/")
+    assert _api_root() == "http://127.0.0.1:8771"
+
+
+def test_api_root_allows_https_enterprise_host(monkeypatch):
+    monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+    assert _api_root() == "https://ghe.example.com/api/v3"
+
+
+def test_api_root_rejects_cleartext_nonloopback(monkeypatch):
+    # Security: the bearer token rides every request, so a non-loopback http host is refused —
+    # an ambient GITHUB_API_URL must not be able to exfiltrate the token over cleartext.
+    monkeypatch.setenv("GITHUB_API_URL", "http://ghe.internal/api/v3")
+    with pytest.raises(BackendError):
+        _api_root()
+
+
+def test_issues_url_uses_api_root_override(monkeypatch):
+    monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    assert be._issues_url() == "https://ghe.example.com/api/v3/repos/o/r/issues"
+    assert be._issues_url("/1") == "https://ghe.example.com/api/v3/repos/o/r/issues/1"
+
+
+def test_search_url_uses_api_root_override(monkeypatch):
+    # The search() URL is built from _api_root() too; assert the override flows through it.
+    monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    captured = {}
+
+    def fake_call(url, **kw):
+        captured["url"] = url
+        return {"items": []}
+
+    monkeypatch.setattr(be, "_call", fake_call)
+    be.search("hello")
+    assert captured["url"].startswith("https://ghe.example.com/api/v3/search/issues?")
 
 
 def test_github_search_post_filters_by_state(monkeypatch):
