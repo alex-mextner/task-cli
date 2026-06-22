@@ -10,6 +10,7 @@ from :mod:`tasklib.credentials` (never re-prompted, never logged).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 
@@ -18,7 +19,34 @@ from ..render import parse, render
 from . import BackendError
 from .http import HttpError, request_json
 
-API_ROOT = "https://api.github.com"
+# Default to public GitHub; honor GITHUB_API_URL the same way gh/octokit do, so a GitHub
+# Enterprise host (https://ghe.example.com/api/v3) — or a hermetic mock server in a test
+# harness — is reachable without code changes. Read per-call (not a frozen module constant)
+# so an env set after import still takes effect.
+_DEFAULT_API_ROOT = "https://api.github.com"
+
+
+def _api_root() -> str:
+    """Resolve the GitHub API base. Honors ``GITHUB_API_URL`` (GHE / a test mock).
+
+    Security invariant: the bearer token is attached to every request, so a non-loopback host
+    MUST be https — otherwise an ambient ``GITHUB_API_URL`` could exfiltrate the token over
+    cleartext or to a foreign server. A loopback host (a local mock/test harness) may be http.
+    """
+    root = os.environ.get("GITHUB_API_URL", _DEFAULT_API_ROOT).rstrip("/")
+    if root == _DEFAULT_API_ROOT:
+        return root
+    from urllib.parse import urlparse
+
+    parsed = urlparse(root)
+    host = (parsed.hostname or "").lower()
+    is_loopback = host in ("localhost", "127.0.0.1", "::1")
+    if parsed.scheme != "https" and not is_loopback:
+        raise BackendError(
+            f"GITHUB_API_URL must be https for a non-loopback host (got {root!r}); refusing to "
+            "send the auth token over cleartext / to an untrusted scheme."
+        )
+    return root
 
 # GitHub issues are open/closed; we carry the finer lifecycle as managed labels.
 _STATE_LABEL = {
@@ -62,7 +90,7 @@ class GitHubIssuesBackend:
         }
 
     def _issues_url(self, suffix: str = "") -> str:
-        return f"{API_ROOT}/repos/{self.owner}/{self.repo}/issues{suffix}"
+        return f"{_api_root()}/repos/{self.owner}/{self.repo}/issues{suffix}"
 
     def _call(self, url: str, *, method: str = "GET", payload=None):
         try:
@@ -128,7 +156,7 @@ class GitHubIssuesBackend:
             q += " is:closed"
         elif state is not None:
             q += " is:open"
-        url = f"{API_ROOT}/search/issues?q={urllib.parse.quote(q)}&per_page={min(limit, 100)}"
+        url = f"{_api_root()}/search/issues?q={urllib.parse.quote(q)}&per_page={min(limit, 100)}"
         result = self._call(url) or {}
         rows = result.get("items", []) if isinstance(result, dict) else []
         tickets = [self._row_to_ticket(r) for r in rows]

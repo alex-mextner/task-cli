@@ -1,0 +1,61 @@
+name: test-cli
+
+# Proves end-to-end that task-cli is ADVERTISED (a fresh agent discovers `task` as a skill /
+# in the SessionStart blurb) and USABLE (`task new`/`task list` work against the backend), on
+# a clean machine provisioned the real way (install.sh → `task install-skill`).
+#
+# Triggers:
+#   - pull_request / push-to-main → the DETERMINISTIC (no-LLM) leg, always. Fast unconditional
+#     gate, no secret needed.
+#   - push to main is "a PR just merged" (this repo squash-merges via `gh ship`), so the
+#     credentialed REAL-AGENT leg runs there, gated behind the ANTHROPIC_API_KEY secret and
+#     SKIPPED-with-a-message when the secret is absent (fork PRs / unconfigured repos stay green).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Deterministic clean-rig → advertised + usable, no LLM. Runs everywhere. ─────────────
+  smoke:
+    name: deterministic (clean-rig → advertised + usable, no LLM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the integration-test image
+        run: docker build -f test/docker/Dockerfile -t task-cli-itest .
+      - name: Deterministic assertions (RUN_AGENT=never)
+        run: docker run --rm -e RUN_AGENT=never task-cli-itest
+
+  # ── Full real-cheap-agent verification. Runs on PR MERGE (push to main), gated by the key. ─
+  # STATUS: tracked next increment, NOT yet a proven gate (see test/docker/agent_test.sh header).
+  # continue-on-error keeps an unhardened assertion from wedging the merge gate; the deterministic
+  # `smoke` job above is the blocking gate. Flip continue-on-error off once the leg is hardened
+  # and verified against a live key.
+  real-agent:
+    name: real cheap agent (claude-haiku) discovers + uses task
+    # Only on the post-merge push to main — i.e. when a PR has merged. PR events skip this leg.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the integration-test image
+        run: docker build -f test/docker/Dockerfile -t task-cli-itest .
+      - name: Real-agent leg (gated; skips with a clear message when the key is absent)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::notice title=test-cli real-agent leg skipped::ANTHROPIC_API_KEY secret is not set;"
+            echo "the deterministic leg already verified advertised+usable. Set the secret to run"
+            echo "the real-cheap-agent verification on merge."
+            exit 0
+          fi
+          docker run --rm \
+            -e RUN_AGENT=always \
+            -e ANTHROPIC_API_KEY \
+            task-cli-itest
