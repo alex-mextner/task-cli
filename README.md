@@ -43,6 +43,7 @@ task new      --title "..." --why "..." --impact "..." --if-not-done "..." --acc
 task create                        # alias of `new` (same arguments, same gates)
 task list                          # THIS session's tickets (falls back to all when empty)
 task list --all                    # every known project's tickets, grouped by project
+task gantt        [--all] [--json] # read-only due-date timeline (Gantt) — see below
 task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
 task find "<query>"                # search title+body (cross-project when outside a repo)
 task done <id>    [--screenshot p] # close a ticket — runs the on-done gates
@@ -79,6 +80,27 @@ The loop is fail-soft: a backend error, a malformed ticket, or a down notifier i
 caught and logged — the daemon keeps running. De-dupe is per `(ticket, due-date)`, so a ticket
 is reminded once; a changed due date re-fires. One daemon per repo coordinate (the state files
 are keyed by it). Tunables live in a `daemon:` config block (see Configuration).
+
+### Timeline view (`task gantt`)
+
+`task gantt` is a **read-only** Gantt: it charts the same tickets `task list` would show
+(same session / `--all` / outside-a-repo scoping) on a date axis by their `--due` date.
+
+```
+task gantt                 # this session's tickets on a due-date timeline
+task gantt --all           # every known project's tickets, flattened onto one axis
+task gantt --state todo    # filter by state / --label, same flags as `task list`
+task gantt --json          # machine-readable timeline (window + per-row bar geometry)
+task gantt --width 60      # override the bar-area width (default: auto-fit the terminal)
+```
+
+Each dated ticket is a row with a status marker on the axis: `○` todo, `◐` in-progress,
+`◑` in-review, `●` done, `!` (red) **overdue** (an open ticket past its due date), `✗`
+cancelled. The `│`/`▼` gridline marks today. The date window auto-fits the tickets' range and
+always includes today; a degenerate (single-date) range still renders. Tickets with **no due
+date** are listed in a clearly-marked `undated` section — never hidden. It is purely a view:
+no ticket is mutated. Output is paged like `list` in an interactive terminal (`--no-pager` /
+`NO_PAGER` opt out); `--json` is never paged.
 
 ### Example
 

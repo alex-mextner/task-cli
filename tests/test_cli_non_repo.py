@@ -245,6 +245,38 @@ def test_find_outside_repo_searches_all_projects_grouped(capsys, tmp_path, monke
     assert "acme/backend" in out and "#2" in out
 
 
+def test_gantt_outside_repo_flattens_projects_onto_one_axis(capsys, tmp_path, monkeypatch):
+    # unlike `list` (grouped per project), `gantt` flattens every project's tickets onto ONE
+    # timeline. Assert tickets from >1 project both appear as rows, keyed by their id prefix.
+    store = {
+        "acme/frontend": [Ticket(title="Fix header", state=State.IN_PROGRESS, id="#12", due="2026-07-01")],
+        "acme/backend": [Ticket(title="DB migration", state=State.TODO, id="#7", due="2026-06-15")],
+    }
+    monkeypatch.setattr("tasklib.backends.get_backend", _ByCoordBackend.factory(store))
+    monkeypatch.setenv(
+        "XDG_CONFIG_HOME",
+        _gh_config(tmp_path, "projects:\n  - {repo: acme/frontend}\n  - {repo: acme/backend}\n"),
+    )
+    rc = main(["gantt", "-C", str(tmp_path), "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    import json
+
+    payload = json.loads(out)
+    ids = [r["id"] for r in payload["rows"]]
+    # both projects' dated tickets are rows on the single axis, sorted by due ascending
+    assert ids == ["#7", "#12"]
+
+
+def test_gantt_outside_repo_no_registry_errors(capsys, tmp_path):
+    # the _UserError branch: outside a repo with NO registered projects → a clean 3-part error.
+    rc = main(["gantt", "-C", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no projects to chart" in out
+    assert "projects:" in out  # the fix points at the registry
+
+
 def test_grouped_list_is_paged_on_tty(capsys, tmp_path, monkeypatch):
     # the cross-project GROUPED view must page like the flat one: on a TTY the section headings +
     # tickets flow THROUGH the pager (sentinel file), not to stdout. Covers the grouped path.
