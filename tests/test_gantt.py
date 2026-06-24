@@ -11,6 +11,7 @@ from datetime import date
 
 from tasklib.gantt import (
     DEFAULT_WIDTH,
+    LABEL_WIDTH,
     DateWindow,
     GanttStatus,
     bar_cells,
@@ -22,6 +23,7 @@ from tasklib.gantt import (
     to_json,
 )
 from tasklib.model import State, Ticket
+from tasklib.textwidth import display_width
 
 TODAY = date(2026, 6, 24)
 
@@ -229,6 +231,77 @@ def test_render_title_with_newline_stays_one_line():
     row_line = [ln for ln in out.splitlines() if "#1" in ln]
     assert len(row_line) == 1  # the ticket renders on exactly one line
     assert "line two" in row_line[0]  # content preserved, just flattened onto one line
+
+
+# ── display-width column alignment (CJK / emoji titles) ──────────────────────────────
+
+
+def _bar_area_column(row_line: str) -> int:
+    """The display-cell column where the bar-area separator ``│`` begins on a rendered row."""
+    idx = row_line.index("│")
+    return display_width(row_line[:idx])
+
+
+def test_cjk_title_row_aligns_to_same_bar_column_as_ascii():
+    # The bug: len()-based padding counted a CJK ideograph (2 cells) as 1, so a CJK-titled row's
+    # bar area started at the wrong terminal column and the grid sheared. Every row's bar area must
+    # begin at the SAME display column regardless of the title's character widths.
+    tickets = [
+        _t("#1", "ascii title here", due="2026-06-25"),
+        _t("#2", "全角タイトル日本語", due="2026-07-01"),  # all wide
+        _t("#3", "mix 全角 and ascii", due="2026-07-10"),  # mixed
+        _t("#4", "short", due="2026-07-15"),
+    ]
+    out = render(layout(tickets, TODAY, width=20), color=_plain, today=TODAY)
+    row_lines = [ln for ln in out.splitlines() if ln.strip().startswith("#")]
+    assert len(row_lines) == 4
+    columns = {_bar_area_column(ln) for ln in row_lines}
+    assert len(columns) == 1, f"bar areas misaligned across rows: {columns}"
+
+
+def test_cjk_label_gutter_is_exactly_label_width_cells():
+    # The label gutter (id + title, padded) must be exactly LABEL_WIDTH *display cells* wide so it
+    # lines up with the axis header's `" " * LABEL_WIDTH` gutter — even for a wide-char title.
+    chart = layout([_t("#42", "全角タイトル日本語テキスト", due="2026-07-01")], TODAY, width=20)
+    out = render(chart, color=_plain, today=TODAY)
+    row_line = next(ln for ln in out.splitlines() if ln.strip().startswith("#"))
+    gutter = row_line[: row_line.index("│") - 1]  # drop the single space before the bar area
+    assert display_width(gutter) == LABEL_WIDTH
+
+
+def test_long_cjk_title_truncates_to_cell_width_without_splitting():
+    # A title far wider than the gutter is cut to LABEL_WIDTH cells with an ellipsis, never leaving
+    # a half-rendered wide char (which would still over/under-fill the column).
+    chart = layout([_t("#1", "日" * 60, due="2026-07-01")], TODAY, width=20)
+    out = render(chart, color=_plain, today=TODAY)
+    row_line = next(ln for ln in out.splitlines() if ln.strip().startswith("#"))
+    gutter = row_line[: row_line.index("│") - 1]
+    assert display_width(gutter) == LABEL_WIDTH
+    assert "…" in gutter  # truncation was signaled
+
+
+def test_ascii_chart_is_byte_identical_regression_guard():
+    # The whole render of an ASCII-only chart must be unchanged by the display-width rework. This
+    # is the no-regression guard: routing through cell-aware pad/truncate must equal the old
+    # len/ljust/slice output for the common (ASCII) case.
+    tickets = [
+        _t("#1", "first ticket", due="2026-06-25"),
+        _t("#2", "a much longer ticket title that will get truncated by the gutter", due="2026-07-01"),
+        _t("#3", "third", due="2026-07-10", state=State.IN_PROGRESS),
+        _t("#noid", "undated one"),
+    ]
+    out = render(layout(tickets, TODAY, width=20), color=_plain, today=TODAY)
+    expected = (
+        "                                   2026-06-24 ▼                    2026-07-10\n"
+        "                                   (today: 2026-06-24 ▼)\n"
+        "     #1 first ticket               │○·················· 2026-06-25\n"
+        "     #2 a much longer ticket titl… │·······○··········· 2026-07-01\n"
+        "     #3 third                      │··················◐ 2026-07-10\n"
+        "\n"
+        "undated (1) — no due date set:\n"
+        "  ○ #noid undated one"
+    )
+    assert out == expected
 
 
 # ── --json timeline shape ────────────────────────────────────────────────────────────

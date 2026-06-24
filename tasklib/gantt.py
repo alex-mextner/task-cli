@@ -26,6 +26,8 @@ from datetime import date, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from .textwidth import pad, truncate
+
 if TYPE_CHECKING:
     from .model import Ticket
 
@@ -260,18 +262,16 @@ def fit_width(terminal_columns: int) -> int:
 
 
 def _truncate(text: str, width: int) -> str:
-    """One-line, truncated label. Collapses control chars so a title can't break the grid.
+    """One-line, truncated label measured in terminal *cells*, not code points.
 
     The chart is a fixed-width grid: a newline or other control char in a ticket title would shift
     every subsequent column (and an embedded ANSI escape would leak into the terminal). Replacing
-    control chars with a space keeps each row exactly one line, ``width`` columns wide.
+    control chars with a space keeps each row exactly one line. Truncation is by display width so a
+    CJK/emoji title is cut to ``width`` *cells* (never splitting a wide char) — :func:`truncate`
+    owns the cell math; for pure-ASCII text this is byte-identical to the old ``len``/slice path.
     """
     flat = "".join(c if c.isprintable() else " " for c in text)
-    if len(flat) <= width:
-        return flat
-    if width <= 1:
-        return flat[:width]
-    return flat[: width - 1] + "…"
+    return truncate(flat, width)
 
 
 def bar_cells(row: GanttRow, chart: GanttChart) -> list[str]:
@@ -342,8 +342,11 @@ def _axis_header(chart: GanttChart, color, today: date) -> str:
 def _render_row(row: GanttRow, chart: GanttChart, color) -> str:
     """One ticket row: the colored label gutter + the colored bar cells."""
     t = row.ticket
-    label = _truncate(f"{t.id or '(new)':>7} {t.title}", LABEL_WIDTH)
-    label = label.ljust(LABEL_WIDTH)
+    # Right-pad the id by display CELLS too (not the `:>7` format-spec's code-point count) so the
+    # id gutter holds even for a non-ASCII id — byte-identical to `:>7` for the normal ASCII id.
+    tid = pad(t.id or "(new)", 7, align="right")
+    label = _truncate(f"{tid} {t.title}", LABEL_WIDTH)
+    label = pad(label, LABEL_WIDTH)  # pad by display CELLS, not code points (CJK/emoji-safe)
     code = _STATUS_COLOR[row.status]
     cells = bar_cells(row, chart)
     painted = []
