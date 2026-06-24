@@ -28,6 +28,10 @@ SECTIONS: tuple[str, ...] = (
 )
 
 _SKIP_MARKER = "Skipped gates"  # an optional trailing section recording escape hatches
+# An optional trailing section carrying the daemon-watched due date. Like Skipped gates it is
+# NOT in SECTIONS — keeping it out of the fixed contract means every pre-existing ticket (no
+# due date) still passes validate_format, and a ticket with a due date stays format-valid.
+_DUE_MARKER = "Due"
 
 
 def render(ticket: Ticket) -> str:
@@ -49,6 +53,9 @@ def render(ticket: Ticket) -> str:
 
     links = _render_links(ticket)
     out.append(f"## Links\n{links}")
+
+    if ticket.due.strip():
+        out.append(f"## {_DUE_MARKER}\n{ticket.due.strip()}")
 
     if ticket.skips:
         lines = "\n".join(f"- {gate}: {reason}" for gate, reason in sorted(ticket.skips.items()))
@@ -104,6 +111,10 @@ def parse(body: str, ticket: Ticket | None = None) -> Ticket:
     screenshots = _parse_screenshots(sec.get("Screenshots", ""))
     links = _parse_links(sec.get("Links", ""))
     skips = _parse_skips(sec.get(_SKIP_MARKER, ""))
+    # The Due section is a single ISO date on its own line; fall back to the base ticket's due
+    # so a backend that supplied the date natively (Linear dueDate) isn't clobbered by a body
+    # that happens to omit the section.
+    due = sec.get(_DUE_MARKER, "").strip() or base.due
 
     return replace(
         base,
@@ -115,6 +126,7 @@ def parse(body: str, ticket: Ticket | None = None) -> Ticket:
         screenshots=screenshots,
         links=links or base.links,
         skips=skips or base.skips,
+        due=due,
         raw_body=body,
     )
 

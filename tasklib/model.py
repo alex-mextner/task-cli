@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datetime import date
 
 
 class State(str, Enum):
@@ -95,6 +99,11 @@ class Ticket:
     url: str = ""
     raw_body: str = ""  # the verbatim body as the backend returned it (for read/lint)
 
+    # Appended LAST (after the existing fields) on purpose: inserting it earlier would shift the
+    # positional order of the dataclass, so any positional ``Ticket(..., State.X)`` call would
+    # silently bind the wrong field. Keeping it trailing makes the addition order-safe.
+    due: str = ""  # ISO date YYYY-MM-DD the daemon watches; "" = no due date
+
     @property
     def is_ui(self) -> bool:
         """A UI/visual ticket triggers the screenshot gates (label-gated, see policy)."""
@@ -111,3 +120,18 @@ class Ticket:
             if label.startswith("session:"):
                 return label
         return None
+
+    def due_date(self) -> "date | None":
+        """The ``due`` field parsed to a :class:`datetime.date`, or ``None`` if unset/malformed.
+
+        Tolerant of a malformed value (a hand-edited body): a non-ISO ``due`` yields ``None``
+        rather than raising, so one bad ticket can never crash the daemon's selection loop.
+        """
+        from datetime import date as _date
+
+        if not self.due:
+            return None
+        try:
+            return _date.fromisoformat(self.due.strip())
+        except ValueError:
+            return None

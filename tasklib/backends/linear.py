@@ -150,10 +150,13 @@ class LinearBackend:
             state=_TYPE_TO_STATE.get(st_type, State.TODO),
             id=node.get("identifier", ""),
             url=node.get("url", ""),
+            # Seed the native dueDate so a ticket created/edited in the Linear UI (no body
+            # section) still carries its due date; parse() lets the body's Due section override.
+            due=str(node.get("dueDate") or "").strip(),
         )
         return parse(node.get("description") or "", base)
 
-    _ISSUE_FIELDS = "id identifier url title description state{type name} labels{nodes{name}}"
+    _ISSUE_FIELDS = "id identifier url title description dueDate state{type name} labels{nodes{name}}"
 
     # ── protocol ──────────────────────────────────────────────────────────────────
     def create(self, ticket: Ticket) -> Ticket:
@@ -167,6 +170,11 @@ class LinearBackend:
                 "labelIds": self._label_ids(ticket.labels),
             }
         }
+        if ticket.due.strip():
+            # Mirror the body's Due section into the native dueDate (TimelessDate = YYYY-MM-DD)
+            # so the date is visible in the Linear UI too. The body section stays the portable
+            # source of truth; this is the best-effort native echo for the github-less backend.
+            variables["input"]["dueDate"] = ticket.due.strip()
         if self.project:
             variables["input"]["projectId"] = self.project
         data = self._gql(
@@ -202,6 +210,9 @@ class LinearBackend:
                 "description": render(ticket),
                 "stateId": self._state_id_for(ticket.state),
                 "labelIds": self._label_ids(ticket.labels),
+                # Echo into the native dueDate on update too; an empty due clears it (null) so a
+                # removed due date doesn't linger in the Linear UI out of sync with the body.
+                "dueDate": ticket.due.strip() or None,
             },
         }
         data = self._gql(

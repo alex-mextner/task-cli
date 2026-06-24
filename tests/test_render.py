@@ -84,3 +84,35 @@ def test_split_sections_handles_extra_whitespace():
     body = "##   What  \n  hello  \n\n## Links\n- (none)\n"
     sec = split_sections(body)
     assert sec["What"] == "hello"
+
+
+# ── due date (the daemon-watched optional section) ──────────────────────────────────
+
+
+def test_due_section_renders_and_round_trips():
+    t = _full_ticket()
+    t.due = "2026-07-01"
+    body = render(t)
+    assert "## Due\n2026-07-01" in body
+    assert parse(body).due == "2026-07-01"
+
+
+def test_due_section_is_omitted_when_unset():
+    body = render(_full_ticket())  # no due
+    assert "## Due" not in body
+    assert parse(body).due == ""
+
+
+def test_due_does_not_break_the_formatting_gate():
+    # the Due section is OPTIONAL (not in SECTIONS) — a body with it (or without) stays valid
+    t = _full_ticket()
+    t.due = "2026-07-01"
+    assert validate_format(render(t)) == []
+    assert validate_format(render(_full_ticket())) == []
+
+
+def test_parse_falls_back_to_base_due_when_body_omits_it():
+    # a backend that supplied the date natively (base.due set) isn't clobbered by a due-less body
+    base = Ticket(id="#1", due="2026-08-15")
+    parsed = parse(render(_full_ticket()), base)  # rendered body has no Due section
+    assert parsed.due == "2026-08-15"

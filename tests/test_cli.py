@@ -581,3 +581,137 @@ def test_session_bind_records(capsys, _inject_fake):
     rc = main(["session", "bind", "#5"])
     assert rc == 0
     assert "#5" in read_ids("testsess")
+
+
+# ── --due field + daemon dispatch ────────────────────────────────────────────────────
+
+
+def test_create_with_due_roundtrips(capsys, _inject_fake):
+    rc = main(_create_argv() + ["--due", "2026-07-01"])
+    assert rc == 0
+    created = _inject_fake.list()[0]
+    # the fake backend round-trips through the body, exactly like a real one → due survives
+    assert created.due == "2026-07-01"
+
+
+def test_create_rejects_malformed_due(capsys):
+    rc = main(_create_argv() + ["--due", "not-a-date"])
+    assert rc == 2
+    assert "ISO date" in capsys.readouterr().out
+
+
+def test_change_sets_and_clears_due(capsys, _inject_fake):
+    main(_create_argv() + ["--due", "2026-07-01"])
+    # change to a new due date
+    rc = main(["change", "#1", "--due", "2026-08-15"])
+    assert rc == 0
+    assert _inject_fake.get("#1").due == "2026-08-15"
+    # clear it with an empty string
+    rc = main(["change", "#1", "--due", ""])
+    assert rc == 0
+    assert _inject_fake.get("#1").due == ""
+
+
+def test_create_without_due_has_empty_due(_inject_fake):
+    main(_create_argv())
+    assert _inject_fake.list()[0].due == ""
+
+
+def test_change_rejects_malformed_due(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["change", "#1", "--due", "31-12-2026"])  # not ISO
+    assert rc == 2
+    assert "ISO date" in capsys.readouterr().out
+
+
+def test_daemon_run_honors_disabled_via_cli(capsys, _inject_fake, tmp_path, monkeypatch):
+    # `task daemon run` with a disabled config returns 0 immediately, writing no pid-file
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(
+        _d.DaemonConfig, "from_config", classmethod(lambda cls, cfg: _d.DaemonConfig(enabled=False))
+    )
+    rc = main(["daemon", "run"])
+    assert rc == 0
+
+
+def test_daemon_stop_when_nothing_running(capsys, _inject_fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    rc = main(["daemon", "stop"])
+    assert rc == 0
+    assert "no running daemon" in capsys.readouterr().out
+
+
+def test_read_json_includes_due(capsys, _inject_fake):
+    import json
+
+    main(_create_argv() + ["--due", "2026-07-01"])
+    capsys.readouterr()  # drain the create output so only the read's JSON remains
+    rc = main(["read", "#1", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["due"] == "2026-07-01"
+
+
+def test_daemon_status_reports_stopped(capsys, _inject_fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    rc = main(["daemon", "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "daemon:" in out
+    assert "stopped" in out
+
+
+def test_daemon_status_json(capsys, _inject_fake, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    rc = main(["daemon", "status", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "stopped"
+    assert payload["interval_s"] == 3600
+    assert payload["notifier"] == ["tg", "--tag", "report"]
+
+
+def test_daemon_start_is_idempotent_no_double_spawn(capsys, _inject_fake, tmp_path, monkeypatch):
+    import os
+    from argparse import Namespace
+
+    from tasklib import daemon as _d
+    from tasklib.cli import _daemon_coordinate, _load
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    spawned: list = []
+    monkeypatch.setattr(_d, "_spawn_detached", lambda *a, **k: spawned.append(1) or 4242)
+    rc = main(["daemon", "start"])
+    assert rc == 0
+    assert "daemon started" in capsys.readouterr().out
+    assert spawned == [1]
+
+    # a second start while a daemon is alive must not spawn again. Stamp the pid-file with THIS
+    # live process so the liveness probe says "running", then assert the second start is a no-op.
+    cfg = _load(Namespace(cwd=".", backend=None, repo=None, config=None))
+    paths = _d.paths_for(_daemon_coordinate(cfg))
+    _d._write_pid(paths.pid, os.getpid())
+    spawned.clear()
+    rc = main(["daemon", "start"])
+    assert rc == 0
+    assert "already running" in capsys.readouterr().out
+    assert spawned == []
+
+
+def test_daemon_disabled_does_not_start(capsys, _inject_fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(_d.DaemonConfig, "from_config", classmethod(lambda cls, cfg: _d.DaemonConfig(enabled=False)))
+    spawned: list = []
+    monkeypatch.setattr(_d, "_spawn_detached", lambda *a, **k: spawned.append(1))
+    rc = main(["daemon", "start"])
+    assert rc == 0
+    assert "disabled" in capsys.readouterr().out
+    assert spawned == []
