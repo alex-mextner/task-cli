@@ -39,23 +39,46 @@ linear auth        # Linear (per-repo, via the rig.yaml task: block)
 ## Commands
 
 ```
-task new      --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..."
+task new      --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..." [--due YYYY-MM-DD]
 task create                        # alias of `new` (same arguments, same gates)
 task list                          # THIS session's tickets (falls back to all when empty)
 task list --all                    # every known project's tickets, grouped by project
 task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
 task find "<query>"                # search title+body (cross-project when outside a repo)
 task done <id>    [--screenshot p] # close a ticket — runs the on-done gates
-task change <id>  [--done]         # update; --done runs the on-done gates (close)
+task change <id>  [--due ...] [--done]  # update; --due sets/clears the due date; --done closes (gates)
 task status <id> [<new-state>]     # read or transition state (works outside a repo)
 #   close/transition verbs validate legality first: a cancelled ticket is a dead-end and a
 #   re-close of an already-done ticket is rejected (no silent re-write). `--force` overrides.
 task classify "<text>" [--create]  # change|justAsk via review; --create makes/dedups a ticket
 task session [show|bind <id>]      # show/bind the current session and its tickets
+task daemon start|stop|status|run  # the due-date reminder watcher (see Daemon below)
 ```
 
 Global flags: `-C/--cwd`, `--backend`, `--repo`, `--config`, `--json`, and the per-gate escape
 hatch `--skip-<gate> "<reason>"`.
+
+### Due-date reminders (the daemon)
+
+A ticket can carry a `--due YYYY-MM-DD` date (set on `new`/`create`, changed or cleared on
+`change`). It is stored backend-portably — a `## Due` section in the ticket body that round-trips
+through both backends (Linear also mirrors it into the native `dueDate`).
+
+The **daemon** is a background watcher that polls the backend on an interval, selects open
+tickets that are overdue or due within a window, and pushes a reminder to the CTO's channel (the
+`tg` CLI by default):
+
+```
+task daemon start    # spawn the detached daemon (idempotent — never double-starts)
+task daemon stop     # stop it (SIGTERM, then SIGKILL on timeout); clears the pid-file
+task daemon status   # running / stale / stopped + pid + config (--json for machine output)
+task daemon run      # the foreground loop (what `start` spawns)
+```
+
+The loop is fail-soft: a backend error, a malformed ticket, or a down notifier in one tick is
+caught and logged — the daemon keeps running. De-dupe is per `(ticket, due-date)`, so a ticket
+is reminded once; a changed due date re-fires. One daemon per repo coordinate (the state files
+are keyed by it). Tunables live in a `daemon:` config block (see Configuration).
 
 ### Example
 
@@ -242,10 +265,16 @@ classify:
 session:
   detect: [env:TASK_SESSION, tmux-pane, git-branch]
   label_prefix: "session:"
+daemon:                              # the due-date reminder watcher (all keys optional)
+  enabled: true                      # false → both `daemon start` AND `daemon run` are no-ops
+  interval_s: 3600                   # poll interval (seconds); a 0/negative value falls back
+  due_soon_days: 3                   # remind when due within N days (or already overdue)
+  query_limit: 100                   # tickets fetched per tick; raise it for a big/old project
+  notifier: [tg, --tag, report]      # the reminder command; the message is appended as the last arg
 ```
 
 Config is committed by default and scoped by location, never a flag. With no config at all the
-tool defaults to `github-issues` with every gate on.
+tool defaults to `github-issues` with every gate on (and the daemon's built-in defaults above).
 
 ## Architecture
 

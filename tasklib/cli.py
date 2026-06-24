@@ -6,7 +6,8 @@ filesystem (sidecar). All pure logic lives in the sibling modules (``model``/``r
 ``policy``/``classify``/``session``/``config``). Heavy/optional imports (yaml via config,
 the backends) are lazy so ``task --help`` stays fast and dependency-light.
 
-Subcommands: create/new · list · read/view · find · change · status · done · classify · session.
+Subcommands: create/new · list · read/view · find · change · status · done · classify · session
+· daemon (the due-date reminder watcher: start/stop/status/run).
 Global flags: --backend, --repo, --config, --json, --yes, and per-gate --skip-<gate>.
 """
 
@@ -80,6 +81,7 @@ def _add_create_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--if-not-done", dest="if_not_done", help="cost of inaction")
     p.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="screenshot (repeatable)")
     p.add_argument("--label", action="append", default=[], help="label (repeatable)")
+    p.add_argument("--due", metavar="YYYY-MM-DD", help="due date (the daemon reminds before/at it)")
     p.add_argument("--yes", action="store_true", help="non-interactive; do not prompt")
     _add_skip_flags(p)
 
@@ -145,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     chp.add_argument("--if-not-done", dest="if_not_done", help="set cost of inaction")
     chp.add_argument("--screenshot", action="append", default=[], metavar="PATH", help="add implementation screenshot")
     chp.add_argument("--label", action="append", default=[], help="add label")
+    chp.add_argument("--due", metavar="YYYY-MM-DD", help="set/replace the due date (empty string clears it)")
     chp.add_argument("--done", action="store_true", help="close the ticket (runs the on-done gates)")
     chp.add_argument("--force", action="store_true", help="override the legal-transition check (e.g. re-close a cancelled ticket)")
     _add_skip_flags(chp)
@@ -176,6 +179,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("install-skill", help="register the task agent skill with harnesses")
 
+    # daemon — the due-date reminder watcher (start/stop/status/run lifecycle)
+    dp = sub.add_parser("daemon", parents=[common], help="due-date reminder daemon (start|stop|status|run)")
+    dp.add_argument(
+        "action",
+        choices=["start", "stop", "status", "run"],
+        help="start (spawn detached) | stop | status | run (foreground loop)",
+    )
+
     return p
 
 
@@ -199,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         "classify": cmd_classify,
         "session": cmd_session,
         "install-skill": cmd_install_skill,
+        "daemon": cmd_daemon,
     }
     try:
         return handlers[args.command](args)
@@ -467,6 +479,26 @@ def _parse_state(value: str):
         raise _UserError(str(exc)) from exc
 
 
+def _normalize_due(value: str | None) -> str | None:
+    """Validate a ``--due`` value to a canonical ``YYYY-MM-DD`` string (``None`` = not passed).
+
+    An empty string is a deliberate "clear the due date" signal (returns ``""``). Any other
+    value must be an ISO date; a malformed one is a clean ``_UserError`` (exit 2), never stored
+    as-is — a daemon that watches due dates must not be fed un-parseable junk at the front door.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if text == "":
+        return ""
+    from datetime import date
+
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise _UserError(f"--due must be an ISO date YYYY-MM-DD (got {value!r})") from exc
+
+
 def _collect_skips(args: argparse.Namespace) -> dict[str, str]:
     """Gather the recorded escape-hatch justifications from --skip-<gate> flags."""
     skips: dict[str, str] = {}
@@ -507,6 +539,7 @@ def _ticket_dict(t: Ticket) -> dict:
         "url": t.url,
         "labels": t.labels,
         "what": t.what,
+        "due": t.due,
     }
 
 
@@ -571,6 +604,7 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     labels = list(dict.fromkeys([*args.label, session.label]))
     screenshots = [Screenshot(ref=p, kind="creation") for p in args.screenshot]
+    due = _normalize_due(getattr(args, "due", None)) or ""
     ticket = Ticket(
         title=title,
         what=what,
@@ -582,6 +616,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         labels=labels,
         links={"Session": session.label},
         skips=_collect_skips(args),
+        due=due,
     )
 
     from .policy import Phase
@@ -940,6 +975,9 @@ def cmd_change(args: argparse.Namespace) -> int:
     for crit in args.acceptance:
         if crit not in ticket.acceptance:
             ticket.acceptance.append(crit)
+    if getattr(args, "due", None) is not None:
+        # --due passed (incl. --due "" to clear): validate then set. Not passed → leave as-is.
+        ticket.due = _normalize_due(args.due)
     new_shots = [Screenshot(ref=path, kind="implementation") for path in args.screenshot]
     ticket.screenshots.extend(new_shots)
     for label in args.label:
@@ -1234,6 +1272,115 @@ def cmd_session(args: argparse.Namespace) -> int:
         print(_dim(f"  tickets ({len(ids)}): {', '.join(ids)}"))
     else:
         print(_dim("  no tickets recorded yet"))
+    return 0
+
+
+def _daemon_coordinate(cfg) -> str:
+    """The repo/team coordinate that keys this daemon's state files (one daemon per project).
+
+    Reuses the same single-target resolution every command uses. A daemon is repo-bound — it
+    watches ONE project's tickets — so running it outside a repo (no pinned coordinate) is a
+    clean 3-part error, never a cryptic backend failure.
+    """
+    current = _current_project_overlay(cfg)
+    if current is None:
+        raise _UserError(
+            "cannot run the daemon: no project context (you are outside a git repo).\n"
+            "  why: the daemon watches ONE project's due dates, so it must know which backend/repo.\n"
+            "  fix: run inside the target git repo, or pass `--repo owner/name` / set `linear.team`."
+        )
+    name, _overlay = current
+    return name
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Dispatch the daemon lifecycle action (start | stop | status | run)."""
+    cfg = _load(args)
+    coordinate = _daemon_coordinate(cfg)
+    from . import daemon
+
+    if args.action == "run":
+        paths = daemon.paths_for(coordinate)
+        return daemon.run_loop(cfg, paths)
+    if args.action == "start":
+        return _daemon_start(daemon, coordinate, cfg, args)
+    if args.action == "stop":
+        return _daemon_stop(daemon, coordinate)
+    return _daemon_status(daemon, coordinate, cfg, args)
+
+
+def _daemon_child_flags(args: argparse.Namespace) -> list[str]:
+    """The backend-selecting global flags to forward to the spawned ``daemon run`` child.
+
+    These are exactly the flags that change coordinate/backend resolution — so the child resolves
+    the SAME coordinate the launcher checked (otherwise start isn't idempotent and stop/status
+    miss the daemon). ``-C`` is added separately by the spawn.
+    """
+    flags: list[str] = []
+    if getattr(args, "backend", None):
+        flags += ["--backend", args.backend]
+    if getattr(args, "repo", None):
+        flags += ["--repo", args.repo]
+    if getattr(args, "config", None):
+        flags += ["--config", args.config]
+    return flags
+
+
+def _daemon_start(daemon, coordinate: str, cfg, args: argparse.Namespace) -> int:
+    dcfg = daemon.DaemonConfig.from_config(cfg)
+    if not dcfg.enabled:
+        print(_warn("daemon is disabled in config (daemon.enabled: false) — not starting"))
+        return 0
+    outcome, pid = daemon.start(coordinate, cwd=str(cfg.repo_root), child_flags=_daemon_child_flags(args))
+    if outcome == "already-running":
+        print(_dim(f"daemon already running (pid {pid}) for {coordinate}"))
+    else:
+        print(_ok(f"daemon started (pid {pid}) for {coordinate}  interval={dcfg.interval_s}s"))
+    return 0
+
+
+def _daemon_stop(daemon, coordinate: str) -> int:
+    outcome, pid = daemon.stop(coordinate)
+    if outcome == "stopped":
+        print(_ok(f"daemon stopped (was pid {pid})"))
+    elif outcome == "timeout":
+        print(_warn(f"daemon (pid {pid}) did not exit in time; pid-file cleared"))
+    else:
+        print(_dim("no running daemon"))
+    return 0
+
+
+def _daemon_status(daemon, coordinate: str, cfg, args: argparse.Namespace) -> int:
+    paths = daemon.paths_for(coordinate)
+    status, pid = daemon.pid_status(paths.pid)
+    dcfg = daemon.DaemonConfig.from_config(cfg)
+    if getattr(args, "json", False):
+        import json
+
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "pid": pid,
+                    "coordinate": coordinate,
+                    "interval_s": dcfg.interval_s,
+                    "due_soon_days": dcfg.due_soon_days,
+                    "notifier": list(dcfg.notifier),
+                    "pidfile": str(paths.pid),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    line = {
+        "running": _ok(f"running (pid {pid})"),
+        "stale": _warn(f"stale pid-file (pid {pid} is gone)"),
+        "stopped": _dim("stopped"),
+    }[status]
+    print(f"daemon: {line}  for {coordinate}")
+    print(_dim(f"  interval={dcfg.interval_s}s  due_soon={dcfg.due_soon_days}d  notifier={' '.join(dcfg.notifier)}"))
+    print(_dim(f"  pidfile={paths.pid}"))
     return 0
 
 

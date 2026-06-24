@@ -204,6 +204,119 @@ def test_linear_label_ids_creates_missing_labels(monkeypatch):
     assert created == ["session:abc", "needs-triage"]  # only the missing ones were created
 
 
+def test_linear_node_to_ticket_seeds_native_due_date(monkeypatch):
+    # a ticket created/edited in the Linear UI carries dueDate natively (no body Due section);
+    # _node_to_ticket must seed Ticket.due from it so the daemon still sees the date.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "native due",
+        "url": "https://linear/HYP-7",
+        "description": "",  # no body Due section
+        "dueDate": "2026-09-01",
+        "state": {"type": "unstarted"},
+        "labels": {"nodes": []},
+    }
+    ticket = be._node_to_ticket(node)
+    assert ticket.due == "2026-09-01"
+
+
+def test_linear_body_due_overrides_native_due_date():
+    # when the body carries a ## Due section, it is the source of truth — it overrides the native
+    # dueDate (a divergence shouldn't silently prefer the native field)
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.model import Ticket
+    from tasklib.render import render
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    body = render(Ticket(title="t", what="w", due="2026-10-10"))  # body Due = 2026-10-10
+    node = {
+        "identifier": "HYP-8",
+        "title": "t",
+        "url": "u",
+        "description": body,
+        "dueDate": "2026-01-01",  # native says something else
+        "state": {"type": "unstarted"},
+        "labels": {"nodes": []},
+    }
+    assert be._node_to_ticket(node).due == "2026-10-10"
+
+
+def test_linear_update_clears_native_due_when_empty(monkeypatch):
+    # clearing the due date (empty) must send dueDate: null so the Linear UI stays in sync
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.model import Ticket
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    be._states_by_type = {"unstarted": "st-1"}
+    seen: dict = {}
+
+    def fake_gql(query, variables=None):
+        if "issue(id" in query:
+            return {"issue": {"id": "node-1", "identifier": "HYP-3"}}
+        if "issueUpdate" in query:
+            seen["input"] = variables["input"]
+            return {
+                "issueUpdate": {
+                    "success": True,
+                    "issue": {
+                        "identifier": "HYP-3",
+                        "title": "t",
+                        "url": "u",
+                        "description": variables["input"]["description"],
+                        "dueDate": None,
+                        "state": {"type": "unstarted"},
+                        "labels": {"nodes": []},
+                    },
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    monkeypatch.setattr(be, "_label_ids", lambda names: [])
+    be.update(Ticket(id="HYP-3", title="t", what="w", due=""))  # cleared
+    assert seen["input"]["dueDate"] is None
+
+
+def test_linear_create_mirrors_due_into_native_field(monkeypatch):
+    # the body Due section is the portable source of truth; create also echoes it into the
+    # native dueDate so it shows in the Linear UI.
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.model import Ticket
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    be._states_by_type = {"unstarted": "st-1"}
+    seen: dict = {}
+
+    def fake_gql(query, variables=None):
+        if "issueCreate" in query:
+            seen["input"] = variables["input"]
+            return {
+                "issueCreate": {
+                    "success": True,
+                    "issue": {
+                        "identifier": "HYP-9",
+                        "title": "t",
+                        "url": "u",
+                        "description": variables["input"]["description"],
+                        "dueDate": variables["input"].get("dueDate"),
+                        "state": {"type": "unstarted"},
+                        "labels": {"nodes": []},
+                    },
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    monkeypatch.setattr(be, "_label_ids", lambda names: [])
+    be.create(Ticket(title="t", what="w", due="2026-09-01"))
+    assert seen["input"]["dueDate"] == "2026-09-01"
+
+
 def test_linear_list_scopes_filter_to_team_and_project(monkeypatch):
     # the IssueFilter must carry the team, and the project too when pinned — otherwise two
     # registry entries on the same team but different projects would list identical issues.
