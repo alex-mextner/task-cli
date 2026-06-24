@@ -46,6 +46,9 @@ def test_no_command_prints_help(capsys):
         ["done", "#1", "--screenshot", "after.png"],
         ["list"],
         ["list", "--all", "--state", "todo"],
+        ["gantt"],
+        ["gantt", "--all", "--width", "60"],
+        ["gantt", "--state", "todo", "--label", "ui", "--json"],
         ["read", "#1"],
         ["view", "#1"],
         ["find", "query"],
@@ -256,6 +259,85 @@ def test_list_filter_excludes_all_session_tickets_does_not_fall_back(capsys, _in
     # no fallback line, and the OTHER session's ticket must not appear
     assert "showing all project tasks" not in out
     assert "other-session" not in out and "#2" not in out
+
+
+# ── gantt (read-only due-date timeline) ──────────────────────────────────────────────
+
+
+def test_gantt_renders_dated_and_undated(capsys, _inject_fake):
+    # #1: dated, in this session;  #2: undated, in this session
+    main(_create_argv() + ["--due", "2026-07-01"])
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["gantt", "--no-pager"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "#1" in out
+    assert "undated" in out  # the no-due ticket is shown in its own section, not hidden
+
+
+def test_gantt_json_timeline_shape(capsys, _inject_fake):
+    main(_create_argv() + ["--due", "2026-07-01"])
+    main(_create_argv())  # undated
+    capsys.readouterr()
+    rc = main(["gantt", "--json", "--width", "30"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    import json
+
+    payload = json.loads(out)
+    assert set(payload) == {"window", "rows", "undated"}
+    assert payload["window"]["width"] == 30
+    ids = [r["id"] for r in payload["rows"]]
+    assert "#1" in ids  # the dated ticket charted as a row
+    assert [u["id"] for u in payload["undated"]] == ["#2"]
+
+
+def test_gantt_empty_is_clean(capsys, _inject_fake):
+    # no tickets at all → a message, exit 0, no traceback
+    rc = main(["gantt", "--all", "--no-pager"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no tickets" in out.lower()
+
+
+def test_gantt_does_not_mutate(_inject_fake):
+    main(_create_argv() + ["--due", "2026-07-01"])
+    before = _inject_fake.get("#1").state
+    main(["gantt", "--no-pager"])
+    main(["gantt", "--json"])
+    # read-only: state untouched, no comments/attachments written
+    assert _inject_fake.get("#1").state == before
+    assert _inject_fake.comments == []
+    assert _inject_fake.attachments == []
+
+
+def test_gantt_session_filter_excluding_all_does_not_fall_back(capsys, _inject_fake):
+    # parity with `list`: a session that HAS tickets but none match --label must NOT spill other
+    # sessions' tickets via the all-tasks fallback (the same regression `list` guards).
+    main(_create_argv() + ["--due", "2026-07-01"])  # #1: this session
+    _inject_fake.create(type(_inject_fake.list()[0])(title="other-session", labels=["session:elsewhere"]))
+    capsys.readouterr()
+    rc = main(["gantt", "--label", "nonexistent-label", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    import json
+
+    payload = json.loads(out)
+    # nothing from the other session leaked in (neither as a row nor undated)
+    all_ids = [r["id"] for r in payload["rows"]] + [u["id"] for u in payload["undated"]]
+    assert "#2" not in all_ids
+
+
+def test_gantt_width_zero_clamps_not_crash(capsys, _inject_fake):
+    main(_create_argv() + ["--due", "2026-07-01"])
+    capsys.readouterr()
+    rc = main(["gantt", "--width", "0", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    import json
+
+    assert json.loads(out)["window"]["width"] == 1  # floored to 1, no divide-by-zero
 
 
 # ── read / change / status ──────────────────────────────────────────────────────────

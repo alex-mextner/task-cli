@@ -6,8 +6,8 @@ filesystem (sidecar). All pure logic lives in the sibling modules (``model``/``r
 ``policy``/``classify``/``session``/``config``). Heavy/optional imports (yaml via config,
 the backends) are lazy so ``task --help`` stays fast and dependency-light.
 
-Subcommands: create/new · list · read/view · find · change · status · done · classify · session
-· daemon (the due-date reminder watcher: start/stop/status/run).
+Subcommands: create/new · list · gantt (read-only due-date timeline) · read/view · find · change
+· status · done · classify · session · daemon (the due-date reminder watcher: start/stop/status/run).
 Global flags: --backend, --repo, --config, --json, --yes, and per-gate --skip-<gate>.
 """
 
@@ -122,6 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("-n", type=int, default=None, dest="limit", help="max results (default 100 interactive, 30 piped)")
     lp.add_argument("--no-pager", action="store_true", dest="no_pager", help="never page output (also honors NO_PAGER, $PAGER='')")
 
+    # gantt — read-only due-date timeline (charts `list`'s tickets, same scoping)
+    gp = sub.add_parser("gantt", parents=[common], help="render tickets on a due-date timeline (read-only)")
+    gp.add_argument("--all", action="store_true", help="all tickets, not just this session")
+    gp.add_argument("--state", help="filter by state (todo|in-progress|in-review|done|cancelled)")
+    gp.add_argument("--label", action="append", default=[], help="filter by label (repeatable)")
+    gp.add_argument("-n", type=int, default=None, dest="limit", help="max tickets (default 100 interactive, 30 piped)")
+    gp.add_argument("--width", type=int, default=None, help="bar-area width in columns (default: auto from terminal)")
+    gp.add_argument("--no-pager", action="store_true", dest="no_pager", help="never page output (also honors NO_PAGER, $PAGER='')")
+
     # read / view
     rp = sub.add_parser("read", parents=[common], help="show a full ticket")
     rp.add_argument("id", help="ticket id (#123 or HYP-456)")
@@ -201,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         "create": cmd_create,
         "new": cmd_create,  # `new` is an alias of `create` (CTO-requested verb)
         "list": cmd_list,
+        "gantt": cmd_gantt,
         "read": cmd_read,
         "view": cmd_read,
         "find": cmd_find,
@@ -872,6 +882,100 @@ def _print_groups_json(groups) -> None:
         for g in groups
     ]
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+# ── gantt (read-only due-date timeline) ─────────────────────────────────────────────
+
+
+def _gantt_tickets(args, cfg, state) -> list[Ticket]:
+    """Collect the tickets to chart, with the SAME scoping `list` uses (session / all / grouped).
+
+    Returns a flat ticket list — the chart is one timeline, so a cross-project run flattens every
+    project's tickets into a single axis (the project shows up via the ticket id prefix). Reuses
+    the existing backend queries so `gantt` and `list` never drift on what "this session" means.
+    """
+    from .backends import BackendError
+
+    current = _current_project_overlay(cfg)
+    limit = _effective_limit(args)
+
+    # Cross-project: an explicit --all, or outside any repo → flatten every known project's tickets.
+    if args.all or current is None:
+        projects, current_coordinate = _known_projects(cfg)
+        if not projects:
+            raise _UserError(
+                "no projects to chart. You are outside a git repo and no projects are registered.\n"
+                "  why: `task gantt` charts known projects; none are configured.\n"
+                "  fix: add a `projects:` entry to ~/.config/task-cli/config.yaml, or run inside a repo."
+            )
+        groups = _aggregate_projects(
+            cfg, projects, labels=args.label or None, state=state, limit=limit,
+            current_coordinate=current_coordinate,
+        )
+        return [t for g in groups for t in g.tickets]
+
+    # In-repo: session scope with the all-tasks fallback, mirroring `list`.
+    backend = _backend(cfg)
+    session = _detect_session(cfg)
+    no_session = session.source == "none"
+    want_labels = set(args.label or [])
+    try:
+        session_tickets = [] if no_session else backend.session_tickets(session.label, limit=limit)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    if no_session or not session_tickets:
+        try:
+            return backend.list(labels=args.label or None, state=state, limit=limit)
+        except BackendError as exc:
+            raise _UserError(str(exc)) from exc
+
+    tickets = session_tickets
+    if state is not None:
+        tickets = [t for t in tickets if t.state == state]
+    if want_labels:
+        tickets = [t for t in tickets if want_labels <= set(t.labels)]
+    return tickets
+
+
+def _gantt_width(args) -> int:
+    """Resolve the bar-area width: an explicit --width wins; else fit the terminal, with a floor."""
+    from . import gantt as _g
+
+    if getattr(args, "width", None) is not None:
+        return max(1, args.width)
+    import shutil
+
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return _g.fit_width(cols)
+
+
+def cmd_gantt(args: argparse.Namespace) -> int:
+    """Render open tickets on a due-date timeline (read-only). Scoping mirrors `task list`.
+
+    Human output is a box-drawing chart (one row per dated ticket, bars on a date axis, a status
+    marker, and a clearly-labeled undated section), paged like `list`. `--json` emits the same
+    timeline as a deterministic structure. No mutation — this is purely a view.
+    """
+    from datetime import date
+
+    from . import gantt as _g
+
+    cfg = _load(args)
+    state = _parse_state(args.state) if args.state else None
+    tickets = _gantt_tickets(args, cfg, state)
+    today = date.today()
+    chart = _g.layout(tickets, today, width=_gantt_width(args))
+
+    if args.json:
+        import json
+
+        print(json.dumps(_g.to_json(chart, today), ensure_ascii=False, indent=2))
+        return 0
+
+    text = _g.render(chart, color=_c, today=today)
+    _emit_list(args, [text])
+    return 0
 
 
 def cmd_read(args: argparse.Namespace) -> int:
