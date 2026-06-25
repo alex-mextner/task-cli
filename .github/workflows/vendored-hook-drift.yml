@@ -1,0 +1,84 @@
+name: vendored-hook-drift
+
+# UPSTREAM-drift guard for the vendored require-ticket hook fixture (issue #20).
+#
+# The pinned-SHA test (tests/test_vendored_hook_sync.py) runs on every PR and catches a LOCAL edit
+# to the vendored copy — but it can't see the agent-tools canonical, so it can't catch the canonical
+# CHANGING upstream while our pinned copy stays put. This scheduled job closes that gap: it checks
+# out the agent-tools catalog and runs the re-sync script in --check mode, which fails when our
+# vendored fixture no longer matches the current canonical hook. On drift it opens / updates a
+# tracking issue instead of silently going stale.
+#
+# Cross-repo read: agent-tools is public, so the default checkout token is enough; if it ever goes
+# private, set an AGENT_TOOLS_TOKEN secret and pass it as `token:` on that checkout step.
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout task-cli
+        uses: actions/checkout@v5
+
+      - name: Checkout agent-tools (the canonical hook source)
+        uses: actions/checkout@v5
+        with:
+          repository: alex-mextner/agent-tools
+          path: .agent-tools-src
+          # shallow is fine — --check compares only the canonical BODY hash, never canonical_commit()
+          # token: ${{ secrets.AGENT_TOOLS_TOKEN }}   # uncomment if agent-tools becomes private
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the vendored hook against the current canonical
+        id: drift
+        run: |
+          set +e
+          python scripts/resync_vendored_hook.py --check "$GITHUB_WORKSPACE/.agent-tools-src"
+          rc=$?
+          set -e
+          # rc 0 = in sync · rc 1 = real DRIFT (re-sync) · rc >=2 = infra error (path moved / usage /
+          # crash) — the latter is NOT drift and "re-sync the body" would be the wrong advice.
+          if [ "$rc" -eq 0 ]; then
+            echo "outcome=ok" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            echo "outcome=drift" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open / update a tracking issue (real drift vs infra error get different advice)
+        if: steps.drift.outputs.outcome != 'ok'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.drift.outputs.outcome }}" = "drift" ]; then
+            title="vendored require-ticket hook has drifted from agent-tools canonical"
+            body=$'The scheduled drift check found `test/docker/require_ticket_before_commit.py` is no longer in sync with the canonical agent-tools hook.\n\nRe-sync it:\n```\npython scripts/resync_vendored_hook.py /path/to/agent-tools\n```\nthen commit. See issue #20 for context.'
+          else
+            title="vendored require-ticket drift CHECK failed (infra error, not drift)"
+            body=$'The scheduled drift check exited with an infrastructure error (>=2), NOT a body mismatch — likely the canonical path moved in agent-tools (CANONICAL_REL), a bad checkout, or a script crash. Re-syncing the body is NOT the fix; investigate the check itself. See `.github/workflows/vendored-hook-drift.yml` and issue #20.'
+          fi
+          # Match the EXACT title (gh --search is word-based, and the drift vs infra titles share
+          # words — a substring search could comment on the wrong one). `--jq` filters on an exact
+          # `.title == $title`; `// empty` keeps an empty result "" (not the literal "null"), so the
+          # create branch stays reachable and `gh issue comment null` can't fire.
+          existing=$(gh issue list --search "$title in:title" --state open --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty" || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            # create once; never a blind `|| create` fallback (that would dupe on a transient/network
+            # failure). The `drift` label is created if missing, so the create won't fail on a label.
+            gh label create drift --color FBCA04 --description "vendored-copy drift from canonical" 2>/dev/null || true
+            gh issue create --title "$title" --body "$body" --label drift
+          fi
