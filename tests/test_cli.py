@@ -726,6 +726,20 @@ def test_daemon_stop_when_nothing_running(capsys, _inject_fake, tmp_path, monkey
     assert "no running daemon" in capsys.readouterr().out
 
 
+def test_daemon_stop_reports_not_ours_pid(capsys, _inject_fake, tmp_path, monkeypatch):
+    # the new "not-ours" outcome (a live but recycled pid) must print a distinct warning, not be
+    # silently reported as a clean stop — and still return 0
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "stop", lambda *a, **k: ("not-ours", 4242))
+    rc = main(["daemon", "stop"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "4242" in out
+    assert "not the task daemon" in out
+
+
 def test_read_json_includes_due(capsys, _inject_fake):
     import json
 

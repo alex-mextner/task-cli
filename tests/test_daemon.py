@@ -279,6 +279,28 @@ def test_read_pid_rejects_garbage(tmp_path):
     assert daemon.read_pid(p) == 12345
 
 
+def test_read_pid_empty_and_whitespace(tmp_path):
+    # an empty or whitespace-only first line → None (not a crash)
+    p = tmp_path / "p"
+    p.write_text("", encoding="utf-8")
+    assert daemon.read_pid(p) is None
+    p.write_text("   \n", encoding="utf-8")
+    assert daemon.read_pid(p) is None
+    p.write_text("\n123\n", encoding="utf-8")  # blank first line
+    assert daemon.read_pid(p) is None
+
+
+def test_clear_pid_if_matches_only_clears_the_recorded_pid(tmp_path):
+    # the race guard: clearing the pid-file must NOT delete a DIFFERENT (freshly-restarted) daemon's
+    # file — only when it still records the pid we were stopping
+    p = tmp_path / "x.pid"
+    daemon._write_pid(p, 111)
+    daemon._clear_pid_if_matches(p, 222)  # file says 111, we hold 222 → must NOT clear
+    assert daemon.read_pid(p) == 111
+    daemon._clear_pid_if_matches(p, 111)  # matches → cleared
+    assert daemon.read_pid(p) is None
+
+
 def test_is_alive():
     assert daemon.is_alive(os.getpid()) is True
     assert daemon.is_alive(2**30) is False
@@ -382,7 +404,7 @@ def test_stop_not_running_clears_stale(tmp_path):
 # `task daemon stop` is a SEPARATE process from the daemon, never its parent — a same-process
 # child would zombie and make stop() see a spurious timeout. We do it with a short-lived launcher
 # (`sh -c "python … &"`) that backgrounds the sleeper and exits, reparenting it to init.
-def _spawn_orphan(code: str) -> int:
+def _spawn_orphan(code: str, *, identity: bool = True) -> int:
     import subprocess
     import sys
     import time
@@ -390,8 +412,12 @@ def _spawn_orphan(code: str) -> int:
     pidfile = subprocess.run(
         ["mktemp"], capture_output=True, text=True, check=True
     ).stdout.strip()
-    # the launcher backgrounds the real sleeper, writes ITS pid, and exits → sleeper orphans to init
-    launcher = f'{sys.executable} -c {code!r} & echo $! > {pidfile}'
+    # The trailing `-m tasklib daemon run` tokens are passed as extra argv after `-c <code>` (Python
+    # ignores them as argv, but `/proc/<pid>/cmdline` & `ps -o args=` show them) so the spawned
+    # sleeper's command line carries the daemon-identity token SEQUENCE — exercising the real
+    # identify_pid()/is_task_daemon() check in stop(). identity=False → an UNRELATED recycled pid.
+    markers = " -m tasklib daemon run" if identity else ""
+    launcher = f'{sys.executable} -c {code!r}{markers} & echo $! > {pidfile}'
     subprocess.run(["sh", "-c", launcher], check=True)
     # read the orphaned sleeper's pid (the launcher has exited)
     deadline = time.time() + 3
@@ -447,6 +473,444 @@ def test_stop_escalates_to_sigkill_when_term_ignored(tmp_path):
         assert daemon.read_pid(paths.pid) is None
     finally:
         _kill_quiet(pid)
+
+
+# ── PID-identity check on stop (issue #25 part a — the reused-pid hazard) ─────────────
+
+
+def test_is_task_daemon_true_for_marked_argv(tmp_path):
+    # a process whose command line carries the daemon-identity markers is recognized as ours
+    pid = _spawn_orphan("import time; time.sleep(30)", identity=True)
+    try:
+        assert daemon.is_task_daemon(pid) is True
+    finally:
+        _kill_quiet(pid)
+
+
+def test_is_task_daemon_false_for_unrelated_process(tmp_path):
+    # a live process WITHOUT the markers (a recycled pid) is NOT recognized — stop must not signal it
+    pid = _spawn_orphan("import time; time.sleep(30)", identity=False)
+    try:
+        assert daemon.is_task_daemon(pid) is False
+    finally:
+        _kill_quiet(pid)
+
+
+def test_is_task_daemon_false_for_dead_pid():
+    # a pid with no process at all → not provably ours
+    assert daemon.is_task_daemon(2**30) is False
+
+
+def test_identify_pid_tristate(tmp_path):
+    # the tri-state: a marked process is "daemon", an unmarked live one is "foreign", a dead one
+    # is "unknown" (can't read its cmdline at all)
+    ours = _spawn_orphan("import time; time.sleep(30)", identity=True)
+    theirs = _spawn_orphan("import time; time.sleep(30)", identity=False)
+    try:
+        assert daemon.identify_pid(ours) == daemon.IDENTITY_DAEMON
+        assert daemon.identify_pid(theirs) == daemon.IDENTITY_FOREIGN
+        assert daemon.identify_pid(2**30) == daemon.IDENTITY_UNKNOWN
+    finally:
+        _kill_quiet(ours)
+        _kill_quiet(theirs)
+
+
+def test_identify_pid_rejects_loose_substring_match(monkeypatch):
+    # a process whose argv merely MENTIONS the words (e.g. `grep "tasklib daemon run"`) but is not
+    # `python -m tasklib daemon run` must be FOREIGN — the contiguous-token check, not substring.
+    monkeypatch.setattr(daemon, "process_cmdline", lambda pid: ["grep", "tasklib daemon run", "."])
+    assert daemon.identify_pid(123) == daemon.IDENTITY_FOREIGN
+    # the real launch shape IS recognized
+    monkeypatch.setattr(
+        daemon, "process_cmdline", lambda pid: ["python", "-m", "tasklib", "daemon", "run", "-C", "/x"]
+    )
+    assert daemon.identify_pid(123) == daemon.IDENTITY_DAEMON
+
+
+def test_argv_is_task_daemon_accepts_both_launch_shapes():
+    # the `python -m tasklib daemon run` form (how _spawn_detached starts it)
+    assert daemon.argv_is_task_daemon(["python", "-m", "tasklib", "daemon", "run", "-C", "/x"])
+    # the console-script form `/path/to/task daemon run` (systemd unit / Docker ENTRYPOINT) — must
+    # ALSO be recognized, else a console-script-launched daemon is mis-classified as foreign + orphaned
+    assert daemon.argv_is_task_daemon(["/usr/local/bin/task", "daemon", "run", "-C", "/srv/repo"])
+    assert daemon.argv_is_task_daemon(["task", "daemon", "run"])
+    # NOT ours: `daemon run` present but the preceding token is not tasklib/`task`
+    assert not daemon.argv_is_task_daemon(["foo", "daemon", "run"])
+    # NOT ours: tasklib referenced but `daemon run` not contiguous
+    assert not daemon.argv_is_task_daemon(["python", "-m", "tasklib", "list"])
+    # NOT ours: an editor opening the file (substring, not the subcommand)
+    assert not daemon.argv_is_task_daemon(["vim", "tasklib/daemon.py"])
+    # NOT ours: a stray `task` token NOT immediately before `daemon` (the positional anchor rejects it)
+    assert not daemon.argv_is_task_daemon(["task", "list", "foo", "daemon", "run"])
+    assert not daemon.argv_is_task_daemon(["tasklib", "x", "daemon", "run"])
+    # IS ours: `task` as the executable immediately before the subcommand, even behind a wrapper
+    assert daemon.argv_is_task_daemon(["timeout", "60", "task", "daemon", "run"])
+
+
+def test_identify_pid_recognizes_renamed_entrypoint_via_recorded_identity(monkeypatch):
+    # the robust fix: a daemon launched via a NON-standard entrypoint (renamed console-script / frozen
+    # binary) whose argv does NOT match argv_is_task_daemon is STILL recognized when its recorded
+    # identity (the signature it wrote to its pid-file) matches the live argv.
+    frozen_argv = ["/opt/app/mytaskd", "daemon", "run", "--config", "/etc/x"]
+    monkeypatch.setattr(daemon, "process_cmdline", lambda pid: frozen_argv)
+    recorded = daemon.argv_signature(frozen_argv)
+    # without the recorded identity the shape matcher calls it foreign (no tasklib/`task`)...
+    assert daemon.identify_pid(123) == daemon.IDENTITY_FOREIGN
+    # ...but WITH the recorded identity it is correctly recognized as ours
+    assert daemon.identify_pid(123, recorded_identity=recorded) == daemon.IDENTITY_DAEMON
+    # a recorded identity that does NOT match the live argv stays foreign (a genuinely recycled pid)
+    assert daemon.identify_pid(123, recorded_identity="something else entirely") == daemon.IDENTITY_FOREIGN
+
+
+def test_identify_pid_recorded_identity_is_authoritative_over_shape(monkeypatch):
+    # THE reused-pid hazard the recorded identity must close: coordinate A's daemon crashes (recorded
+    # `…-C /A`), the OS reuses its pid for coordinate B's daemon (`…-C /B`, which HAS the task-daemon
+    # SHAPE). stop("A") must NOT mistake B for A's daemon and kill it — a recorded identity that does
+    # not match the live argv is FOREIGN, NOT a fall-through to the shape matcher.
+    b_argv = ["python", "-m", "tasklib", "daemon", "run", "-C", "/repo/B"]
+    monkeypatch.setattr(daemon, "process_cmdline", lambda pid: b_argv)
+    a_identity = "python -m tasklib daemon run -C /repo/A"
+    # without a recorded identity, the shape matcher (correctly) calls B a daemon
+    assert daemon.identify_pid(99) == daemon.IDENTITY_DAEMON
+    # WITH A's recorded identity, B's mismatching argv is FOREIGN — A's stop won't signal B
+    assert daemon.identify_pid(99, recorded_identity=a_identity) == daemon.IDENTITY_FOREIGN
+
+
+def test_pid_file_records_and_reads_back_identity(tmp_path):
+    # _write_pid(identity=...) writes pid on line 1, identity on line 2; read_pid stays compatible
+    p = tmp_path / "x.pid"
+    daemon._write_pid(p, 4242, identity="python -m tasklib daemon run -C /repo")
+    assert daemon.read_pid(p) == 4242  # first line only
+    assert daemon.read_recorded_identity(p) == "python -m tasklib daemon run -C /repo"
+    # a legacy single-line pid-file has no recorded identity
+    legacy = tmp_path / "legacy.pid"
+    daemon._write_pid(legacy, 7)
+    assert daemon.read_pid(legacy) == 7
+    assert daemon.read_recorded_identity(legacy) is None
+
+
+def test_argv_signature_is_single_line(tmp_path):
+    # a token carrying a newline/tab must NOT split the pid-file record across lines — argv_signature
+    # collapses internal whitespace so the identity is always one line and read_recorded_identity
+    # reads it whole. Otherwise a real daemon would be mis-classified foreign and orphaned.
+    sig = daemon.argv_signature(["python", "-m", "tasklib", "daemon", "run", "-C", "/weird\npath\there"])
+    assert "\n" not in sig and "\t" not in sig
+    p = tmp_path / "x.pid"
+    daemon._write_pid(p, 4242, identity=sig)
+    assert daemon.read_pid(p) == 4242
+    assert daemon.read_recorded_identity(p) == sig  # round-trips whole, not truncated
+
+
+def test_run_loop_records_a_matching_self_identity(tmp_path, monkeypatch, capture_notifications):
+    # the daemon records its OWN argv signature, and that signature matches what identify_pid would
+    # read back for this process — so a stop() for this pid recognizes it via the recorded identity
+    from tasklib.config import LoadedConfig
+
+    cfg = LoadedConfig(data={"backend": "github-issues", "daemon": {"interval_s": 1}}, repo_root=tmp_path)
+    be = _FakeBackend([])
+    monkeypatch.setattr("tasklib.backends.get_backend", lambda c, env=None: be)
+    paths = daemon.DaemonPaths(
+        pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log", lock=tmp_path / "p.lock"
+    )
+    # capture the identity written during the loop (before the finally clears the pid-file)
+    captured = {}
+    real_write = daemon._write_pid
+
+    def spy_write(path, pid, *, identity=None):
+        captured["identity"] = identity
+        return real_write(path, pid, identity=identity)
+
+    monkeypatch.setattr(daemon, "_write_pid", spy_write)
+    assert daemon.run_loop(cfg, paths, max_ticks=1) == 0
+    assert captured["identity"], "the daemon must record a non-empty self identity"
+    # the recorded identity is THIS process's argv signature (the same source stop() reads)
+    assert captured["identity"] == daemon.argv_signature(daemon._self_argv())
+
+
+def test_spawn_detached_argv_is_recognized_by_the_identity_matcher(tmp_path, monkeypatch):
+    # CONSISTENCY guard: the EXACT argv _spawn_detached launches must satisfy argv_is_task_daemon, so
+    # stop() never mis-classifies the daemon it itself started. We capture the spawned argv and feed it
+    # straight to the matcher — if the launch shape and the matcher ever drift apart, this fails.
+    seen: dict = {}
+
+    class _FakeProc:
+        pid = 123
+
+    def fake_popen(argv, **kw):
+        seen["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=[])
+    assert daemon.argv_is_task_daemon(seen["argv"]), seen["argv"]
+
+
+def test_stop_rechecks_identity_before_sigkill(tmp_path, monkeypatch):
+    # finding: between the SIGTERM wait and the SIGKILL escalation the pid could die + be recycled.
+    # stop must RE-CHECK identity before SIGKILL and, if the pid is now foreign, NOT send SIGKILL.
+    # Deterministic via mocks: a live (but unsignalled) sleeper, a forced SIGTERM-timeout, and an
+    # identify_pid that flips daemon→foreign between the pre-SIGTERM guard and the pre-SIGKILL recheck.
+    import signal as _sig
+
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    pid = _spawn_orphan("import time; time.sleep(60)", identity=True)
+
+    calls = {"n": 0}
+
+    def fake_identify(p, *, recorded_identity=None):
+        calls["n"] += 1
+        return daemon.IDENTITY_DAEMON if calls["n"] == 1 else daemon.IDENTITY_FOREIGN
+
+    monkeypatch.setattr(daemon, "identify_pid", fake_identify)
+    monkeypatch.setattr(daemon, "_wait_gone", lambda p, t: False)  # SIGTERM "didn't take" → escalation path
+
+    sent: list = []
+    real_kill = os.kill
+
+    def spy_kill(p, sig):
+        sent.append(sig)
+        if sig == _sig.SIGTERM:
+            return  # swallow the SIGTERM so the live sleeper stays alive for the recheck
+        return real_kill(p, sig)
+
+    monkeypatch.setattr(daemon.os, "kill", spy_kill)
+    try:
+        daemon._write_pid(paths.pid, pid)
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=1)
+        assert outcome == "not-ours", "a pid that turned foreign before SIGKILL must not be killed"
+        assert got == pid
+        assert _sig.SIGKILL not in sent, "SIGKILL must NOT be sent after the identity recheck fails"
+        assert daemon.read_pid(paths.pid) is None  # pid-file cleared
+    finally:
+        _kill_quiet(pid)
+
+
+def test_daemon_paths_lock_path_appends_not_replaces_suffix(tmp_path):
+    # lock_path must APPEND ".lock" to the full pid-file name, not replace the suffix — robust even if
+    # the pid-file name contains dots
+    paths = daemon.DaemonPaths(
+        pid=tmp_path / "github.com_owner_repo.pid", state=tmp_path / "s.json", log=tmp_path / "l.log"
+    )
+    assert paths.lock_path.name == "github.com_owner_repo.pid.lock"
+
+
+def test_stop_refuses_to_signal_a_recycled_pid(tmp_path):
+    # the reused-pid guard: the pid-file points at a LIVE but UNRELATED process (OS pid-reuse after a
+    # daemon crash). stop must NOT signal it — return "not-ours", clear the stale file, leave it alive.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    innocent = _spawn_orphan("import time; time.sleep(30)", identity=False)
+    try:
+        daemon._write_pid(paths.pid, innocent)
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=1)
+        assert outcome == "not-ours"
+        assert got == innocent
+        assert daemon.read_pid(paths.pid) is None  # the misleading pid-file is cleared
+        assert daemon.is_alive(innocent), "the innocent recycled-pid process must NOT be killed"
+    finally:
+        _kill_quiet(innocent)
+
+
+def test_stop_signals_a_real_daemon_with_matching_identity(tmp_path):
+    # the happy path with the identity check ENABLED: a process carrying the markers IS signalled
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    pid = _spawn_orphan("import time; time.sleep(60)", identity=True)
+    try:
+        daemon._write_pid(paths.pid, pid)
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=5)
+        assert outcome == "stopped"
+        assert got == pid
+        assert daemon.read_pid(paths.pid) is None
+    finally:
+        _kill_quiet(pid)
+
+
+def test_stop_signals_a_real_daemon_via_the_RECORDED_identity_branch(tmp_path):
+    # END-TO-END coverage of the CORE mechanism on a REAL process: write the pid-file with the
+    # recorded identity derived from the live pid's OWN cmdline (exactly as run_loop does), then prove
+    # stop() recognizes it through the recorded-identity branch and signals it. This is the test that
+    # would catch a write-side/read-side tokenization mismatch (which would otherwise orphan the
+    # daemon). We deliberately spawn WITHOUT the shape markers so ONLY the recorded identity can match.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    pid = _spawn_orphan("import time; time.sleep(60)", identity=False)  # no `daemon run` shape
+    try:
+        live_sig = daemon.argv_signature(daemon.process_cmdline(pid))
+        assert live_sig, "the live process must have a readable cmdline for this test"
+        # sanity: WITHOUT the recorded identity the shape matcher would call it foreign...
+        assert daemon.identify_pid(pid) == daemon.IDENTITY_FOREIGN
+        # ...so a clean stop here can ONLY succeed via the recorded-identity branch
+        daemon._write_pid(paths.pid, pid, identity=live_sig)
+        assert daemon.read_recorded_identity(paths.pid) == live_sig
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=5)
+        assert outcome == "stopped", "stop must recognize the daemon via its recorded identity"
+        assert got == pid
+        assert daemon.read_pid(paths.pid) is None
+    finally:
+        _kill_quiet(pid)
+
+
+def test_stop_refuses_real_process_with_mismatching_recorded_identity(tmp_path):
+    # the SYMMETRIC end-to-end pair to the recorded-identity happy path: a LIVE real process whose
+    # recorded identity does NOT match its live argv (a recycled pid) → stop returns "not-ours" and
+    # does NOT signal it. This would catch a write-side serialization bug from the other direction.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    pid = _spawn_orphan("import time; time.sleep(30)", identity=False)
+    try:
+        daemon._write_pid(paths.pid, pid, identity="python -m tasklib daemon run -C /some/OTHER/coord")
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=1)
+        assert outcome == "not-ours", "a mismatching recorded identity must refuse to signal"
+        assert got == pid
+        assert daemon.is_alive(pid), "the process must NOT be killed"
+        assert daemon.read_pid(paths.pid) is None  # the misleading file is cleared
+    finally:
+        _kill_quiet(pid)
+
+
+def test_stop_still_signals_when_cmdline_unreadable(tmp_path, monkeypatch):
+    # REGRESSION: when the cmdline can't be read at all (busybox `ps` / no /proc → IDENTITY_UNKNOWN),
+    # stop must NOT refuse — refusing would orphan a real daemon in the minimal Docker images this
+    # project tests in. The recorded pid is still signalled (the pre-guard behavior).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    pid = _spawn_orphan("import time; time.sleep(60)", identity=True)
+    # force "can't read the cmdline" for this pid → identify_pid returns UNKNOWN
+    monkeypatch.setattr(daemon, "process_cmdline", lambda p: None)
+    try:
+        daemon._write_pid(paths.pid, pid)
+        outcome, got = daemon.stop("owner/repo", env=env, timeout_s=5)
+        assert outcome == "stopped", "an unreadable cmdline must NOT orphan the daemon"
+        assert got == pid
+        assert daemon.read_pid(paths.pid) is None
+    finally:
+        _kill_quiet(pid)
+
+
+# ── flock singleton (issue #25 part b — close the start() TOCTOU) ────────────────────
+
+
+def test_acquire_singleton_grants_then_blocks(tmp_path):
+    # the first acquire wins the exclusive flock; a second non-blocking acquire on the SAME lock
+    # (while the first handle is open) is refused with None — the race-free singleton guarantee
+    lock = tmp_path / "x.lock"
+    first = daemon.acquire_singleton(lock)
+    assert first is not None
+    try:
+        second = daemon.acquire_singleton(lock)
+        assert second is None, "a second daemon must not acquire the lock while the first holds it"
+    finally:
+        first.close()
+
+
+def test_acquire_singleton_reusable_after_release(tmp_path):
+    # closing the handle releases the lock → a fresh acquire succeeds (a clean restart re-locks)
+    lock = tmp_path / "x.lock"
+    h1 = daemon.acquire_singleton(lock)
+    assert h1 is not None
+    h1.close()
+    h2 = daemon.acquire_singleton(lock)
+    assert h2 is not None
+    h2.close()
+
+
+def test_acquire_singleton_non_posix_fallback(tmp_path, monkeypatch):
+    # on a platform without fcntl (non-POSIX) acquire_singleton degrades to "no flock available":
+    # it returns the open (UNLOCKED) handle so the daemon still runs, with the pid-file liveness
+    # check as the fallback guard — it must NOT crash on the missing import.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_fcntl(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("no fcntl on this platform")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_fcntl)
+    h = daemon.acquire_singleton(tmp_path / "x.lock")
+    assert h is not None  # degrades to an unlocked handle, never None/crash
+    h.close()
+
+
+def test_run_loop_loser_exits_without_clobbering_winner(tmp_path, monkeypatch, capture_notifications):
+    # two daemons race: the WINNER holds the lock; a second run_loop on the same coordinate gets
+    # None from acquire_singleton, logs "already-running", and returns WITHOUT writing a pid-file or
+    # ticking — so it can't clobber the winner's state. We simulate the winner by pre-holding the lock.
+    from tasklib.config import LoadedConfig
+
+    cfg = LoadedConfig(data={"backend": "github-issues", "daemon": {"interval_s": 1}}, repo_root=tmp_path)
+    be = _FakeBackend([_t("#1", "2026-06-20")])
+    monkeypatch.setattr("tasklib.backends.get_backend", lambda c, env=None: be)
+    paths = daemon.DaemonPaths(
+        pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log", lock=tmp_path / "p.lock"
+    )
+    winner = daemon.acquire_singleton(paths.lock_path)  # the "other" daemon already holds the lock
+    assert winner is not None
+    daemon._write_pid(paths.pid, 99999, identity="python -m tasklib daemon run -C /winner")  # winner's pid-file
+    try:
+        rc = daemon.run_loop(cfg, paths, max_ticks=5)
+        assert rc == 0
+        assert capture_notifications == [], "the loser must not tick"
+        # the KEY guarantee: the loser returns BEFORE its try/finally, so it must NOT _clear_pid the
+        # winner's pid-file — the winner's record must be intact and unchanged.
+        assert daemon.read_pid(paths.pid) == 99999, "the loser must not clobber the winner's pid-file"
+        assert daemon.read_recorded_identity(paths.pid) == "python -m tasklib daemon run -C /winner"
+    finally:
+        winner.close()
+
+
+def test_run_loop_winner_holds_lock_during_loop(tmp_path, monkeypatch, capture_notifications):
+    # while run_loop is running it must HOLD the lock (a concurrent acquire is refused). We prove it
+    # from inside a tick: the backend's list() tries to acquire the same lock and records the result.
+    from tasklib.config import LoadedConfig
+
+    cfg = LoadedConfig(data={"backend": "github-issues", "daemon": {"interval_s": 1}}, repo_root=tmp_path)
+    paths = daemon.DaemonPaths(
+        pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log", lock=tmp_path / "p.lock"
+    )
+    acquired_during_loop: list = []
+
+    class _ProbingBackend:
+        def list(self, *, labels=None, state=None, limit=30):
+            # while the loop owns the lock, a second acquire must be refused (None)
+            h = daemon.acquire_singleton(paths.lock_path)
+            acquired_during_loop.append(h)
+            if h is not None:
+                h.close()
+            return []
+
+    monkeypatch.setattr("tasklib.backends.get_backend", lambda c, env=None: _ProbingBackend())
+    rc = daemon.run_loop(cfg, paths, max_ticks=1)
+    assert rc == 0
+    assert acquired_during_loop == [None], "the loop must hold the lock exclusively while ticking"
+
+
+def test_run_loop_releases_lock_on_exit(tmp_path, monkeypatch, capture_notifications):
+    # after run_loop returns, the lock is released → a fresh run_loop / acquire succeeds
+    from tasklib.config import LoadedConfig
+
+    cfg = LoadedConfig(data={"backend": "github-issues", "daemon": {"interval_s": 1}}, repo_root=tmp_path)
+    be = _FakeBackend([])
+    monkeypatch.setattr("tasklib.backends.get_backend", lambda c, env=None: be)
+    paths = daemon.DaemonPaths(
+        pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log", lock=tmp_path / "p.lock"
+    )
+    assert daemon.run_loop(cfg, paths, max_ticks=1) == 0
+    after = daemon.acquire_singleton(paths.lock_path)
+    assert after is not None, "the lock must be released when the loop exits"
+    after.close()
+
+
+def test_daemon_paths_lock_defaults_to_pidfile_sibling(tmp_path):
+    # DaemonPaths.lock defaults to the pid-file name + ".lock", so existing constructors that pass
+    # only pid/state/log still get a sensible, collision-free lock path next to the pid-file
+    paths = daemon.paths_for("owner/repo", env={"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)})
+    assert paths.lock is None
+    assert paths.lock_path == paths.pid.parent / (paths.pid.name + ".lock")
+    assert paths.lock_path.name.endswith(".pid.lock")
 
 
 # ── config ──────────────────────────────────────────────────────────────────────────

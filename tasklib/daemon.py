@@ -120,11 +120,23 @@ def _notifier_argv(value: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class DaemonPaths:
-    """Where this coordinate's daemon keeps its pid-file, notified-state, and log."""
+    """Where this coordinate's daemon keeps its pid-file, notified-state, log, and singleton lock.
+
+    ``lock`` defaults to the pid-file's path with a ``.lock`` suffix so existing constructors that
+    pass only ``pid``/``state``/``log`` keep working; the live daemon holds an exclusive flock on
+    it for its whole lifetime, which is the race-free singleton guarantee (see :func:`acquire_singleton`).
+    """
 
     pid: Path
     state: Path
     log: Path
+    lock: Path | None = None
+
+    @property
+    def lock_path(self) -> Path:
+        # APPEND ".lock" to the full pid-file name (not with_suffix, which would replace whatever
+        # follows the last dot in the stem — fragile if the coordinate key ever contains a dot).
+        return self.lock if self.lock is not None else self.pid.parent / (self.pid.name + ".lock")
 
 
 def _state_dir(env: dict[str, str] | None = None) -> Path:
@@ -157,15 +169,69 @@ def paths_for(coordinate: str, *, env: dict[str, str] | None = None) -> DaemonPa
 
 
 def read_pid(pid_path: Path) -> int | None:
-    """The pid recorded in ``pid_path`` (a positive int), or ``None`` if absent/garbage."""
+    """The pid recorded in ``pid_path`` (a positive int), or ``None`` if absent/garbage.
+
+    The pid is the FIRST line; an optional second line records the daemon's launch identity (see
+    :func:`read_recorded_identity`). Reading only the first line keeps an older single-line pid-file
+    fully compatible.
+    """
     try:
-        content = pid_path.read_text(encoding="utf-8").strip()
+        first = pid_path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+    if not first.isdigit():
+        return None
+    pid = int(first)
+    return pid if pid > 0 else None
+
+
+def read_recorded_identity(pid_path: Path) -> str | None:
+    """The daemon's recorded launch identity (the pid-file's second line), or ``None`` if absent.
+
+    The running daemon writes its OWN argv signature here at startup (:func:`run_loop`). ``stop`` then
+    matches the LIVE pid's argv against this recorded value, which is robust to ANY entrypoint shape
+    — a renamed console-script, a frozen/PyInstaller binary — because it compares against what THIS
+    daemon actually launched as instead of guessing a pattern.
+    """
+    try:
+        lines = pid_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
-    if not content.isdigit():
+    if len(lines) < 2:
         return None
-    pid = int(content)
-    return pid if pid > 0 else None
+    recorded = lines[1].strip()
+    return recorded or None
+
+
+def argv_signature(tokens: list[str]) -> str:
+    """A normalized, SINGLE-LINE, STABLE signature of an argv token list — argv[0] DROPPED.
+
+    Two normalizations make the signature reproducible across reads of the SAME process:
+
+    - ``argv[0]`` (the interpreter/executable path) is DROPPED entirely. It is NOT stable between
+      reads: a venv ``python3`` reads as the symlink path at one moment and the resolved real path
+      (or even a different basename like ``Python``) at another, depending on how ``ps`` resolves it
+      — so including it would make a live daemon's recorded signature mismatch its OWN later read and
+      orphan the daemon. ``argv[1:]`` — ``-m tasklib daemon run -C <coordinate>`` — is the stable AND
+      discriminating part: it pins the tool, the subcommand, AND the coordinate (so a recycled pid
+      running a DIFFERENT coordinate's daemon still mismatches and is correctly foreign).
+    - Internal whitespace (newlines/tabs) inside any remaining token is collapsed to single spaces,
+      so the signature is always ONE line — it is stored as the second line of the pid-file, and a
+      token with a literal newline would otherwise split the record and truncate the recorded value.
+    """
+    norm = [" ".join(tok.split()) for tok in tokens if tok.split()]
+    return " ".join(norm[1:])  # drop argv[0]; argv[1:] is the stable, discriminating signature
+
+
+def _self_argv() -> list[str]:
+    """This process's OWN argv as :func:`process_cmdline` would read it for another pid.
+
+    Reading our own ``/proc/self``/``ps`` view (not ``sys.argv``) makes the recorded identity match
+    what ``stop`` later reads for this pid — same source, same tokenization — so the signatures line
+    up exactly. Falls back to ``sys.argv`` if our own cmdline somehow can't be read.
+    """
+    tokens = process_cmdline(os.getpid())
+    return tokens if tokens is not None else list(sys.argv)
 
 
 def is_alive(pid: int) -> bool:
@@ -181,6 +247,137 @@ def is_alive(pid: int) -> bool:
     return True
 
 
+# The substring that identifies OUR daemon in a process's argv. The child is launched as
+# `python -m tasklib daemon run …` (see _spawn_detached), so this pair appears in its command
+# line and not in an unrelated process that merely happened to be assigned the recycled pid. We
+# match the `daemon run` SUBCOMMAND tokens as a CONTIGUOUS pair (a substring-anywhere match would
+# treat an innocent `grep "tasklib daemon run"` with a recycled pid as the daemon and SIGKILL it),
+# AND require that the token immediately before `daemon` references this tool (`tasklib` for the
+# `-m tasklib` module form, or a `task` executable basename for the console-script form). Both
+# launch shapes qualify: `python -m tasklib daemon run …` (how _spawn_detached starts it) AND the
+# public console-script form `/path/task daemon run …` (systemd unit / Docker ENTRYPOINT) — matching
+# only the `-m tasklib` form would mis-classify a console-script daemon as foreign and orphan it.
+
+# The tri-state result of identifying a pid against the daemon's expected argv.
+IDENTITY_DAEMON = "daemon"  # the cmdline is readable AND carries the daemon token sequence
+IDENTITY_FOREIGN = "foreign"  # the cmdline is readable AND does NOT carry it (a recycled pid)
+IDENTITY_UNKNOWN = "unknown"  # the cmdline could not be read at all (ps absent / busybox / timeout)
+
+
+def process_cmdline(pid: int) -> list[str] | None:
+    """The argv of ``pid`` as a token LIST, or ``None`` if it can't be read.
+
+    Prefers Linux's ``/proc/<pid>/cmdline`` (NUL-separated → exact, un-split tokens), which is also
+    the reliable path inside the minimal Docker images this project tests in (busybox ``ps`` often
+    rejects ``-p``/``-o args=``). Falls back to ``ps -p <pid> -o args=`` (whitespace-split, so a
+    token containing a space is approximated) on platforms without ``/proc`` (macOS). ``None`` means
+    "could not read" — distinct from "read it and it isn't ours"; the caller MUST keep them apart so
+    an unreadable cmdline never orphans a real daemon (see :func:`identify_pid`).
+    """
+    proc_tokens = _read_proc_cmdline(pid)
+    if proc_tokens is not None:
+        return proc_tokens
+    return _read_ps_cmdline(pid)
+
+
+def _read_proc_cmdline(pid: int) -> list[str] | None:
+    """Linux ``/proc/<pid>/cmdline`` → NUL-separated argv tokens, or ``None`` if unavailable."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None  # no /proc (macOS) or the process is gone
+    if not raw:
+        return None  # a kernel thread / zombie has an empty cmdline — fall back to ps
+    return [tok for tok in raw.decode("utf-8", "replace").split("\0") if tok]
+
+
+def _read_ps_cmdline(pid: int) -> list[str] | None:
+    """``ps -p <pid> -o args=`` → whitespace-split argv tokens, or ``None`` if ps can't read it."""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    line = out.stdout.strip()
+    return line.split() if line else None
+
+
+def argv_is_task_daemon(tokens: list[str]) -> bool:
+    """True when an argv ``tokens`` list is recognizably a ``task daemon run`` process.
+
+    Two launch shapes qualify (both contiguous ``daemon run`` + a reference to this tool):
+
+    - ``python -m tasklib daemon run …`` — how :func:`_spawn_detached` starts the child.
+    - ``/path/to/task daemon run …`` — the public console-script form (systemd / Docker ENTRYPOINT).
+
+    The ``daemon run`` pair must be contiguous (so a loose ``grep "tasklib daemon run"`` is rejected),
+    and the token IMMEDIATELY BEFORE ``daemon`` must be this tool — ``tasklib`` (the ``-m tasklib``
+    module form) or a ``task`` executable basename (the console-script form). Anchoring the tool
+    reference to the subcommand position rejects an unrelated ``foo daemon run`` and a stray ``task``
+    token elsewhere in the argv (``["foo", "task", "daemon", "run"]``).
+    """
+    for i in range(len(tokens) - 1):
+        if tokens[i] == "daemon" and tokens[i + 1] == "run" and i >= 1:
+            preceding = tokens[i - 1]
+            if preceding == "tasklib" or os.path.basename(preceding) == "task":
+                return True
+    return False
+
+
+def identify_pid(pid: int, *, recorded_identity: str | None = None) -> str:
+    """Classify ``pid`` against the daemon's expected argv: daemon / foreign / unknown (tri-state).
+
+    The guard against the reused-pid hazard: after a daemon crash the OS can recycle its pid for an
+    unrelated process of the same user, which a bare ``kill(pid, 0)`` liveness probe reads as
+    "running". We inspect the live pid's argv:
+
+    - ``IDENTITY_DAEMON``  — readable AND either (a) it matches ``recorded_identity`` — the argv
+      signature THIS daemon wrote into its pid-file at startup, which makes the check robust to ANY
+      entrypoint (a renamed console-script, a frozen/PyInstaller binary) — or (b) it is recognizably
+      ``task daemon run`` by shape (:func:`argv_is_task_daemon`), the fallback for an old pid-file
+      with no recorded identity.
+    - ``IDENTITY_FOREIGN`` — readable AND neither matches → a recycled pid; ``stop`` must NOT signal it.
+    - ``IDENTITY_UNKNOWN`` — the cmdline could not be read at all (busybox ``ps``, no ``/proc``, a
+      timeout). We deliberately do NOT call this "foreign": refusing to signal on an unreadable
+      cmdline would ORPHAN a real daemon in exactly the minimal Docker images this project tests in.
+      The caller preserves the pre-guard signalling behavior on ``unknown``.
+
+    ACCEPTED RESIDUAL RISK (legacy pid-files only): with NO ``recorded_identity`` (a single-line
+    pid-file written before this version) the shape fallback recognizes ANY ``…daemon run…`` process,
+    so a pid recycled by a DIFFERENT coordinate's daemon could be mis-claimed. The window is one
+    restart after upgrade — the next daemon start rewrites the pid-file WITH a recorded identity,
+    after which the authoritative path closes it. New daemons always record an identity.
+    """
+    tokens = process_cmdline(pid)
+    if tokens is None:
+        return IDENTITY_UNKNOWN
+    if recorded_identity:
+        # When we HAVE a recorded identity, it is AUTHORITATIVE: an exact match → ours, anything
+        # else → foreign. We must NOT fall through to the shape matcher here — that recognizes ANY
+        # `daemon run` process regardless of coordinate, so a recycled pid running a DIFFERENT
+        # coordinate's daemon (`…daemon run -C /other`) would be mis-claimed and killed. The shape
+        # matcher is ONLY the fallback for a legacy pid-file that has no recorded identity.
+        return IDENTITY_DAEMON if argv_signature(tokens) == recorded_identity else IDENTITY_FOREIGN
+    return IDENTITY_DAEMON if argv_is_task_daemon(tokens) else IDENTITY_FOREIGN
+
+
+def is_task_daemon(pid: int) -> bool:
+    """``True`` only when ``pid``'s argv POSITIVELY identifies it as this task daemon.
+
+    Convenience over :func:`identify_pid` — ``True`` for ``IDENTITY_DAEMON`` only. An UNKNOWN cmdline
+    (unreadable) is ``False`` here, so callers that need to avoid orphaning a daemon on an unreadable
+    cmdline should branch on :func:`identify_pid` (``foreign`` vs ``unknown``), not this boolean.
+    """
+    return identify_pid(pid) == IDENTITY_DAEMON
+
+
 def pid_status(pid_path: Path) -> tuple[str, int | None]:
     """Classify the daemon: ``("running"|"stale"|"stopped", pid_or_None)``.
 
@@ -193,9 +390,15 @@ def pid_status(pid_path: Path) -> tuple[str, int | None]:
     return ("running", pid) if is_alive(pid) else ("stale", pid)
 
 
-def _write_pid(pid_path: Path, pid: int) -> None:
+def _write_pid(pid_path: Path, pid: int, *, identity: str | None = None) -> None:
+    """Write the pid (line 1) and, when given, the daemon's launch identity (line 2).
+
+    The optional identity is the daemon's own argv signature; ``stop`` matches the live pid's argv
+    against it so the daemon is recognized regardless of its entrypoint shape (see :func:`identify_pid`).
+    """
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(pid), encoding="utf-8")
+    payload = f"{pid}\n{identity}\n" if identity else str(pid)
+    pid_path.write_text(payload, encoding="utf-8")
 
 
 def _clear_pid(pid_path: Path) -> None:
@@ -203,6 +406,52 @@ def _clear_pid(pid_path: Path) -> None:
         pid_path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _clear_pid_if_matches(pid_path: Path, pid: int) -> None:
+    """Clear the pid-file ONLY if it still records ``pid`` — never delete a DIFFERENT daemon's file.
+
+    Guards a narrow race in ``stop``: while we waited on a signalled pid, the old daemon could have
+    exited, freed the flock, and a fresh ``start`` for the same coordinate could have written a NEW
+    pid into the same file. Deleting unconditionally would orphan that live new daemon's pid-file.
+    Re-reading and matching the pid first makes the clear safe.
+    """
+    if read_pid(pid_path) == pid:
+        _clear_pid(pid_path)
+
+
+# ── flock singleton (race-free "never double-starts") ───────────────────────────────
+
+
+def acquire_singleton(lock_path: Path):  # type: ignore[no-untyped-def]
+    """Take an exclusive, non-blocking flock on ``lock_path``. Returns the held handle, or ``None``.
+
+    The race-free singleton primitive behind the docstring's "never double-starts": the live daemon
+    holds this lock for its WHOLE lifetime (it is acquired in :func:`run_loop` before the loop). Two
+    near-simultaneous ``start``s both pass the liveness check and both spawn — but only ONE child
+    wins this flock; the loser gets ``None`` and exits without ticking. The OS lock closes the
+    check-then-spawn TOCTOU that the pid-file alone can't.
+
+    Returns the open file object on success (the CALLER must keep it open — closing it, or the
+    process exiting, releases the lock). Returns ``None`` when another live daemon already holds it.
+    On a platform without ``fcntl`` (non-POSIX) it degrades to "no lock available" → returns the
+    open handle UNLOCKED so the daemon still runs (the pid-file liveness check remains the guard).
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a", encoding="utf-8")  # noqa: SIM115 - lifetime is the daemon's
+    try:
+        import fcntl
+    except ImportError:
+        # non-POSIX (Windows): no flock available. We degrade to "no singleton lock" and rely on the
+        # pid-file liveness check (with its narrower TOCTOU). Log it so the lost guarantee isn't silent.
+        log_event("daemon.singleton-unavailable", level="WARN", reason="fcntl not available")
+        return handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()  # another live daemon holds the lock → we are the loser, release our fd
+        return None
+    return handle
 
 
 # ── due-date selection (pure; the unit-tested core) ─────────────────────────────────
@@ -397,12 +646,24 @@ def run_loop(cfg: "LoadedConfig", paths: DaemonPaths, *, max_ticks: int | None =
         # config that turns the daemon off can't be bypassed by invoking the loop directly.
         log_event("daemon.disabled", level="INFO")
         return 0
-    _write_pid(paths.pid, os.getpid())
-    log_event("daemon.start", pid=os.getpid(), interval_s=dcfg.interval_s, due_soon_days=dcfg.due_soon_days)
 
-    stop = _install_stop_handlers()
+    # The singleton flock is the race-free guarantee: if another live daemon already holds it, we
+    # are a duplicate (two concurrent `start`s raced past the liveness check) — exit at once WITHOUT
+    # touching the pid-file, so the winner's pid-file stays authoritative.
+    lock_handle = acquire_singleton(paths.lock_path)
+    if lock_handle is None:
+        log_event("daemon.already-running", level="INFO")
+        return 0
+
+    # Everything after a successful acquire is inside try/finally, so the lock is released even if
+    # _write_pid / handler-install raises — no leaked flock that would wedge the next start.
     ticks = 0
     try:
+        # Record THIS process's own argv signature in the pid-file, so stop() can match the live pid
+        # against exactly what we launched as — robust to any entrypoint shape, not a guessed pattern.
+        _write_pid(paths.pid, os.getpid(), identity=argv_signature(_self_argv()))
+        log_event("daemon.start", pid=os.getpid(), interval_s=dcfg.interval_s, due_soon_days=dcfg.due_soon_days)
+        stop = _install_stop_handlers()
         while not stop.requested:
             try:
                 backend = get_backend(cfg)
@@ -415,6 +676,7 @@ def run_loop(cfg: "LoadedConfig", paths: DaemonPaths, *, max_ticks: int | None =
             stop.wait(dcfg.interval_s)
     finally:
         _clear_pid(paths.pid)
+        lock_handle.close()  # release the singleton lock (also released on process exit)
         log_event("daemon.stop", ticks=ticks)
     return 0
 
@@ -519,15 +781,41 @@ def stop(coordinate: str, *, env: dict[str, str] | None = None, timeout_s: float
     """Stop the running daemon for ``coordinate``: TERM it, wait, then clear the pid-file.
 
     Returns ``(outcome, pid)`` — ``"stopped"`` (a live daemon was signalled and is gone),
-    ``"not-running"`` (nothing alive; a stale pid-file is cleared), or ``"timeout"`` (it didn't
-    exit within ``timeout_s`` — we still clear the file and report). Sends SIGTERM (clean), never
-    SIGKILL: the loop's TERM handler clears its own pid-file and exits the inter-tick sleep at once.
+    ``"not-running"`` (nothing alive; a stale pid-file is cleared), ``"not-ours"`` (the pid is
+    alive but is NOT the task daemon — a recycled pid; we refuse to signal it and clear the stale
+    file), or ``"timeout"`` (it didn't exit within ``timeout_s`` — we still clear the file and
+    report). Sends SIGTERM (clean) before SIGKILL: the loop's TERM handler clears its own pid-file
+    and exits the inter-tick sleep at once.
+
+    The PID-IDENTITY guard runs BEFORE any signal: after a daemon crash the OS can recycle its pid
+    for an unrelated process of the same user, which a bare liveness probe reads as "running". We
+    classify the pid (:func:`identify_pid`), matching FIRST against the argv signature the daemon
+    recorded in its pid-file at startup — so a daemon launched via ANY entrypoint (a renamed
+    console-script, a frozen binary) is still recognized, not just the ``python -m tasklib`` shape —
+    and refuse to signal ONLY when the pid is POSITIVELY foreign (a readable argv matching neither
+    the recorded identity nor the daemon shape) → ``"not-ours"``. When the argv can't be read at all
+    (``IDENTITY_UNKNOWN`` — busybox ``ps`` / no ``/proc``), we do NOT refuse: signalling the recorded
+    pid is the pre-guard behavior, and refusing there would ORPHAN a real daemon in the minimal
+    Docker images this project tests in. NOTE the guard before the FIRST SIGTERM is best-effort —
+    there is a microscopic window between :func:`identify_pid` and ``os.kill`` where the pid could
+    die + be recycled (unclosable without ``pidfd``); the identity is RE-CHECKED before SIGKILL,
+    which closes the much wider SIGTERM-wait window.
     """
     paths = paths_for(coordinate, env=env)
     status, pid = pid_status(paths.pid)
     if status != "running" or pid is None:
         _clear_pid(paths.pid)
         return "not-running", pid
+
+    # The identity the daemon recorded at startup (its own argv signature) — matched first, so a
+    # daemon launched via ANY entrypoint (renamed console-script, frozen binary) is still recognized.
+    recorded = read_recorded_identity(paths.pid)
+    if identify_pid(pid, recorded_identity=recorded) == IDENTITY_FOREIGN:
+        # The pid is alive but POSITIVELY not OUR daemon (a crash + OS pid-reuse). Refuse to signal
+        # it, and clear the misleading pid-file so a later start/stop doesn't trip on it again.
+        log_event("daemon.stop-pid-not-ours", level="WARN", pid=pid)
+        _clear_pid(paths.pid)
+        return "not-ours", pid
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -536,19 +824,28 @@ def stop(coordinate: str, *, env: dict[str, str] | None = None, timeout_s: float
         return "not-running", pid
 
     if _wait_gone(pid, timeout_s):
-        _clear_pid(paths.pid)
+        # Clear only if the file still names the pid we stopped — a fresh same-coordinate start
+        # during the wait could already own it.
+        _clear_pid_if_matches(paths.pid, pid)
         return "stopped", pid
 
     # TERM didn't take in time — escalate to SIGKILL so stop never leaves a live daemon behind.
-    # A short second wait confirms; if even that fails the process is wedged uninterruptibly
-    # (rare), and we report "timeout" honestly rather than pretend it's gone.
+    # RE-CHECK identity first (with the same recorded identity): during the SIGTERM wait the daemon
+    # could have died and the OS could have recycled its pid, so a blind SIGKILL might hit an innocent
+    # process. A positively-foreign pid here means exactly that — stop signalling, report "not-ours".
+    if identify_pid(pid, recorded_identity=recorded) == IDENTITY_FOREIGN:
+        # Post-wait: the old daemon may have exited and a fresh start re-written the pid-file with a
+        # NEW pid — only clear it if it still points at the pid we were stopping, never the new one.
+        log_event("daemon.stop-pid-recycled-before-kill", level="WARN", pid=pid)
+        _clear_pid_if_matches(paths.pid, pid)
+        return "not-ours", pid
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        _clear_pid(paths.pid)
+        _clear_pid_if_matches(paths.pid, pid)
         return "stopped", pid
     gone = _wait_gone(pid, 2.0)
-    _clear_pid(paths.pid)
+    _clear_pid_if_matches(paths.pid, pid)
     return ("stopped", pid) if gone else ("timeout", pid)
 
 
