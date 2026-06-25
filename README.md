@@ -276,6 +276,15 @@ enforce:
     on_done:   { required_if_label: [ui, visual] }
   escape_hatch: explain
 classify:
+  capability: ""                     # optional (rig#8): a role/capability tag (e.g. `fast` /
+                                     # `reasoning` / `code`) resolved from the shared model
+                                     # manifest (agent-tools `lib/contracts/models.yaml`) and
+                                     # PREFERRED ahead of `fallbacks`. Empty → manifest unused.
+                                     # The manifest's exact model id is used for every provider
+                                     # EXCEPT gemini (there it steers the provider/role only —
+                                     # review's gemini backend picks the version). Fail-soft: a
+                                     # missing manifest / resolver falls through to `fallbacks`.
+                                     # Point at a manifest with $TASK_MODELS_MANIFEST.
   fallbacks:
     - { anthropic:   claude-haiku-4-5 }
     - { openai:      gpt-5-mini }
@@ -297,6 +306,10 @@ daemon:                              # the due-date reminder watcher (all keys o
 
 Config is committed by default and scoped by location, never a flag. With no config at all the
 tool defaults to `github-issues` with every gate on (and the daemon's built-in defaults above).
+
+When `classify.capability` is set, the model manifest is located by probing a few conventional
+`agent-tools` checkout paths; set `$TASK_MODELS_MANIFEST` to an explicit `models.yaml` to make the
+choice deterministic on a machine with more than one checkout (it always wins over the heuristics).
 
 ## Architecture
 

@@ -276,6 +276,22 @@ class LoadedConfig:
         return chain
 
     @property
+    def classify_capability(self) -> str:
+        """The capability/role to resolve the classifier's preferred model from ``models.yaml``.
+
+        Empty (the default) means "no manifest resolution" — the classifier uses the
+        hardcoded/config fallback chain alone, exactly as before rig#8. A value (``fast`` /
+        ``reasoning`` / ``code`` — a role or capability tag the shared manifest defines)
+        makes the classifier prefer the model the manifest currently pins for it, kept fresh
+        by the cron checker. (One caveat: for the ``gemini`` provider the manifest steers only
+        the provider/role, not the exact version — ``review``'s gemini backend uses its own
+        env-configured model; every other provider carries the manifest's exact id.) The
+        resolution is fail-soft: an unresolvable value, a missing manifest, or the resolver
+        lib being absent all fall through to the fallback chain.
+        """
+        return str(self.section("classify").get("capability", "")).strip()
+
+    @property
     def classify_bias(self) -> str:
         return str(self.section("classify").get("bias", "change"))
 

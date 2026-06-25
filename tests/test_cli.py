@@ -594,7 +594,7 @@ def test_classify_change_creates_ticket(capsys, monkeypatch, _inject_fake):
     monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
     monkeypatch.setattr(
         "tasklib.classify.resolve_chain",
-        lambda fallbacks=None, env=None: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
             "anthropic", "claude:claude-haiku-4-5"
         ),
     )
@@ -611,7 +611,7 @@ def test_classify_create_makes_policy_clean_draft(capsys, monkeypatch, _inject_f
     monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "VERDICT: change")
     monkeypatch.setattr(
         "tasklib.classify.resolve_chain",
-        lambda fallbacks=None, env=None: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
             "anthropic", "claude:claude-haiku-4-5"
         ),
     )
@@ -628,7 +628,7 @@ def test_classify_just_ask_creates_nothing(capsys, monkeypatch, _inject_fake):
     monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "justAsk")
     monkeypatch.setattr(
         "tasklib.classify.resolve_chain",
-        lambda fallbacks=None, env=None: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
             "anthropic", "claude:claude-haiku-4-5"
         ),
     )
@@ -639,12 +639,48 @@ def test_classify_just_ask_creates_nothing(capsys, monkeypatch, _inject_fake):
 
 
 def test_classify_no_provider_biases(capsys, monkeypatch, _inject_fake):
-    monkeypatch.setattr("tasklib.classify.resolve_chain", lambda fallbacks=None, env=None: None)
+    monkeypatch.setattr("tasklib.classify.resolve_chain", lambda fallbacks=None, env=None, **_kw: None)
     rc = main(["classify", "ambiguous message"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "no classifier provider available" in out
     assert "change" in out
+
+
+def test_classify_passes_configured_capability_to_resolve_chain(monkeypatch, _inject_fake):
+    # cmd_classify must forward cfg.classify_capability into resolve_chain (rig#8 wiring) — a
+    # capability configured in task.yaml has to actually reach the resolver, not be dropped.
+    seen = {}
+
+    def _spy(fallbacks=None, env=None, *, capability=None):
+        seen["capability"] = capability
+        return None  # bias-decide; we only care that capability arrived
+
+    monkeypatch.setattr("tasklib.classify.resolve_chain", _spy)
+    monkeypatch.setattr(
+        "tasklib.config.LoadedConfig.classify_capability", property(lambda self: "reasoning")
+    )
+    rc = main(["classify", "anything"])
+    assert rc == 0
+    assert seen["capability"] == "reasoning"
+
+
+def test_classify_empty_capability_passes_none(monkeypatch, _inject_fake):
+    # the `cfg.classify_capability or None` wiring: an empty config capability must reach
+    # resolve_chain as None (no manifest lookup), not as "".
+    seen = {}
+
+    def _spy(fallbacks=None, env=None, *, capability=None):
+        seen["capability"] = capability
+        return None
+
+    monkeypatch.setattr("tasklib.classify.resolve_chain", _spy)
+    monkeypatch.setattr(
+        "tasklib.config.LoadedConfig.classify_capability", property(lambda self: "")
+    )
+    rc = main(["classify", "anything"])
+    assert rc == 0
+    assert seen["capability"] is None
 
 
 # ── session ──────────────────────────────────────────────────────────────────────────

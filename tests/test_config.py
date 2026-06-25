@@ -50,6 +50,21 @@ def test_classify_fallbacks_parsed_to_pairs(tmp_path, monkeypatch):
     assert chain[0][0] == "anthropic"  # default head
 
 
+def test_classify_capability_default_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    cfg = load(tmp_path)
+    assert cfg.classify_capability == ""  # unset → no manifest resolution
+
+
+def test_classify_capability_read_and_stripped(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "task.yaml").write_text(
+        'version: 1\nbackend: github-issues\nclassify: {capability: "  fast  "}\n', encoding="utf-8"
+    )
+    cfg = load(tmp_path)
+    assert cfg.classify_capability == "fast"  # whitespace trimmed
+
+
 def test_session_detect_default(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
     cfg = load(tmp_path)

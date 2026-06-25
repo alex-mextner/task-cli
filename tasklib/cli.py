@@ -1201,7 +1201,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
     from .classify import Verdict, build_prompt, parse_verdict, resolve_chain
 
     bias = Verdict(cfg.classify_bias) if cfg.classify_bias in ("change", "justAsk") else Verdict.CHANGE
-    resolved = resolve_chain(cfg.classify_fallbacks or None)
+    resolved = resolve_chain(cfg.classify_fallbacks or None, capability=cfg.classify_capability or None)
     if resolved is None:
         # no provider reachable → bias-decide, still observable
         verdict = bias
