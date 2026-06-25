@@ -72,9 +72,14 @@ tickets that are overdue or due within a window, and pushes a reminder to the CT
 ```
 task daemon start    # spawn the detached daemon (idempotent — never double-starts)
 task daemon stop     # stop it (SIGTERM, then SIGKILL on timeout); clears the pid-file
-task daemon status   # running / stale / stopped + pid + config (--json for machine output)
+task daemon status   # running / not-ours / stale / stopped + pid + config (--json for machine output)
 task daemon run      # the foreground loop (what `start` spawns)
 ```
+
+`status` is pid-identity-aware (consistent with `stop`/`start`): a pid that was recycled by the OS
+for an unrelated process after a crash reports as `not-ours` (in `--json` too), not `running`. To
+verify that, a live daemon's status reads the process argv (`ps -ww` / `/proc`), slightly more than a
+bare liveness probe.
 
 The loop is fail-soft: a backend error, a malformed ticket, or a down notifier in one tick is
 caught and logged — the daemon keeps running. De-dupe is per `(ticket, due-date)`, so a ticket
