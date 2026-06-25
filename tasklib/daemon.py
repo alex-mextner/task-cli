@@ -292,10 +292,16 @@ def _read_proc_cmdline(pid: int) -> list[str] | None:
 
 
 def _read_ps_cmdline(pid: int) -> list[str] | None:
-    """``ps -p <pid> -o args=`` → whitespace-split argv tokens, or ``None`` if ps can't read it."""
+    """``ps -ww -p <pid> -o args=`` → whitespace-split argv tokens, or ``None`` if ps can't read it.
+
+    ``-ww`` disables ``ps``'s default command-line TRUNCATION (to ~screen width). Without it a long
+    argv is cut off, so the signature derived from a truncated ``ps`` read would not match the one
+    derived from the full ``/proc`` read — and a daemon whose identity was recorded from ``/proc`` at
+    startup would be mis-classified foreign and ORPHANED when ``stop`` later falls back to ``ps``.
+    """
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
             capture_output=True,
             text=True,
             timeout=3,

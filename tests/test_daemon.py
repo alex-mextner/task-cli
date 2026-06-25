@@ -404,7 +404,8 @@ def test_stop_not_running_clears_stale(tmp_path):
 # `task daemon stop` is a SEPARATE process from the daemon, never its parent — a same-process
 # child would zombie and make stop() see a spurious timeout. We do it with a short-lived launcher
 # (`sh -c "python … &"`) that backgrounds the sleeper and exits, reparenting it to init.
-def _spawn_orphan(code: str, *, identity: bool = True) -> int:
+def _spawn_orphan(code: str, *, identity: bool = True, extra: list[str] | None = None) -> int:
+    import shlex
     import subprocess
     import sys
     import time
@@ -416,20 +417,40 @@ def _spawn_orphan(code: str, *, identity: bool = True) -> int:
     # ignores them as argv, but `/proc/<pid>/cmdline` & `ps -o args=` show them) so the spawned
     # sleeper's command line carries the daemon-identity token SEQUENCE — exercising the real
     # identify_pid()/is_task_daemon() check in stop(). identity=False → an UNRELATED recycled pid.
+    # `extra` injects further argv tokens (shell-quoted so a value with spaces stays ONE token), used
+    # to test the cmdline read paths on a spaced argument.
     markers = " -m tasklib daemon run" if identity else ""
-    launcher = f'{sys.executable} -c {code!r}{markers} & echo $! > {pidfile}'
+    extra_str = (" " + " ".join(shlex.quote(t) for t in extra)) if extra else ""
+    launcher = f'{sys.executable} -c {code!r}{markers}{extra_str} & echo $! > {pidfile}'
     subprocess.run(["sh", "-c", launcher], check=True)
     # read the orphaned sleeper's pid (the launcher has exited)
     deadline = time.time() + 3
+    pid = None
     while time.time() < deadline:
         try:
             txt = open(pidfile).read().strip()
         except OSError:
             txt = ""
         if txt.isdigit():
-            return int(txt)
+            pid = int(txt)
+            break
         time.sleep(0.05)
-    raise AssertionError("could not read orphaned sleeper pid")
+    if pid is None:
+        raise AssertionError("could not read orphaned sleeper pid")
+    # The pidfile holds `$!` as soon as the shell BACKGROUNDS the child — but that child may not have
+    # EXEC'd Python yet (it can still be the `sh -c …` launcher, or have an empty /proc cmdline that
+    # falls back to a launcher-shaped ps read). Tests that sample the cmdline immediately would race.
+    # Wait until the process's argv shows the Python `-c` invocation (a `-c` token whose executable is
+    # NOT the `sh` launcher). The `-c` flag survives both /proc and ps reads identically, so this
+    # condition matches quickly on every platform (it does not depend on how the `code` token is split).
+    from tasklib import daemon as _d
+
+    while time.time() < deadline:
+        tokens = _d.process_cmdline(pid)
+        if tokens and "-c" in tokens and os.path.basename(tokens[0]) != "sh":
+            return pid
+        time.sleep(0.02)
+    return pid  # best-effort: return anyway if the cmdline never settled (the test will surface it)
 
 
 def _kill_quiet(pid: int) -> None:
@@ -601,6 +622,53 @@ def test_argv_signature_is_single_line(tmp_path):
     assert daemon.read_recorded_identity(p) == sig  # round-trips whole, not truncated
 
 
+def test_argv_signature_invariant_to_proc_vs_ps_tokenization():
+    # THE invariant the identity guard relies on: `/proc/<pid>/cmdline` keeps a spaced argument as a
+    # SINGLE token (NUL-separated), while a `ps -o args=` fallback whitespace-SPLITS that same argument
+    # into several tokens. argv_signature MUST produce the SAME signature for both, or a real daemon
+    # whose argv contains a spaced value (e.g. `-C "/path with spaces"`) would record one signature and
+    # read back a different one across the two sources → orphaned. This pins that equivalence
+    # deterministically (no live process), guarding the production code, not just the flaky test body.
+    proc_form = ["python", "-m", "tasklib", "daemon", "run", "-C", "/path with spaces"]  # /proc: 1 token
+    ps_form = ["python", "-m", "tasklib", "daemon", "run", "-C", "/path", "with", "spaces"]  # ps: split
+    assert daemon.argv_signature(proc_form) == daemon.argv_signature(ps_form)
+    # the signature is the discriminating part (argv[0] dropped, whitespace collapsed)
+    assert daemon.argv_signature(proc_form) == "-m tasklib daemon run -C /path with spaces"
+    # argv[0] differing (a venv `python3` symlink vs a resolved `Python`) must not change it either
+    a = ["/venv/bin/python3", "-m", "tasklib", "daemon", "run"]
+    b = ["/Cellar/.../Python", "-m", "tasklib", "daemon", "run"]
+    assert daemon.argv_signature(a) == daemon.argv_signature(b) == "-m tasklib daemon run"
+    # whitespace COLLAPSE (not a plain join): a token with a double space / tab normalizes to single
+    # spaces, so a `/proc` token `"a  b"` and a `ps` split `["a", "b"]` still match
+    assert daemon.argv_signature(["x", "-C", "a  b\tc"]) == daemon.argv_signature(["x", "-C", "a", "b", "c"])
+    assert daemon.argv_signature(["x", "-C", "a  b\tc"]) == "-C a b c"
+
+
+def test_process_cmdline_real_read_paths_agree_on_a_long_spaced_argument(tmp_path, monkeypatch):
+    # THE actual root-cause regression (found on Linux CI): `ps` TRUNCATES the command line to ~screen
+    # width by default, so for a LONG argv the `ps` read drops the tail while `/proc` keeps it whole —
+    # the two signatures diverge and a daemon recorded from `/proc` is orphaned when stop falls back to
+    # `ps`. The fix is `ps -ww` (no truncation). This spawns a process with a LONG, spaced trailing
+    # argument and asserts the `/proc` read and the (now `-ww`) `ps` read yield the SAME signature, and
+    # that the `ps` read is NOT truncated. A spaced arg also makes the raw token lists differ (one token
+    # vs split), confirming a real cross-SOURCE comparison.
+    if daemon._read_proc_cmdline(os.getpid()) is None:
+        pytest.skip("no /proc on this platform — the cross-source (/proc vs ps) check is meaningless here")
+    long_value = "/tmp/a b c " + "x" * 300  # long enough to be truncated by a default (no -ww) ps
+    pid = _spawn_orphan("__import__('time').sleep(60)", identity=False, extra=["-C", long_value])
+    try:
+        proc_tokens = daemon.process_cmdline(pid)
+        monkeypatch.setattr(daemon, "_read_proc_cmdline", lambda p: None)  # force the ps fallback
+        ps_tokens = daemon.process_cmdline(pid)
+        assert proc_tokens != ps_tokens, "the /proc (one token) and ps (split) reads must differ raw"
+        # the ps read must be UNtruncated (the -ww fix): the full long tail survives
+        assert "x" * 300 in " ".join(ps_tokens), "ps must NOT truncate the command line (needs -ww)"
+        # and both real read paths yield the SAME signature — the invariant the identity guard depends on
+        assert daemon.argv_signature(proc_tokens) == daemon.argv_signature(ps_tokens)
+    finally:
+        _kill_quiet(pid)
+
+
 def test_run_loop_records_a_matching_self_identity(tmp_path, monkeypatch, capture_notifications):
     # the daemon records its OWN argv signature, and that signature matches what identify_pid would
     # read back for this process — so a stop() for this pid recognizes it via the recorded identity
@@ -728,18 +796,22 @@ def test_stop_signals_a_real_daemon_with_matching_identity(tmp_path):
 
 
 def test_stop_signals_a_real_daemon_via_the_RECORDED_identity_branch(tmp_path):
-    # END-TO-END coverage of the CORE mechanism on a REAL process: write the pid-file with the
-    # recorded identity derived from the live pid's OWN cmdline (exactly as run_loop does), then prove
-    # stop() recognizes it through the recorded-identity branch and signals it. This is the test that
-    # would catch a write-side/read-side tokenization mismatch (which would otherwise orphan the
-    # daemon). We deliberately spawn WITHOUT the shape markers so ONLY the recorded identity can match.
+    # END-TO-END on a REAL process with the REAL cmdline read on BOTH sides (write-side derivation like
+    # run_loop, read-side in stop) — this is what catches a write/read signature mismatch that would
+    # orphan a daemon. The process is spawned WITHOUT the daemon shape (`identity=False`), so the shape
+    # matcher rejects it (FOREIGN) and a clean stop can ONLY succeed via the recorded-identity branch —
+    # the isolation the test's name promises. The earlier `import time; time.sleep(60)` body flaked on
+    # CI because a long argv tripped `ps`'s default command-line TRUNCATION (the now-fixed root cause —
+    # `process_cmdline` uses `ps -ww`); a short space-free body keeps the spawned argv well under any
+    # width limit. The `ps -ww` no-truncation fix is covered by
+    # test_process_cmdline_real_read_paths_agree_on_a_long_spaced_argument.
     env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
     paths = daemon.paths_for("owner/repo", env=env)
-    pid = _spawn_orphan("import time; time.sleep(60)", identity=False)  # no `daemon run` shape
+    pid = _spawn_orphan("__import__('time').sleep(60)", identity=False)  # no `daemon run` shape
     try:
         live_sig = daemon.argv_signature(daemon.process_cmdline(pid))
         assert live_sig, "the live process must have a readable cmdline for this test"
-        # sanity: WITHOUT the recorded identity the shape matcher would call it foreign...
+        # sanity: WITHOUT a recorded identity the shape matcher calls it foreign...
         assert daemon.identify_pid(pid) == daemon.IDENTITY_FOREIGN
         # ...so a clean stop here can ONLY succeed via the recorded-identity branch
         daemon._write_pid(paths.pid, pid, identity=live_sig)
