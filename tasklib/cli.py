@@ -1449,6 +1449,10 @@ def _daemon_stop(daemon, coordinate: str) -> int:
         print(_ok(f"daemon stopped (was pid {pid})"))
     elif outcome == "timeout":
         print(_warn(f"daemon (pid {pid}) did not exit in time; pid-file cleared"))
+    elif outcome == "not-ours":
+        # the recorded pid is alive but is NOT our daemon (a crash + OS pid-reuse) — we refused to
+        # signal it; the stale pid-file is cleared. Surface this so it isn't mistaken for a clean stop.
+        print(_warn(f"pid {pid} is alive but is not the task daemon (recycled pid); not signalled, pid-file cleared"))
     else:
         print(_dim("no running daemon"))
     return 0
