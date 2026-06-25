@@ -70,6 +70,19 @@ _PROVIDER_KEY_ENV = {
     "ollama": (),  # availability is the daemon, not a key
 }
 
+# The shared manifest (models.yaml) names Google's provider ``gemini`` and has no ``ollama``;
+# this CLI's provider tables use ``google`` (and route ``review`` to a bare ``gemini`` arg).
+# Map a manifest provider onto this CLI's provider key so a manifest-resolved entry slots
+# into the SAME availability check + ``-m`` building as the hardcoded chain. Providers not
+# listed pass through unchanged (anthropic/openai/commandcode/zai already line up).
+#
+# KNOWN LIMITATION (google only): ``to_model_arg("google", …)`` collapses to the bare ``gemini``
+# token because review's gemini backend ignores a model id and uses its OWN env-configured model.
+# So for a manifest entry whose provider is ``gemini`` the manifest's exact VERSION is not threaded
+# into ``-m`` — the manifest only steers WHICH provider/role is preferred, and review picks the
+# concrete gemini version. Every other provider DOES carry the manifest's exact model id.
+_MANIFEST_PROVIDER_ALIASES = {"gemini": "google"}
+
 
 @dataclass
 class ResolvedModel:
@@ -110,17 +123,61 @@ def provider_available(provider: str, env: dict[str, str] | None = None) -> bool
     return any(env.get(k) for k in keys)
 
 
+def capability_head(
+    capability: str | None,
+    env: dict[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Resolve ``capability`` to a manifest ``(provider, model)`` head, or ``None`` (rig#8).
+
+    The consumer side of rig-cli#8: when a ``classify.capability`` is configured, ask the
+    shared manifest (``models.yaml``) for the model it currently pins for that capability/role
+    and return it as a ``(provider, model)`` pair to PREFER ahead of the hardcoded chain — so
+    the classifier tracks the manifest the cron checker keeps fresh, instead of a literal pin.
+
+    Fail-soft and purely additive: a falsy ``capability``, a missing manifest, or the shared
+    resolver lib not being installed all yield ``None``, and the caller proceeds with the
+    hardcoded chain exactly as before. The manifest's provider name is normalized onto this
+    CLI's provider keys (``gemini`` -> ``google``) so the head slots into the same availability
+    check + ``-m`` building as every other chain entry.
+    """
+    if not capability:
+        return None
+    from .manifest import resolve_capability
+
+    resolved = resolve_capability(capability, env=env)
+    if resolved is None:
+        return None
+    provider, model = resolved
+    return _MANIFEST_PROVIDER_ALIASES.get(provider, provider), model
+
+
 def resolve_chain(
     fallbacks: list[tuple[str, str]] | None = None,
     env: dict[str, str] | None = None,
+    *,
+    capability: str | None = None,
 ) -> ResolvedModel | None:
     """Return the first AVAILABLE (provider, model) in the chain, or ``None`` if none are.
 
     Same availability-failover as the review board, pool=1: walk the chain top-to-bottom and
     pick the first provider with a credential/daemon. Provider-agnostic — degrades to
     whatever's reachable so classification keeps working offline (ollama) or on any one key.
+
+    When ``capability`` is given (the ``classify.capability`` config — rig#8), the model the
+    shared manifest pins for it is PREPENDED as the preferred head, so a reachable manifest
+    model wins over the hardcoded chain. The prepend is fail-soft (an unresolvable capability
+    or a missing manifest adds nothing), and an UNREACHABLE manifest head still falls through
+    to the rest of the chain — the head only changes the PREFERENCE, never removes a fallback.
     """
-    chain = fallbacks if fallbacks is not None else list(DEFAULT_FALLBACKS)
+    chain = list(fallbacks) if fallbacks is not None else list(DEFAULT_FALLBACKS)
+    head = capability_head(capability, env)
+    if head is not None:
+        # Promote the manifest model to the PREFERRED head. If it already appears in the chain
+        # (anywhere — not just at position 0), drop that occurrence first so the promotion isn't
+        # silently lost when the manifest picked an entry that sits LOWER than another reachable
+        # provider; the manifest's choice must win the preference, never duplicate.
+        chain = [entry for entry in chain if entry != head]
+        chain.insert(0, head)
     for provider, model in chain:
         if provider_available(provider, env):
             return ResolvedModel(provider=provider, model_arg=to_model_arg(provider, model))

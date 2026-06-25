@@ -6,6 +6,7 @@ from tasklib.classify import (
     DEFAULT_FALLBACKS,
     Verdict,
     build_prompt,
+    capability_head,
     parse_verdict,
     provider_available,
     resolve_chain,
@@ -107,3 +108,136 @@ def test_resolve_chain_none_when_nothing_available(monkeypatch):
     # no keys, and ensure ollama is treated as absent
     monkeypatch.setattr("tasklib.classify.shutil.which", lambda _name: None)
     assert resolve_chain([("anthropic", "claude-haiku-4-5"), ("openai", "gpt-5-mini")], {}) is None
+
+
+# ── rig#8 consumer half: manifest capability → preferred head ────────────────────────
+
+
+def test_capability_head_none_for_empty_capability():
+    # no capability configured → no manifest lookup at all (the pre-rig#8 behaviour)
+    assert capability_head("", {}) is None
+    assert capability_head(None, {}) is None
+
+
+def test_capability_head_falls_through_when_resolver_returns_none(monkeypatch):
+    # the manifest/resolver could not resolve (lib absent / no manifest / unknown tag) → None
+    monkeypatch.setattr("tasklib.manifest.resolve_capability", lambda *a, **k: None)
+    assert capability_head("reasoning", {}) is None
+
+
+def test_capability_head_normalizes_manifest_gemini_to_google(monkeypatch):
+    # the manifest names Google's provider `gemini`; this CLI's provider key is `google`.
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("gemini", "gemini-2.5-flash")
+    )
+    assert capability_head("fast", {}) == ("google", "gemini-2.5-flash")
+
+
+def test_capability_head_passthrough_for_aligned_provider(monkeypatch):
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("anthropic", "claude-opus-4-8")
+    )
+    assert capability_head("reasoning", {}) == ("anthropic", "claude-opus-4-8")
+
+
+def test_resolve_chain_prepends_reachable_manifest_head(monkeypatch):
+    # a configured capability resolves to a manifest model whose provider is reachable → it
+    # wins over the hardcoded chain head, even though the chain's anthropic entry is also up.
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("anthropic", "claude-opus-4-8")
+    )
+    env = {"ANTHROPIC_API_KEY": "x"}
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env, capability="reasoning")
+    assert resolved is not None
+    # the manifest model (opus), not the chain's hardcoded haiku, is preferred
+    assert resolved.model_arg == "claude:claude-opus-4-8"
+
+
+def test_resolve_chain_promotes_manifest_model_over_higher_chain_provider(monkeypatch):
+    # the manifest picks openai/gpt-5-mini (position 1 in DEFAULT_FALLBACKS); anthropic (position
+    # 0) is ALSO reachable. Without dedup-then-prepend the higher anthropic entry would win — the
+    # manifest's preference must promote the openai model to the head and win instead.
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("openai", "gpt-5-mini")
+    )
+    env = {"ANTHROPIC_API_KEY": "x", "COMMANDCODE_API_KEY": "y"}  # both providers reachable
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env, capability="fast")
+    assert resolved is not None
+    assert resolved.provider == "openai"
+    assert resolved.model_arg == "commandcode:gpt-5-mini"
+
+
+def test_resolve_chain_head_unreachable_still_falls_through(monkeypatch):
+    # the manifest head's provider has no key → it is skipped and the chain still resolves.
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("zai", "glm-5.2")
+    )
+    monkeypatch.setattr("tasklib.classify.shutil.which", lambda _name: None)
+    env = {"ANTHROPIC_API_KEY": "x"}  # zai (head) unreachable, anthropic reachable
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env, capability="code")
+    assert resolved is not None
+    assert resolved.provider == "anthropic"
+
+
+def test_resolve_chain_unknown_manifest_provider_skips_gracefully(monkeypatch):
+    # the manifest is a foreign, independently-updated artifact: the cron checker could pin a
+    # provider this CLI doesn't know (`mistral`, `xai`, …). Such a head must degrade to "not
+    # reachable" and fall through to the hardcoded chain — never crash (the never-fatal invariant).
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("mistral", "mistral-large")
+    )
+    env = {"ANTHROPIC_API_KEY": "x"}  # unknown 'mistral' head has no key → skipped
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env, capability="reasoning")
+    assert resolved is not None
+    assert resolved.provider == "anthropic"  # fell through cleanly, no KeyError
+
+
+def test_resolve_chain_gemini_head_normalizes_to_google(monkeypatch):
+    # gemini→google normalization end-to-end: the manifest's `gemini` provider resolves through
+    # resolve_chain as this CLI's `google` key, with review's bare `gemini` arg.
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("gemini", "gemini-2.5-flash")
+    )
+    env = {"GOOGLE_API_KEY": "x"}  # only google reachable
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env, capability="fast")
+    assert resolved is not None
+    assert resolved.provider == "google"
+    assert resolved.model_arg == "gemini"  # review's gemini backend takes the bare token
+
+
+def test_resolve_chain_dedups_exact_duplicate_head(monkeypatch):
+    # the manifest head is an EXACT duplicate of a chain entry (same provider AND model). Dedup
+    # must drop the lower duplicate and keep ONE promoted copy — a custom chain with a tail entry
+    # equal to the head, where the head provider is the only reachable one, proves no double-count
+    # by resolving to exactly that model (and the test exercises the `entry != head` removal).
+    head = ("commandcode", "deepseek/deepseek-v4-flash")
+    monkeypatch.setattr("tasklib.manifest.resolve_capability", lambda *a, **k: head)
+    custom_chain = [("anthropic", "claude-haiku-4-5"), head]  # head also present at the tail
+    env = {"COMMANDCODE_API_KEY": "x"}  # only the head provider reachable
+    resolved = resolve_chain(custom_chain, env, capability="code")
+    assert resolved is not None
+    assert resolved.provider == "commandcode"
+    assert resolved.model_arg == "commandcode:deepseek/deepseek-v4-flash"
+
+
+def test_resolve_chain_does_not_mutate_caller_fallbacks(monkeypatch):
+    # prepending the manifest head must NOT mutate the caller's list (resolve_chain copies it).
+    monkeypatch.setattr(
+        "tasklib.manifest.resolve_capability", lambda *a, **k: ("anthropic", "claude-opus-4-8")
+    )
+    caller_chain = [("zai", "glm-4.6-flash")]
+    before = list(caller_chain)
+    resolve_chain(caller_chain, {"ANTHROPIC_API_KEY": "x"}, capability="reasoning")
+    assert caller_chain == before  # untouched — no leaked insert
+
+
+def test_resolve_chain_no_capability_is_unchanged(monkeypatch):
+    # with no capability the resolver is never even consulted — behaviour is the old chain.
+    def _boom(*_a, **_k):
+        raise AssertionError("resolve_capability must not be called without a capability")
+
+    monkeypatch.setattr("tasklib.manifest.resolve_capability", _boom)
+    env = {"ANTHROPIC_API_KEY": "x"}
+    resolved = resolve_chain(list(DEFAULT_FALLBACKS), env)
+    assert resolved is not None
+    assert resolved.provider == "anthropic"
