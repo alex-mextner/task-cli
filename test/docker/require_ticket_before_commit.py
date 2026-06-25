@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
-# SYNC: VENDORED COPY of agent-tools/agent-hooks/require-ticket-before-commit/
-#       require_ticket_before_commit.py. The canonical source lives in agent-tools (rig provisions
-#       it onto a real machine). This copy is a hermetic FIXTURE for the Docker `test-cli`
-#       enforcement leg (test/docker/enforce_test.sh): a clean-rig machine has this exact hook, so
-#       the harness ships it to prove the strict ticket gate blocks a ticketless commit end-to-end
-#       without depending on agent-tools at image-build time. Keep it byte-identical to the source;
-#       the test asserts the STABLE marker `[require-ticket] BLOCKED: no ticket reference` + exit 10,
-#       which is the cross-repo contract both sides keep. Re-copy from agent-tools when that hook
-#       changes (its own unit tests guard the marker/exit-code contract).
+# SYNC-HEADER-BEGIN  (this block is the ONLY delta from the canonical source; the drift
+#   guard strips exactly these lines and asserts the remainder is byte-identical to the hash)
+# VENDORED COPY of agent-tools/agent-hooks/require-ticket-before-commit/require_ticket_before_commit.py.
+# The canonical source lives in agent-tools (rig provisions it onto a real machine). This copy is a
+# hermetic FIXTURE for the Docker `test-cli` enforcement leg (test/docker/enforce_test.sh): a
+# clean-rig machine has this exact hook, so the harness ships it to prove the strict ticket gate
+# blocks a ticketless commit end-to-end WITHOUT depending on agent-tools at image-build time.
+#
+# DRIFT GUARD (issue #20): tests/test_vendored_hook_sync.py rebuilds the canonical content from this
+# file (shebang + body, with the SYNC-HEADER block removed) and asserts its SHA256 equals
+# CANONICAL_SHA256 below. A local edit to this copy, OR a stale copy after the canonical changes,
+# fails CI instead of silently diverging — exactly the false-confidence #20 warns about.
+#
+# CANONICAL_SHA256: 59a830c415d2497540d6fb9c3fa3fe4b6ecbb98f41a4fa63dd38a607b1f43615
+# CANONICAL_AGENT_TOOLS_COMMIT: 13329cdde7adfe2b3877054fb22eb14cf4710d79
+#
+# TO RE-SYNC after the canonical hook changes: run `python scripts/resync_vendored_hook.py
+# <path-to-agent-tools>` (re-copies the canonical body and refreshes CANONICAL_SHA256 + the commit
+# above). Keep the marker contract (`[require-ticket] BLOCKED: no ticket reference` + exit 10)
+# intact — the enforce test asserts it.
+# SYNC-HEADER-END
 """agents-hooks/v1 pre-bash hook — require a ticket reference on a commit.
 
 When the agent is about to `git commit`, this checks the commit message (and the
@@ -46,6 +58,14 @@ on_error is "open": a CRASH in the check still fails open — process discipline
 not a security boundary, so a bug must never make committing impossible. But on a
 SUCCESSFUL run with no ticket reference and no exemption/escape, the default is now
 a hard BLOCK (exit 10). Set REQUIRE_TICKET_STRICT=0 to fall back to warn-only.
+
+The `-F -` (message on git's STDIN) case FAILS CLOSED WITH A HINT (agent-tools#104,
+reversing the #102 fail-open): the hook cannot read git's stdin to verify a ticket, so
+rather than let `-F -` silently dodge the gate it BLOCKS with an actionable message —
+pass the message a readable way (`-m "…Closes #N…"` or `-F <file>`), or use the
+documented escape (`[skip-ticket: <reason>]` / `REQUIRE_TICKET_SKIP=1`). The escapes
+still work on a `-F -` command (they're parsed from the message text / the command env,
+not the unreadable stdin). A readable `-F <file>` is checked normally.
 """
 
 from __future__ import annotations
@@ -86,10 +106,11 @@ SKIP_TICKET_TRAILER = re.compile(r"\[skip-ticket:\s*\S[^\]]*\]", re.IGNORECASE)
 _INLINE_ENV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SKIP_FALSEY = frozenset({"", "0", "false", "no", "off"})
 
-GIT_COMMIT = re.compile(r"\bgit\b.*\bcommit\b")
 # `git commit --continue/--abort/--skip` (merge/rebase plumbing) and `--amend`
-# are not authoring a fresh change → don't gate them.
-SKIP_COMMIT = re.compile(r"--(?:continue|abort|skip|amend)\b")
+# are not authoring a fresh change → don't gate them. Matched against the PARSED commit
+# argv (NOT the raw command), so a flag named in the commit MESSAGE / a sibling command
+# can't falsely exempt a real commit (agent-tools#97).
+SKIP_FLAGS = frozenset({"--continue", "--abort", "--skip", "--amend"})
 
 # Commit-type prefixes that are exempt by default (conventional-commit chores).
 # Override the set with REQUIRE_TICKET_EXEMPT_TYPES="chore,docs" (comma-separated).
@@ -138,6 +159,329 @@ TICKET_PATTERNS = (
 )
 
 
+# ── commit-segment parser ─────────────────────────────────────────────────────────────────────
+# The gate fires ONLY on a real `git commit` invocation. Detecting that means PARSING the command
+# into argv — NOT raw-string matching "git"…"commit", which over-blocked every benign command that
+# merely mentioned both words (`gh issue create --body "...git commit..."`, `echo "git commit"`,
+# `git log --grep=commit` — agent-tools#97; the exact regression block-no-verify already fixed in
+# #59). This parser is adapted from block-no-verify (the authoritative copy) and trimmed to the
+# subset require-ticket needs: tokenize → split on separators → strip shell noise/redirects → peel
+# inline env + wrapper executables (env/sudo/runuser/timeout/…) → keep a segment whose executable is
+# `git` and subcommand is `commit`. Each hook is its own subprocess (no shared import path), so the
+# logic is duplicated by design; keep it in step with block-no-verify when changing separator/quote/
+# wrapper handling.
+_SHELL_SEP = frozenset({"&&", "||", ";", "|", "&", ";;", "|&", ";&", ";;&"})
+# Leading tokens that introduce a command but are NOT the command (subshell/brace openers, control
+# keywords). Stripping them recovers the real `git` so a `(git commit …)` / `then git commit …` is
+# still seen.
+_LEADING_SHELL_NOISE = frozenset({
+    "(", "{", "!", "then", "do", "else", "elif", "while", "until", "for", "case",
+})
+_GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+# Wrapper executables that prefix the REAL command and pass the rest through. Best-effort, mirrors
+# block-no-verify's set so a wrapped `git commit` is still gated. An UNLISTED wrapper (`unshare`,
+# `nsenter`, `bash -c '…'`) is not peeled — a documented limitation; the gate is process discipline.
+_WRAPPERS = frozenset({
+    "timeout", "env", "nice", "ionice", "nohup", "setsid", "stdbuf", "time", "unbuffer", "command",
+    "sudo", "doas", "exec", "taskset", "chrt", "setpriv", "flock", "runuser",
+})
+_MAX_WRAPPER_NESTING = 16
+# Wrappers that take a LEADING POSITIONAL operand before the command (timeout's duration, chrt's
+# priority, taskset's mask, flock's lockfile) — dropped so the real command is reached.
+_OPERAND_DROP_WRAPPERS = frozenset({"timeout", "taskset", "chrt", "flock"})
+# Operand-drop wrappers whose operand is a MANDATORY arbitrary string that may legitimately be `git`
+# (flock's lockfile) — dropped even when literally `git`.
+_MANDATORY_OPERAND_WRAPPERS = frozenset({"flock"})
+# Per-wrapper flags taking a SEPARATE value, so the NEXT token is the value, not the wrapped command
+# (`sudo -u USER git …`, `timeout -s SIG …`). PER-WRAPPER: the same letter means different things to
+# different wrappers (`-s` value for timeout, boolean for sudo). Mirrors block-no-verify.
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "sudo": frozenset({
+        "-u", "--user", "-g", "--group", "-p", "--prompt", "-r", "--role",
+        "-t", "--type", "-C", "--close-from", "-R", "--chroot", "-D", "--chdir",
+        "-T", "--command-timeout", "-U", "--other-user", "-c", "--login-class",
+        "-a", "--auth-type",
+    }),
+    "doas": frozenset({"-u", "-a", "-C"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({
+        "-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid",
+    }),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-P", "-a", "--argv0"}),
+    "time": frozenset({"-o", "--output", "-f", "--format"}),
+    "exec": frozenset({"-a"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "taskset": frozenset({"-c", "--cpu-list"}),
+    "flock": frozenset({"-w", "--timeout", "-E", "--conflict-exit-code"}),
+    "setpriv": frozenset({
+        "--ruid", "--euid", "--reuid", "--rgid", "--egid", "--regid", "--groups", "--ptracer",
+        "--securebits", "--pdeathsig", "--ambient-caps", "--inh-caps", "--bounding-set",
+        "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule",
+    }),
+    "chrt": frozenset({"-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"}),
+    "runuser": frozenset({
+        "-c", "--command", "--session-command", "-g", "--group", "-G", "--supp-group",
+        "-s", "--shell", "-u", "--user", "-w", "--whitelist-environment",
+    }),
+}
+# INVARIANTS (loud import-time failure, not a silent bypass): every operand-drop / value-flag /
+# mandatory-operand wrapper must first be a recognized wrapper, else its config is dead and the
+# wrapped commit slips (argv[0] != git → not gated).
+if not _OPERAND_DROP_WRAPPERS <= _WRAPPERS:
+    raise RuntimeError(f"operand-drop wrappers missing from _WRAPPERS: {_OPERAND_DROP_WRAPPERS - _WRAPPERS}")
+if not _MANDATORY_OPERAND_WRAPPERS <= _OPERAND_DROP_WRAPPERS:
+    raise RuntimeError(f"mandatory-operand wrappers not in operand-drop: {_MANDATORY_OPERAND_WRAPPERS - _OPERAND_DROP_WRAPPERS}")
+if not set(_WRAPPER_VALUE_FLAGS) <= _WRAPPERS:
+    raise RuntimeError(f"value-flag wrappers missing from _WRAPPERS: {set(_WRAPPER_VALUE_FLAGS) - _WRAPPERS}")
+
+
+def _short_value_letters(value_flags: frozenset[str]) -> frozenset[str]:
+    """The single-letter forms (`-u` → `u`) of a wrapper's value-flags, for the cluster check."""
+    return frozenset(f[1] for f in value_flags if len(f) == 2 and f.startswith("-"))
+
+
+_WRAPPER_SHORT_VALUE_LETTERS = {w: _short_value_letters(f) for w, f in _WRAPPER_VALUE_FLAGS.items()}
+
+
+def _basename(tok: str) -> str:
+    """The executable name without a leading path — `/usr/bin/git` → `git`, `./sudo` → `sudo`."""
+    return tok.rsplit("/", 1)[-1]
+
+
+def _is_git_executable(tok: str) -> bool:
+    """True when `tok` is the git binary — bare `git` or a path to it (`/usr/bin/git`, `./git`)."""
+    return _basename(tok) == "git"
+
+
+def _strip_line_comment(line: str) -> str:
+    """Cut a `#` shell comment to end-of-line, RESPECTING quotes (so a quoted `#42` in `-m 'fix #42'`
+    is kept). A `#` starts a comment only at a WORD boundary outside quotes."""
+    in_single = in_double = False
+    prev_ws = True
+    for idx, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and prev_ws and not in_single and not in_double:
+            return line[:idx]
+        prev_ws = ch.isspace()
+    return line
+
+
+def _tokenize_line(line: str) -> list[str] | None:
+    """Tokenize ONE physical line: drop a word-boundary `#` comment (quote-aware) then split GLUED
+    separators (`x;git`, `a&&git`). `punctuation_chars=True` emits `; & | && ||` as their own tokens
+    while honoring quotes. Returns None on unbalanced quotes → the caller fails safe."""
+    lex = shlex.shlex(_strip_line_comment(line), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _tokenize(command: str) -> list[str] | None:
+    """Shell-tokenize a whole (possibly MULTI-LINE) command into a flat token stream where a NEWLINE
+    is a command separator. A line that fails to tokenize (a quoted string spanning newlines) is
+    re-joined with following lines until it balances. Returns None only if a chunk can never balance
+    → the caller fails safe."""
+    joined = command.replace("\r\n", "\n").replace("\r", "\n")
+    joined = joined.replace("\\\n", "")  # honor backslash-newline line continuations
+    lines = joined.split("\n")
+    out: list[str] = []
+    first = True
+    i = 0
+    while i < len(lines):
+        chunk = lines[i]
+        toks = _tokenize_line(chunk)
+        while toks is None and i + 1 < len(lines):
+            i += 1
+            chunk = f"{chunk}\n{lines[i]}"
+            toks = _tokenize_line(chunk)
+        if toks is None:
+            return None
+        if not first:
+            out.append(";")  # the newline that started this chunk ends the previous command
+        first = False
+        out.extend(toks)
+        i += 1
+    return out
+
+
+def _segments(tokens: list[str]) -> list[list[str]]:
+    """Split a token list on shell command separators (&&, ||, ;, |, &, fused forms)."""
+    segs: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_SEP:
+            segs.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    segs.append(cur)
+    return segs
+
+
+def _strip_leading_shell_noise(segment: list[str]) -> list[str]:
+    """Drop leading subshell/brace openers and control keywords so a command introduced by them is
+    recovered: `(git commit …)` → `git commit …`. Capped so an all-noise segment can't loop."""
+    i = 0
+    while i < len(segment) and i < 16 and segment[i] in _LEADING_SHELL_NOISE:
+        i += 1
+    return segment[i:]
+
+
+def _strip_redirects(segment: list[str]) -> list[str]:
+    """Drop shell redirection operators + their targets so they don't leak into argv. A pure `<>&`
+    token is a redirect operator; a `<`/`>` inside a quoted word stays a normal token. After `--`
+    everything is a literal pathspec (never a redirect)."""
+    out: list[str] = []
+    i = 0
+    seen_ddash = False
+    while i < len(segment):
+        tok = segment[i]
+        is_redir = (not seen_ddash and bool(tok) and tok not in _SHELL_SEP
+                    and ("<" in tok or ">" in tok) and all(ch in "<>&" for ch in tok))
+        if is_redir:
+            if out and out[-1].isdigit():
+                out.pop()  # drop a bare fd digit prefixing the redirect (`2` of `2> err`)
+            i += 2 if i + 1 < len(segment) else 1
+            continue
+        if tok == "--":
+            seen_ddash = True
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _split_inline_env(segment: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Peel leading `VAR=value` assignments off a segment → (env, rest-starting-at-executable)."""
+    env: dict[str, str] = {}
+    i = 0
+    while i < len(segment):
+        m = _INLINE_ENV.match(segment[i])
+        if not m:
+            break
+        env[m.group(1)] = m.group(2)
+        i += 1
+    return env, segment[i:]
+
+
+def _cluster_takes_next_value(tok: str, short_letters: frozenset[str]) -> bool:
+    """True when a short cluster's LAST char is a value-letter AND no earlier value-letter already
+    consumed the cluster tail (`-iP` → True; `-Px` → False; `-iv` → False)."""
+    body = tok[1:]
+    if not body or body[-1] not in short_letters:
+        return False
+    for ch in body[:-1]:
+        if ch in short_letters:
+            return False
+    return True
+
+
+def _skip_wrapper_args(wrapper: str, argv: list[str]) -> list[str]:
+    """Drop one wrapper's own option flags + (for an operand-drop wrapper) its leading positional
+    operand, returning argv positioned at the wrapped command. A flag in this wrapper's value set
+    (`sudo -u alice`) consumes the following token UNCONDITIONALLY — even when it is literally `git`
+    (`sudo -u git git commit …`: the user is named "git", the SECOND git is the executable)."""
+    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, frozenset())
+    short_letters = _WRAPPER_SHORT_VALUE_LETTERS.get(wrapper, frozenset())
+    i = 0
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "--":
+        consumes_next = (argv[i] in value_flags
+                         or (not argv[i].startswith("--")
+                             and _cluster_takes_next_value(argv[i], short_letters)))
+        if consumes_next and i + 1 < len(argv):
+            i += 2
+            continue
+        i += 1
+    if i < len(argv) and argv[i] == "--":
+        i += 1
+    if wrapper in _OPERAND_DROP_WRAPPERS and i < len(argv) and _basename(argv[i]) not in _WRAPPERS:
+        if wrapper in _MANDATORY_OPERAND_WRAPPERS or not _is_git_executable(argv[i]):
+            i += 1
+    return argv[i:]
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Peel leading wrapper executables (`timeout 60`, `env A=b`, `sudo`, `runuser -u u --`, …) so the
+    REAL command beneath is what we inspect. Stops as soon as the head is no longer a known wrapper,
+    so a real `git` is never skipped. An `env -S '<command>'` split-string is NOT recursed here (a
+    documented best-effort limitation; the gate is process discipline, not a security boundary). Past
+    the nesting cap, returns argv unchanged (a pathological wrapper chain → simply not a commit we
+    gate; require-ticket is on_error=open, so under-matching obfuscation is acceptable)."""
+    guard = 0
+    while argv and _basename(argv[0]) in _WRAPPERS:
+        if guard >= _MAX_WRAPPER_NESTING:
+            return argv
+        guard += 1
+        wrapper, argv = _basename(argv[0]), argv[1:]
+        argv = _skip_wrapper_args(wrapper, argv)
+        _, argv = _split_inline_env(argv)  # `env HUSKY=0 git …` / `sudo FOO=bar git …`
+    return argv
+
+
+def _commit_argv(segment: list[str]) -> list[str] | None:
+    """If `segment`'s executable is `git` and its subcommand is exactly `commit`, return the tokens
+    AFTER `commit`; else None. Walks past git GLOBAL options (`-C dir`, `-c k=v`) to reach the
+    subcommand. Wrappers + inline env must already be peeled. `commit-graph`/`commit-tree` are
+    DIFFERENT subcommands and correctly do NOT match (exact `== "commit"`)."""
+    if not segment or not _is_git_executable(segment[0]):
+        return None
+    i = 1
+    while i < len(segment):
+        tok = segment[i]
+        if tok in _GIT_GLOBAL_VALUE_FLAGS and i + 1 < len(segment):
+            i += 2  # global flag + its separate value
+            continue
+        if tok.startswith("-"):
+            i += 1  # other global flag / glued `-Cdir` / `-ck=v`
+            continue
+        break
+    if i >= len(segment) or segment[i] != "commit":
+        return None
+    return segment[i + 1:]
+
+
+class CommitSegment:
+    """A parsed real `git commit` segment.
+
+    - ``env``      : the inline `VAR=value` env prefixing the command (and a wrapper's `VAR=val`
+                     operands), scoped to THIS segment — for the `REQUIRE_TICKET_SKIP` escape.
+    - ``argv``     : the tokens AFTER `commit` — the commit's own flags/message/pathspecs.
+    - ``git_argv`` : the wrapper-stripped invocation starting at `git` (`git -C <dir> commit …`) —
+                     for reading the `git -C <dir>` global that targets a different repo.
+    """
+
+    __slots__ = ("env", "argv", "git_argv")
+
+    def __init__(self, env: dict[str, str], argv: list[str], git_argv: list[str]) -> None:
+        self.env = env
+        self.argv = argv
+        self.git_argv = git_argv
+
+
+def commit_segments(command: str) -> list[CommitSegment]:
+    """Every real `git commit` segment in `command` (a chain may hold more than one). Empty on a
+    tokenization failure (the safe direction: a command we can't parse is not gated — require-ticket
+    is on_error=open, a discipline reminder, not a security boundary)."""
+    tokens = _tokenize(command)
+    if tokens is None:
+        return []
+    out: list[CommitSegment] = []
+    for raw_seg in _segments(tokens):
+        seg = _strip_leading_shell_noise(_strip_redirects(raw_seg))
+        env, rest = _split_inline_env(seg)
+        git_argv = _strip_wrappers(rest)  # the real `git …` invocation, wrappers peeled
+        argv = _commit_argv(git_argv)
+        if argv is not None:
+            out.append(CommitSegment(env, argv, git_argv))
+    return out
+
+
 def emit(decision: str, message: str | None = None) -> None:
     out = {"hook_api": HOOK_API, "decision": decision}
     if message:
@@ -172,65 +516,43 @@ def has_skip_trailer(message: str) -> bool:
     return bool(SKIP_TICKET_TRAILER.search(message))
 
 
-def has_inline_skip(command: str) -> bool:
-    """True when the FIRST `git commit` segment is prefixed with `REQUIRE_TICKET_SKIP=<truthy>`.
+def has_inline_skip(segment: CommitSegment) -> bool:
+    """True when the commit segment is prefixed with `REQUIRE_TICKET_SKIP=<truthy>` inline env.
 
     Reads the inline env on the COMMAND the agent is about to run (`REQUIRE_TICKET_SKIP=1 git
-    commit …`), not the hook's process env — mirroring the review-gate's `REVIEW_SKIP`. Scoped
-    to the leading assignments of the segment that contains `git commit`, so an assignment on a
-    SIBLING command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) does NOT bypass the gate.
+    commit …`), not the hook's process env — mirroring the review-gate's `REVIEW_SKIP`. The env is
+    already scoped to the real `git commit` segment by the parser, so an assignment on a SIBLING
+    command (`REQUIRE_TICKET_SKIP=1 echo x; git commit …`) is NOT seen here and does not bypass.
     Falsey values (`0`/`false`/`no`/`off`/empty) are matched case-insensitively so they don't
-    accidentally skip. Best-effort: a tokenization failure → no skip (the commit stays gated)."""
-    for segment in re.split(r"&&|\|\||;|\|", command):
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            continue
-        env: dict[str, str] = {}
-        rest = tokens
-        for idx, tok in enumerate(tokens):
-            m = _INLINE_ENV.match(tok)
-            if not m:
-                rest = tokens[idx:]
-                break
-            env[m.group(1)] = m.group(2)
-        else:
-            rest = []
-        # Only honor the assignment on the segment that actually runs `git commit`.
-        if not (rest and _is_git_executable(rest[0]) and "commit" in rest[1:]):
-            continue
-        if env.get("REQUIRE_TICKET_SKIP", "").strip().lower() not in _SKIP_FALSEY:
-            return True
-    return False
+    accidentally skip."""
+    return segment.env.get("REQUIRE_TICKET_SKIP", "").strip().lower() not in _SKIP_FALSEY
 
 
-def _is_git_executable(tok: str) -> bool:
-    """True when `tok` is the git binary — bare `git` or a path to it (`/usr/bin/git`)."""
-    return os.path.basename(tok) == "git"
+# The `-F -` sentinel: git reads the commit message from its OWN stdin. A PreToolUse hook cannot
+# read that (the hook's stdin is the JSON event, not git's), so a `-F -` value is NOT a file path to
+# open — it's the unreadable-message marker that triggers the fail-CLOSED-with-hint block in
+# _evaluate_commit_segment (agent-tools#104; #102 used to fail open here).
+_STDIN_SENTINEL = "-"
 
 
-def commit_message_from_command(command: str, cwd: str | None = None) -> str:
-    """Pull the inline commit message out of the argv: -m/--message and -F/--file.
+def commit_message_from_argv(argv: list[str], cwd: str | None = None) -> str:
+    """Pull the commit message out of the already-parsed commit argv: -m/--message and -F/--file.
 
-    Returns ONLY the message text — the concatenation of every -m value and the
-    contents of any -F file. Deliberately excludes the raw command so that the
-    conventional-type / WIP exemption check sees the real subject line, not the
-    `git commit …` argv. A relative `-F` path is resolved against `cwd` (the
-    command's working directory from the event), since the hook may run elsewhere.
-    Best-effort: on unbalanced quotes, falls back to the raw command string
-    (better to over-scan for a ticket id than to crash).
-    """
+    Returns ONLY the message text — the concatenation of every -m value and the contents of any -F
+    file — so the conventional-type / WIP exemption check sees the real subject line, not the `git
+    commit …` argv. A relative `-F` path is resolved against `cwd` (the command's working directory
+    from the event), since the hook may run elsewhere. A `-F -` (stdin) value contributes NO text —
+    git streams that message on its own stdin, which the hook can't read; commit_reads_stdin_message
+    detects it separately so the caller can fail closed with a hint. Stops at `--` (the rest are
+    literal pathspecs, never message flags)."""
     parts: list[str] = []
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return command  # unbalanced quotes etc. — scan the raw string
-
     i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in ("-m", "--message", "-F", "--file") and i + 1 < len(tokens):
-            value = tokens[i + 1]
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in ("-m", "--message", "-F", "--file") and i + 1 < len(argv):
+            value = argv[i + 1]
             if tok in ("-F", "--file"):
                 parts.append(_read_message_file(value, cwd))
             else:
@@ -242,12 +564,54 @@ def commit_message_from_command(command: str, cwd: str | None = None) -> str:
         elif tok.startswith("--file="):
             parts.append(_read_message_file(tok.split("=", 1)[1], cwd))
         elif tok.startswith("-m") and len(tok) > 2:
-            parts.append(tok[2:])  # -mMessage
+            parts.append(tok[2:])  # -mMessage (glued)
+        elif tok.startswith("-F") and len(tok) > 2:
+            parts.append(_read_message_file(tok[2:], cwd))  # -FPATH (glued; git accepts both forms)
         i += 1
     return "\n".join(parts)
 
 
+def _file_flag_values(argv: list[str]) -> list[str]:
+    """Every `-F`/`--file` VALUE in the parsed commit argv — separate `-F <p>`/`--file <p>`, glued
+    `-F<p>`, and `--file=<p>` — in order. Stops at `--` (literal pathspecs, never message flags).
+
+    Recognizes the SAME four spellings `commit_message_from_argv` reads from disk, so the
+    stdin-sentinel detector and the message reader agree on what a `-F`/`--file` value is (a value
+    that reads as a file in one MUST be seen as a file in the other, and vice versa for `-`). The two
+    keep separate loops because the reader interleaves `-m` values and file CONTENTS while this one
+    only collects the file VALUES; a parity test pins that they don't drift."""
+    values: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in ("-F", "--file") and i + 1 < len(argv):
+            values.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--file="):
+            values.append(tok.split("=", 1)[1])
+        elif tok.startswith("-F") and len(tok) > 2:
+            values.append(tok[2:])  # -FPATH glued (and -F- → "-")
+        i += 1
+    return values
+
+
+def commit_reads_stdin_message(argv: list[str]) -> bool:
+    """True when the commit's message comes from git's STDIN via `-F -` (any spelling: `-F -`,
+    `-F-`, `--file -`, `--file=-`). That message is on git's own stdin, which a PreToolUse hook
+    cannot read — so the caller fails CLOSED with a hint (agent-tools#104), rather than let `-F -`
+    silently dodge the ticket gate. The readable per-commit escapes are honored first, so a genuine
+    no-ticket `-F -` commit still has an out."""
+    return any(v == _STDIN_SENTINEL for v in _file_flag_values(argv))
+
+
 def _read_message_file(path: str, cwd: str | None = None) -> str:
+    # `-F -` is the stdin sentinel, not a file named "-": don't try to open it (it would fail and
+    # warn spuriously). commit_reads_stdin_message handles that case at the decision layer.
+    if path == _STDIN_SENTINEL:
+        return ""
     resolved = os.path.expanduser(path)
     if cwd and not os.path.isabs(resolved):
         resolved = os.path.join(cwd, resolved)
@@ -260,10 +624,14 @@ def _read_message_file(path: str, cwd: str | None = None) -> str:
 
 
 def current_branch(cwd: str | None) -> str:
-    """Branch name — a ticket id is often encoded there (feature/ABC-12-foo)."""
+    """Branch name — a ticket id is often encoded there (feature/ABC-12-foo).
+
+    Uses ``git branch --show-current`` (git >=2.22), which returns the branch name even on an
+    UNBORN branch — the exact case of a repo's FIRST commit, where ``git rev-parse --abbrev-ref
+    HEAD`` returns the literal "HEAD" instead and the branch-encoded ticket would be missed."""
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "branch", "--show-current"],
             cwd=cwd or None,
             capture_output=True,
             text=True,
@@ -275,19 +643,17 @@ def current_branch(cwd: str | None) -> str:
         return ""
 
 
-def effective_cwd(command: str, cwd: str | None) -> str | None:
-    """Honor ``git -C <dir>``: a `git -C <repo> commit …` acts on <repo>, not the shell cwd,
-    so branch detection must read THAT repo. Returns the -C target (``-C dir`` or ``-Cdir``,
-    last one wins, resolved against cwd) if present, else cwd. Falls back to cwd when the
-    command can't be tokenized."""
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return cwd
+def effective_cwd(segment: CommitSegment, cwd: str | None) -> str | None:
+    """Honor ``git -C <dir>``: a `git -C <repo> commit …` acts on <repo>, not the shell cwd, so
+    branch detection must read THAT repo. Returns the -C target (``-C dir`` or ``-Cdir``, last one
+    wins, resolved against cwd) read from the PARSED commit segment if present, else cwd."""
+    tokens = segment.git_argv  # the wrapper-stripped `git …` invocation
     target: str | None = None
-    i = 0
+    i = 1 if tokens and _is_git_executable(tokens[0]) else 0
     while i < len(tokens):
         tok = tokens[i]
+        if tok == "commit":
+            break  # past the global options — stop before the subcommand argv
         if tok == "-C" and i + 1 < len(tokens):
             target = tokens[i + 1]
             i += 2
@@ -303,28 +669,37 @@ def effective_cwd(command: str, cwd: str | None) -> str | None:
     return target
 
 
-def _argv_without_message(command: str) -> str:
-    """The command with -m/--message/-F message VALUES stripped, so a flag named in the commit
-    MESSAGE (``-m 'support --amend'``) can't trip SKIP_COMMIT and falsely exempt a real commit.
-    On a tokenization failure, returns "" → SKIP_COMMIT can't match → the commit is GATED
-    (the safe direction: gate rather than wrongly exempt)."""
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return ""
-    out: list[str] = []
+def _takes_following_message_value(tok: str) -> bool:
+    """True when a commit flag token consumes the NEXT token as a VALUE (a message/file path) — so a
+    skip-flag-looking value (`-am '--amend'`) is NOT read as a real flag. Covers `--message`/`--file`
+    and any short cluster ENDING in `m`/`F` (`-m`, `-am`, `-aF`); a GLUED short value (`-mMSG`/`-FX`,
+    where the value letter is not last) carries its value in the token and does not take the next."""
+    if tok.startswith("--"):
+        return tok in ("--message", "--file")
+    if tok.startswith("-") and len(tok) > 1:
+        if len(tok) > 2 and tok[1] in ("m", "F"):
+            return False  # a glued `-mMSG` / `-FPATH`
+        return tok[-1] in ("m", "F")  # `-m` / `-am` / `-aF` takes the next token
+    return False
+
+
+def is_skip_commit(argv: list[str]) -> bool:
+    """True when the PARSED commit argv carries --continue/--abort/--skip/--amend (merge/rebase
+    plumbing or an amend — not authoring a fresh change). Skips every message/file VALUE so a skip
+    flag named only in the commit MESSAGE (`-m 'support --amend'`, `-am '--amend'`) does NOT falsely
+    exempt a real commit. Stops at `--` (the rest are literal pathspecs, never flags)."""
     i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in ("-m", "--message", "-F", "--file") and i + 1 < len(tokens):
-            i += 2  # drop the flag AND its value
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if _takes_following_message_value(tok) and i + 1 < len(argv):
+            i += 2  # drop the flag AND its value (a `--amend`-looking message can't be read as one)
             continue
-        if tok.startswith(("--message=", "--file=")) or (tok.startswith("-m") and len(tok) > 2):
-            i += 1  # drop -mMSG / --message=MSG / --file=PATH
-            continue
-        out.append(tok)
+        if tok in SKIP_FLAGS:
+            return True
         i += 1
-    return " ".join(out)
+    return False
 
 
 def main() -> int:
@@ -339,36 +714,97 @@ def main() -> int:
     command = args.get("command") or args.get("cmd") or event.get("command") or ""
     if not isinstance(command, str):
         command = str(command)
-    # Honor `git -C <repo>`: branch/message checks must target the repo the commit acts on.
-    cwd = effective_cwd(command, event.get("cwd") or args.get("cwd"))
+    event_cwd = event.get("cwd") or args.get("cwd")
 
-    # SKIP_COMMIT is matched against the argv with the MESSAGE removed, so `--amend`/`--continue`
-    # appearing in a commit message can't falsely exempt the commit.
-    if not GIT_COMMIT.search(command) or SKIP_COMMIT.search(_argv_without_message(command)):
-        return _allow()  # not a normal authoring commit → nothing to gate
+    # Detection is now ARGV-SCOPED: parse the command and gate ONLY a real `git commit` segment, so a
+    # benign command that merely mentions "git"/"commit" (`gh issue create --body "...git commit..."`,
+    # `echo "git commit"`, `git log --grep=commit`) is never gated (agent-tools#97). A chain may hold
+    # more than one commit (`git commit … && git commit …`); gate on the FIRST that is non-exempt and
+    # ticketless.
+    segments = commit_segments(command)
+    if not segments:
+        return _allow()  # no real `git commit` segment → nothing to gate
 
-    message = commit_message_from_command(command, cwd)
-    # Exemption is judged from the message text only (the real subject line), not
-    # the `git commit …` argv — otherwise the command words could mis-trigger it.
+    for segment in segments:
+        decision = _evaluate_commit_segment(segment, event_cwd)
+        if decision is not None:
+            return decision  # a non-exempt, ticketless commit → block (or warn-allow)
+    return _allow()  # every commit segment is exempt / ticketed / escaped
+
+
+def _evaluate_commit_segment(segment: CommitSegment, event_cwd: str | None) -> int | None:
+    """Decide ONE parsed `git commit` segment. Returns an exit code when the gate fires (block, or a
+    warn-only allow), or None when this segment is clean (exempt / ticketed / escaped) so the caller
+    moves on to the next segment in the chain."""
+    # `--amend`/`--continue`/`--abort`/`--skip` aren't authoring a fresh change → nothing to gate.
+    if is_skip_commit(segment.argv):
+        return None
+    # Honor `git -C <repo>`: message-file + branch detection must target the repo the commit acts on.
+    cwd = effective_cwd(segment, event_cwd)
+    message = commit_message_from_argv(segment.argv, cwd)
+    # Exemption is judged from the message text only (the real subject line), not the `git commit …`
+    # argv — otherwise the command words could mis-trigger it.
     if is_exempt(message):
-        return _allow()  # trivial chore / WIP / merge — no ticket expected
+        return None  # trivial chore / WIP / merge — no ticket expected
 
     # Per-commit escapes (the deliberate, documented bypass for a legit ticketless commit):
     # a `[skip-ticket: <reason>]` message trailer, or an inline `REQUIRE_TICKET_SKIP=1`.
+    # `has_inline_skip` reads the COMMAND env (`REQUIRE_TICKET_SKIP=1 git commit …`), so it works even
+    # for a `-F -` commit whose message is on unreadable stdin. `has_skip_trailer` reads the parsed
+    # MESSAGE, so for `-F -` (empty readable message) it is a no-op — only the inline env escape
+    # applies to a stdin-message commit (the hint below says exactly that, no false promise).
     if has_skip_trailer(message):
-        return _allow()  # explicit `[skip-ticket: …]` escape
-    if has_inline_skip(command):
-        return _allow()  # explicit inline `REQUIRE_TICKET_SKIP=1 git commit …` escape
+        return None  # explicit `[skip-ticket: …]` escape
+    if has_inline_skip(segment):
+        return None  # explicit inline `REQUIRE_TICKET_SKIP=1 git commit …` escape
 
     branch = current_branch(cwd)
-    # Ticket detection is permissive: scan the message, the raw command (a ticket
-    # id may ride in any flag, e.g. a -F path), and the branch name.
-    if (
-        has_ticket_reference(message)
-        or has_ticket_reference(command)
-        or has_ticket_reference(branch)
-    ):
-        return _allow()  # a ticket reference is present → proceed
+    # Ticket detection is permissive: scan the commit message and the branch name (a ticket id is
+    # often encoded as `feature/ABC-12-foo`). NOTE: the OLD code also scanned the whole RAW command,
+    # which is what produced the false POSITIVE in the inverse direction — but here it would let a
+    # ticket id anywhere on the line (even in a sibling) satisfy the gate. Scoping to the parsed
+    # message + branch is both correct and tighter; a `-F` file's contents are already folded into
+    # `message`.
+    #
+    # This runs BEFORE the `-F -` stdin block on purpose: a `-F -` commit can still be ticketed via
+    # its BRANCH name (`feature/ABC-12-foo`), which IS readable. Blocking `-F -` ahead of branch
+    # detection would false-block that legit case and diverge from the editor-commit path (a `git
+    # commit` with no `-m`/`-F` is likewise unreadable and is checked against the branch only). So we
+    # only fall through to the stdin block when NEITHER the message NOR the branch yields a ticket.
+    if has_ticket_reference(message) or has_ticket_reference(branch):
+        return None  # a ticket reference is present (in the message or the branch) → proceed
+
+    # `git commit -F -` streams the message on GIT's stdin, which a PreToolUse hook CANNOT read (the
+    # hook's stdin is the JSON event, not git's). Reaching here means the branch carried no ticket
+    # either, so the message is our last chance to verify one — and it's unreadable. Rather than let
+    # `-F -` silently dodge the gate (the #102 fail-open), FAIL CLOSED WITH A HINT (agent-tools#104):
+    # BLOCK with an actionable message. The ONLY escape that works for a stdin-message commit is the
+    # inline `REQUIRE_TICKET_SKIP=1` (already checked above; it's read from the command, not stdin) —
+    # a `[skip-ticket: …]` TRAILER would live in the unreadable stdin message, so the hint does NOT
+    # offer it here. `-F <file>` is readable and is ticket-checked normally (it never reaches here).
+    if commit_reads_stdin_message(segment.argv):
+        hint = (
+            f"{BLOCK_MARKER}. The commit message is on git's stdin (`-F -`), which a PreToolUse hook "
+            "cannot read — so the ticket gate cannot verify a reference (and the branch name carried "
+            "none either) and will not let `-F -` dodge it. Put the ticket somewhere readable: pass "
+            "the message via `-m \"…Closes #123…\"` or `-F <file>` (both are checked), or encode the "
+            "ticket in the branch name (e.g. `feature/ABC-12-foo`). Deliberate no-ticket escape for a "
+            "stdin-message commit: run `REQUIRE_TICKET_SKIP=1 git commit …` (read from the command, "
+            "not stdin); or opt the whole gate back to warn-only with REQUIRE_TICKET_STRICT=0."
+        )
+        if STRICT:
+            warn(hint)
+            emit("block", hint)
+            return BLOCK_EXIT_CODE
+        # Warn-only opt-out: surface the reminder but allow (and DON'T leak the BLOCK_MARKER).
+        advisory = (
+            "commit message is on git's stdin (`-F -`) — unreadable, so the ticket gate cannot "
+            "verify a reference; committing anyway (warn-only). Prefer `-m`/`-F <file>` so the gate "
+            "can check the ticket."
+        )
+        warn(advisory)
+        emit("allow", advisory)
+        return 0
 
     # The shared human-facing guidance — what's wrong and how to satisfy the gate. It carries NO
     # marker: the stable BLOCK_MARKER must appear ONLY on a real block, so an external check that
