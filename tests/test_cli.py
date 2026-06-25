@@ -808,6 +808,34 @@ def test_daemon_status_json(capsys, _inject_fake, tmp_path, monkeypatch):
     assert payload["notifier"] == ["tg", "--tag", "report"]
 
 
+def test_daemon_status_reports_not_ours(capsys, _inject_fake, tmp_path, monkeypatch):
+    # #32: a recycled foreign pid must surface in `status` as a recycled/foreign warning (not
+    # "running") — the consistency fix with stop's identity guard.
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "pid_status", lambda _p: ("not-ours", 4242))
+    rc = main(["daemon", "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "4242" in out
+    assert "recycled" in out and "running (pid" not in out
+
+
+def test_daemon_status_json_not_ours(capsys, _inject_fake, tmp_path, monkeypatch):
+    import json
+
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "pid_status", lambda _p: ("not-ours", 4242))
+    rc = main(["daemon", "status", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "not-ours"
+    assert payload["pid"] == 4242
+
+
 def test_daemon_start_is_idempotent_no_double_spawn(capsys, _inject_fake, tmp_path, monkeypatch):
     import os
     from argparse import Namespace
@@ -824,11 +852,13 @@ def test_daemon_start_is_idempotent_no_double_spawn(capsys, _inject_fake, tmp_pa
     assert "daemon started" in capsys.readouterr().out
     assert spawned == [1]
 
-    # a second start while a daemon is alive must not spawn again. Stamp the pid-file with THIS
-    # live process so the liveness probe says "running", then assert the second start is a no-op.
+    # a second start while OUR daemon is alive must not spawn again. Stamp the pid-file with THIS
+    # live process AND make its cmdline read as the daemon (pid_status is identity-aware now — #32 —
+    # so a bare-liveness "running" requires a daemon-shaped argv), then assert the second start no-ops.
     cfg = _load(Namespace(cwd=".", backend=None, repo=None, config=None))
     paths = _d.paths_for(_daemon_coordinate(cfg))
     _d._write_pid(paths.pid, os.getpid())
+    monkeypatch.setattr(_d, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
     spawned.clear()
     rc = main(["daemon", "start"])
     assert rc == 0

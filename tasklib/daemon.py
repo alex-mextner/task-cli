@@ -11,9 +11,12 @@ HOW it is reached at runtime: `tasklib.cli`'s `daemon` subcommand group dispatch
 re-execs `task daemon run` detached. `run` takes the loop; `stop`/`status` read the pid-file.
 
 INVARIANTS this assumes:
-- The pid-file is informational; liveness is a real ``kill(pid, 0)`` probe (a stale file whose
-  process died reads as "stale", never "running"). One daemon per repo coordinate — the state
-  files are keyed by the coordinate so two repos on one machine never collide.
+- The pid-file is informational; liveness is a real ``kill(pid, 0)`` probe AND a pid-identity
+  check (a stale file whose process died reads as "stale", and a file whose pid was recycled for a
+  foreign process reads as "not-ours" — never "running"). ``status``/``start``/``stop`` all key off
+  the same identity-aware :func:`pid_status`, so a recycled pid is classified consistently across the
+  three commands (#32). One daemon per repo coordinate — the state files are keyed by the coordinate
+  so two repos on one machine never collide.
 - The loop is FAIL-SOFT end to end: a backend error, a malformed ticket, or a notifier failure
   in one tick is caught, logged, and the loop continues. Nothing a single tick does can wedge
   the daemon — that is the whole point of a watcher you are supposed to forget about.
@@ -385,15 +388,33 @@ def is_task_daemon(pid: int) -> bool:
 
 
 def pid_status(pid_path: Path) -> tuple[str, int | None]:
-    """Classify the daemon: ``("running"|"stale"|"stopped", pid_or_None)``.
+    """Classify the daemon: ``("running"|"not-ours"|"stale"|"stopped", pid_or_None)``.
 
-    "stale" = the pid-file exists but its process is gone (a crash/kill left the file behind).
-    The pid-file is informational; this liveness probe is the real truth.
+    - ``"stopped"`` — no pid-file (or garbage): nothing to talk about.
+    - ``"stale"`` — the pid-file exists but its process is gone (a crash/kill left the file behind).
+    - ``"not-ours"`` — the pid is ALIVE but is POSITIVELY a foreign process (a crash + OS pid-reuse):
+      the same identity check ``stop`` makes, threaded through here so ``status``/``start`` agree with
+      ``stop`` instead of a bare liveness probe reporting a recycled pid as ``"running"`` (#32).
+    - ``"running"`` — the pid is alive AND identifies as our daemon, OR its cmdline can't be read at
+      all (``IDENTITY_UNKNOWN`` — busybox ``ps`` / no ``/proc``). The UNKNOWN case stays ``"running"``
+      ON PURPOSE: calling an unreadable cmdline "foreign" would mis-report (and, via ``start``, double-
+      spawn over) a real daemon in exactly the minimal Docker images this project tests in — the same
+      reason ``stop`` preserves its pre-guard signalling on UNKNOWN.
+
+    The pid-file is informational; the liveness probe + identity check are the real truth. Matching
+    ``stop``'s recorded-identity-first classification keeps the three commands consistent: a recycled
+    pid reads as ``"not-ours"`` everywhere, never ``"running"`` in one command and ``"not-ours"`` in
+    another.
     """
     pid = read_pid(pid_path)
     if pid is None:
         return "stopped", None
-    return ("running", pid) if is_alive(pid) else ("stale", pid)
+    if not is_alive(pid):
+        return "stale", pid
+    recorded = read_recorded_identity(pid_path)
+    if identify_pid(pid, recorded_identity=recorded) == IDENTITY_FOREIGN:
+        return "not-ours", pid
+    return "running", pid
 
 
 def _write_pid(pid_path: Path, pid: int, *, identity: str | None = None) -> None:
@@ -747,7 +768,11 @@ def start(
     status, pid = pid_status(paths.pid)
     if status == "running":
         return "already-running", pid
-    if status == "stale":
+    # A stale (dead) pid-file OR a "not-ours" recycled-pid pid-file is misleading and must not block
+    # a fresh start: clear it and spawn. Before #32, a recycled foreign pid read as "running" here and
+    # start wrongly no-op'd as "already-running" — the inconsistency this fix closes. We do NOT signal
+    # the foreign pid (that's stop's job); we just stop trusting the pid-file and start our own daemon.
+    if status in ("stale", "not-ours"):
         _clear_pid(paths.pid)
 
     child = _spawn_detached(cwd=cwd, log_path=paths.log, child_flags=child_flags or [])
@@ -809,19 +834,27 @@ def stop(coordinate: str, *, env: dict[str, str] | None = None, timeout_s: float
     """
     paths = paths_for(coordinate, env=env)
     status, pid = pid_status(paths.pid)
-    if status != "running" or pid is None:
+    if pid is None or status in ("stopped", "stale"):
+        # Nothing alive under this pid-file (or no file at all) — clear any stale file and report.
         _clear_pid(paths.pid)
         return "not-running", pid
-
-    # The identity the daemon recorded at startup (its own argv signature) — matched first, so a
-    # daemon launched via ANY entrypoint (renamed console-script, frozen binary) is still recognized.
-    recorded = read_recorded_identity(paths.pid)
-    if identify_pid(pid, recorded_identity=recorded) == IDENTITY_FOREIGN:
-        # The pid is alive but POSITIVELY not OUR daemon (a crash + OS pid-reuse). Refuse to signal
-        # it, and clear the misleading pid-file so a later start/stop doesn't trip on it again.
+    if status == "not-ours":
+        # The pid is alive but POSITIVELY not OUR daemon (a crash + OS pid-reuse). pid_status already
+        # ran the same identity check stop relies on — refuse to signal it and clear the misleading
+        # pid-file so a later start/stop doesn't trip on it again. (status/start now agree here too.)
         log_event("daemon.stop-pid-not-ours", level="WARN", pid=pid)
         _clear_pid(paths.pid)
         return "not-ours", pid
+
+    # The pid is alive AND ours (or unreadable→treated as ours): read the recorded launch identity
+    # here, on this live path only, and reuse this SAME value for the pre-SIGKILL re-check below (we
+    # capture it ONCE for the SIGTERM→wait→SIGKILL sequence rather than re-reading after the wait).
+    # That keeps the pre/post-wait checks within stop consistent — the post-wait branch judges "is the
+    # pid we SIGTERM'd still ours?" against what we recorded at THIS moment, not a value a racing
+    # same-coordinate restart could have rewritten meanwhile. (pid_status did its own read for the
+    # earlier not-ours-vs-running classification; in the recycle case both reads agree on FOREIGN, so
+    # the brief duplicate read is harmless — the flock the live daemon holds blocks a mid-wait rewrite.)
+    recorded = read_recorded_identity(paths.pid)
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -836,9 +869,9 @@ def stop(coordinate: str, *, env: dict[str, str] | None = None, timeout_s: float
         return "stopped", pid
 
     # TERM didn't take in time — escalate to SIGKILL so stop never leaves a live daemon behind.
-    # RE-CHECK identity first (with the same recorded identity): during the SIGTERM wait the daemon
-    # could have died and the OS could have recycled its pid, so a blind SIGKILL might hit an innocent
-    # process. A positively-foreign pid here means exactly that — stop signalling, report "not-ours".
+    # RE-CHECK identity first (against the SAME `recorded` read before SIGTERM): during the wait the
+    # daemon could have died and the OS could have recycled its pid, so a blind SIGKILL might hit an
+    # innocent process. A positively-foreign pid here means exactly that — stop signalling, "not-ours".
     if identify_pid(pid, recorded_identity=recorded) == IDENTITY_FOREIGN:
         # Post-wait: the old daemon may have exited and a fresh start re-written the pid-file with a
         # NEW pid — only clear it if it still points at the pid we were stopping, never the new one.

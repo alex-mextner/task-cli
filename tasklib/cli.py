@@ -1483,9 +1483,10 @@ def _daemon_status(daemon, coordinate: str, cfg, args: argparse.Namespace) -> in
         return 0
     line = {
         "running": _ok(f"running (pid {pid})"),
+        "not-ours": _warn(f"recycled pid-file (pid {pid} is alive but is a foreign, reused process)"),
         "stale": _warn(f"stale pid-file (pid {pid} is gone)"),
         "stopped": _dim("stopped"),
-    }[status]
+    }.get(status, _warn(f"{status} (pid {pid})"))
     print(f"daemon: {line}  for {coordinate}")
     print(_dim(f"  interval={dcfg.interval_s}s  due_soon={dcfg.due_soon_days}d  notifier={' '.join(dcfg.notifier)}"))
     print(_dim(f"  pidfile={paths.pid}"))

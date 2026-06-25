@@ -257,16 +257,39 @@ def test_run_loop_survives_backend_construction_failure(tmp_path, monkeypatch):
 # ── pid-file + liveness lifecycle ───────────────────────────────────────────────────
 
 
-def test_pid_status_stopped_running_stale(tmp_path):
+def test_pid_status_stopped_running_stale(tmp_path, monkeypatch):
     pid_path = tmp_path / "x.pid"
     assert daemon.pid_status(pid_path) == ("stopped", None)
 
+    # A live pid whose argv identifies as our daemon → "running". The pytest process isn't shaped
+    # like `task daemon run`, so make its cmdline read as the daemon (pid_status is identity-aware
+    # now — #32 — so a bare-liveness "running" requires a daemon-shaped argv).
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
     daemon._write_pid(pid_path, os.getpid())
     assert daemon.pid_status(pid_path) == ("running", os.getpid())
 
     daemon._write_pid(pid_path, 2**30)  # a pid that cannot be alive
     status, pid = daemon.pid_status(pid_path)
     assert status == "stale" and pid == 2**30
+
+
+def test_pid_status_recycled_foreign_pid_is_not_ours(tmp_path, monkeypatch):
+    # #32: a pid-file whose pid is ALIVE but is a recycled, FOREIGN process must read as "not-ours"
+    # in status/start too — mirroring stop's identity guard — not a bare-liveness "running".
+    pid_path = tmp_path / "x.pid"
+    daemon._write_pid(pid_path, os.getpid())  # alive…
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["some", "unrelated", "process"])  # …but foreign
+    assert daemon.pid_status(pid_path) == ("not-ours", os.getpid())
+
+
+def test_pid_status_unreadable_cmdline_stays_running(tmp_path, monkeypatch):
+    # an UNREADABLE cmdline (busybox ps / no /proc → IDENTITY_UNKNOWN) must NOT be called foreign:
+    # it stays "running" so status/start never mis-report (or double-spawn over) a real daemon whose
+    # argv just can't be read — the same reason stop preserves pre-guard signalling on UNKNOWN.
+    pid_path = tmp_path / "x.pid"
+    daemon._write_pid(pid_path, os.getpid())
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: None)  # can't read → UNKNOWN
+    assert daemon.pid_status(pid_path) == ("running", os.getpid())
 
 
 def test_read_pid_rejects_garbage(tmp_path):
@@ -307,11 +330,13 @@ def test_is_alive():
 
 
 def test_start_is_idempotent_when_already_running(tmp_path, monkeypatch):
-    # a live pid-file → start is a no-op (never double-spawns). We make the pid-file point at this
-    # live test process and assert _spawn_detached is NOT called.
+    # a live pid-file whose process IS our daemon → start is a no-op (never double-spawns). We point
+    # the pid-file at this live test process and make its cmdline read as the daemon (pid_status is
+    # identity-aware now), then assert _spawn_detached is NOT called.
     env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
     paths = daemon.paths_for("owner/repo", env=env)
     daemon._write_pid(paths.pid, os.getpid())
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
 
     spawned: list = []
     monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: spawned.append(1) or 999)
@@ -319,6 +344,37 @@ def test_start_is_idempotent_when_already_running(tmp_path, monkeypatch):
     assert outcome == "already-running"
     assert pid == os.getpid()
     assert spawned == []  # the guard prevented a second spawn
+
+
+def test_start_clears_recycled_foreign_pid_then_spawns(tmp_path, monkeypatch):
+    # #32: a pid-file pointing at a recycled FOREIGN pid must NOT be treated as already-running —
+    # start clears the misleading file and spawns a fresh daemon (consistent with the new status).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    daemon._write_pid(paths.pid, os.getpid())  # alive…
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["unrelated", "recycled", "process"])  # …foreign
+
+    # SAFETY: start must NEVER deliver a real signal to the foreign pid (that's stop's job, and even
+    # stop refuses) — it only stops trusting the pid-file. Spy on os.kill recording only REAL signals
+    # (sig != 0); the sig-0 liveness probe in is_alive must still pass through to the real kill.
+    signalled: list = []
+    real_kill = daemon.os.kill
+
+    def _spy_kill(p, sig):
+        if sig != 0:
+            signalled.append((p, sig))
+            return
+        return real_kill(p, sig)  # let the liveness probe work
+
+    monkeypatch.setattr(daemon.os, "kill", _spy_kill)
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: 5555)
+    outcome, pid = daemon.start("owner/repo", env=env)
+    assert outcome == "started"
+    assert pid == 5555
+    assert signalled == [], "start must not deliver a real signal to the recycled foreign pid"
+    # the misleading foreign pid-file was cleared (the spawned child writes its own in run_loop, which
+    # _spawn_detached is mocked away here — so the file is simply gone, not the old foreign pid).
+    assert daemon.read_pid(paths.pid) is None
 
 
 def test_start_clears_stale_then_spawns(tmp_path, monkeypatch):
@@ -397,6 +453,15 @@ def test_stop_not_running_clears_stale(tmp_path):
     outcome, _pid = daemon.stop("owner/repo", env=env)
     assert outcome == "not-running"
     assert daemon.read_pid(paths.pid) is None
+
+
+def test_stop_with_no_pid_file_is_not_running(tmp_path):
+    # #32 refactor guard: stop must handle a COMPLETELY ABSENT pid-file (status "stopped") without
+    # crashing — the identity reads are now reached only on the live-daemon paths, never on no-file.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    outcome, pid = daemon.stop("owner/repo", env=env)  # no _write_pid at all → no file on disk
+    assert outcome == "not-running"
+    assert pid is None
 
 
 # Spawn a sleeper ORPHANED to init (reaped by it), so when stop() kills it there is no zombie
