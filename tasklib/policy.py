@@ -57,6 +57,15 @@ ALL_GATES: tuple[str, ...] = (
 
 
 class Phase(str, Enum):
+    """The two enforcement edges `check()` runs at — and the ONLY values it is ever passed.
+
+    There is deliberately no third "check"/"edit" phase: the `task check` command toggles a
+    criterion in place (`cmd_check`) and never calls `check()`, and a non-closing `task change`
+    runs its own narrow edit gates (`_enforce_edit_or_die`), also not `check()`. So a gate run
+    unconditionally inside `check()` runs at exactly create AND close — the two edges — and
+    nowhere else.
+    """
+
     CREATE = "create"
     DONE = "done"
 
@@ -177,14 +186,16 @@ class PolicyResult:
 def check(ticket: Ticket, cfg: EnforceConfig, phase: Phase) -> PolicyResult:
     """Run all active gates for ``phase``, honoring per-gate escape hatches on the ticket."""
     raw: list[Violation] = []
-    raw.extend(_text_gates(ticket, cfg, phase))
-    # links + user-impact-quality are CREATE/edit rules (the impact and references are authored
-    # at creation, re-checked on edit) — they do NOT re-fire on the close transition, which has
-    # its own gates (every criterion checked-with-proof, the implementation screenshot).
-    if phase is Phase.CREATE:
-        v = links_violation(ticket, cfg)
-        if v is not None:
-            raw.append(v)
+    raw.extend(_text_gates(ticket, cfg))
+    # links + user-impact-quality are content rules enforced at BOTH create and close: a ticket
+    # must not be CREATED carrying a bare reference / thin impact, and must not be CLOSED carrying
+    # one either. Running them on the close transition catches a ticket that never passed create —
+    # one made before this version, or edited directly in the GitHub/Linear web UI — so it can't be
+    # closed with an un-linked HYP-789 or a "users"-thin impact. A genuine legacy exception is
+    # waived on the close command with --skip-links / --skip-user-impact-quality (both wired there).
+    v = links_violation(ticket, cfg)
+    if v is not None:
+        raw.append(v)
     raw.extend(_screenshot_gate(ticket, cfg, phase))
     if phase is Phase.DONE:
         v = unchecked_criteria_violation(ticket, cfg)
@@ -211,12 +222,14 @@ def apply_skips(raw: list[Violation], ticket: Ticket) -> PolicyResult:
     return result
 
 
-def _text_gates(ticket: Ticket, cfg: EnforceConfig, phase: Phase) -> list[Violation]:
+def _text_gates(ticket: Ticket, cfg: EnforceConfig) -> list[Violation]:
     """The structured-content gates: acceptance count, motivation, user-impact, cost-of-inaction.
 
-    The user-impact *quality* check (rule 5) only fires on CREATE — the impact is authored at
-    creation and re-checked on edit, so it isn't re-graded on close. The emptiness gates and the
-    ``>=2`` count run in every phase (a ticket can't be created OR closed without them).
+    All run in every phase — a ticket can't be created OR closed without them. The user-impact
+    *quality* check (rule 5) fires whenever the impact is non-empty, on create and on close alike,
+    so a ticket can't be closed carrying a thin/jargon-only impact it never had to justify at
+    create (e.g. one authored in the GitHub/Linear web UI). These gates are phase-agnostic, so the
+    helper takes no ``phase``.
     """
     out: list[Violation] = []
     if cfg.acceptance_criteria and len(ticket.acceptance) < cfg.acceptance_min:
@@ -232,7 +245,11 @@ def _text_gates(ticket: Ticket, cfg: EnforceConfig, phase: Phase) -> list[Violat
         out.append(Violation(GATE_MOTIVATION, "the Why (motivation) section is required", hint='add --why "..."'))
     if cfg.user_impact and not ticket.user_impact.strip():
         out.append(Violation(GATE_USER_IMPACT, "the User impact section is required", hint='add --impact "..."'))
-    elif phase is Phase.CREATE:
+    elif ticket.user_impact.strip():
+        # the impact is present → grade its quality, on every phase (create and close), so a
+        # thin/jargon-only impact can't slip through at either edge. Gated on a non-empty impact
+        # so disabling the emptiness gate (user_impact=False) with an empty impact is not then
+        # re-blocked here as "low quality" — an empty impact is empty, not thin.
         v = impact_quality_violation(ticket, cfg)
         if v is not None:
             out.append(v)
@@ -309,8 +326,9 @@ def links_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     return Violation(
         GATE_LINKS,
         f"related entities must be links, not bare references: {listed}",
-        hint='make each a markdown link [text](url) or paste a full URL; '
-        '--force "<reason>" / --skip-links "<reason>" for a false-positive match',
+        hint="make each a markdown link [text](url) or paste a full URL; waive a false positive "
+        'with --skip-links "<reason>" (works on new and on close; --force "<reason>" is a '
+        "create/new-only shorthand)",
     )
 
 
@@ -326,8 +344,9 @@ def impact_quality_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | 
     return Violation(
         GATE_USER_IMPACT_QUALITY,
         "user impact is not plain-language/user-framed: " + problems[0],
-        hint='rewrite --impact in the user\'s terms; '
-        '--force "<reason>" / --skip-user-impact-quality "<reason>" if truly N/A',
+        hint="rewrite the impact in the user's terms (--impact on new, `task change --impact` on "
+        'an existing ticket); waive with --skip-user-impact-quality "<reason>" (works on new and '
+        'on close; --force "<reason>" is a create/new-only shorthand) if truly N/A',
     )
 
 

@@ -185,13 +185,18 @@ is and isn't done.
 ### Upgrading to 0.6.0 — the close gates are stricter
 
 0.6.0 adds the **every-criterion-checked-with-proof** close gate (`acceptance-checked`, a
-*hard* refuse) and the **≥2 criteria** rule, and both run on `done`. A ticket created before
-0.6.0 — open with unchecked or proof-less `- [ ]` criteria, or with a single criterion —
-therefore cannot be closed as-is: run `task check <id> <selector> --proof <path>` for each
-criterion (use `--force "<reason>"` when a proof is genuinely impossible), and add a second
-criterion if it has only one. If you need to close a batch of legacy tickets without that
-migration, disable the gate per repo in `enforce:` (`acceptance_checked: false`,
-`acceptance_min: 1`) rather than fighting it ticket-by-ticket.
+*hard* refuse) and the **≥2 criteria** rule, and both run on `done`. The **links** and
+**plain-language user-impact** gates also run on close now (not only create), so a ticket that
+never passed the new create gates — one opened before 0.6.0, or edited directly in the
+GitHub/Linear web UI — is caught at the close boundary too. A pre-0.6.0 ticket therefore cannot
+be closed as-is when it has unchecked / proof-less `- [ ]` criteria, fewer than two criteria, a
+bare reference (`HYP-789`), or a thin impact: run `task check <id> <selector> --proof <path>` for
+each criterion (use `--force "<reason>"` when a proof is genuinely impossible), add a second
+criterion if it has only one, and link the references / rewrite the impact — or waive a genuine
+legacy exception on the close command itself with `--skip-links` / `--skip-user-impact-quality`
+`"<reason>"`. If you need to close a batch of legacy tickets without that migration, disable the
+gates per repo in `enforce:` (`acceptance_checked: false`, `acceptance_min: 1`, `links: false`,
+`user_impact_quality: false`) rather than fighting it ticket-by-ticket.
 
 ## The ticket body template
 

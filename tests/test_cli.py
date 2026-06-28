@@ -220,6 +220,55 @@ def test_done_persists_skip_justification(_inject_fake):
     assert "## Skipped gates" in body and "config-only change, no UI" in body
 
 
+def test_done_skip_links_waives_the_close_phase_links_gate(capsys, _inject_fake):
+    # the close-command --skip-links flag is wired and waives the now-active close-phase links
+    # gate: a close-ready ticket carrying a bare reference (e.g. one edited in the web UI) closes
+    # with a recorded reason instead of being stuck. Inject the bare ref into the stored ticket to
+    # simulate a body that never passed the create gate.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    _inject_fake.get("#1").what = "regressed by HYP-789"  # a bare ref the create gate never saw
+    capsys.readouterr()
+    # without the skip, the close is refused on links
+    assert main(["done", "#1"]) == 2
+    assert "links" in capsys.readouterr().out
+    # with --skip-links on the close command, it closes and records the waiver in the body
+    rc = main(["done", "#1", "--skip-links", "legacy ref edited in the GitHub UI"])
+    assert rc == 0
+    from tasklib.render import render
+
+    t = _inject_fake.get("#1")
+    assert t.state.value == "done"
+    assert "## Skipped gates" in render(t) and "legacy ref edited in the GitHub UI" in render(t)
+
+
+def test_done_skip_user_impact_quality_waives_the_close_phase_quality_gate(capsys, _inject_fake):
+    # symmetric to the links case: the close-command --skip-user-impact-quality flag is wired and
+    # waives the now-active close-phase quality gate, so a close-ready ticket whose impact was
+    # thinned (e.g. edited in the web UI) closes with a recorded reason instead of being stuck.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    _inject_fake.get("#1").user_impact = "users"  # a thin impact the create gate never graded
+    capsys.readouterr()
+    assert main(["done", "#1"]) == 2
+    assert "user-impact-quality" in capsys.readouterr().out
+    rc = main(["done", "#1", "--skip-user-impact-quality", "internal tool, no end user"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_create_force_links_waiver_persists_through_close(capsys, _inject_fake):
+    # the documented migration: a bare reference waived at create with --force is recorded in the
+    # body's Skipped gates, so the ticket closes WITHOUT re-specifying the skip — the close-phase
+    # links gate honors the persisted waiver via the render/parse round-trip.
+    main(_create_argv() + ["--what", "follow-up to HYP-789", "--force", "legacy ref, pre-link era"])
+    _ready_to_close(_inject_fake)
+    capsys.readouterr()
+    rc = main(["done", "#1"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
+
+
 def test_done_on_unknown_id_is_clean_error_not_traceback(capsys, _inject_fake):
     # a backend lookup miss surfaces as a clean `error:` (exit 2), never a traceback.
     rc = main(["done", "#999"])

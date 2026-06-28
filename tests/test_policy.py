@@ -196,8 +196,42 @@ def test_linked_reference_passes():
     assert check_create(_good_ticket(what="blocked by [HYP-789](https://linear/HYP-789)"), EnforceConfig()).ok
 
 
+def test_clean_linked_ticket_closes_after_gate_expansion():
+    # the close gates now include links + impact-quality; a close-ready ticket with a PROPERLY
+    # linked reference and a good impact must still close cleanly (no over-blocking of valid closes).
+    t = _good_ticket(
+        what="follows up [HYP-789](https://linear/HYP-789)",
+        acceptance=_checked_criteria(),
+    )
+    assert check_done(t, EnforceConfig()).ok
+
+
+def test_unlinked_reference_blocks_close_too():
+    # rule 1 also gates the close: a close-ready ticket carrying a bare reference (e.g. one made
+    # before this version or edited in the web UI) cannot be closed without linking it / skipping.
+    t = _good_ticket(what="blocked by HYP-789", acceptance=_checked_criteria())
+    res = check_done(t, EnforceConfig())
+    assert any(v.gate == "links" for v in res.violations)
+    # the close command's --skip-links waives a genuine legacy exception
+    t.skips = {"links": "legacy ticket, reference predates the rule"}
+    assert check_done(t, EnforceConfig()).ok
+
+
 def test_links_gate_disabled_in_config():
     assert check_create(_good_ticket(what="see HYP-789"), EnforceConfig(links=False)).ok
+
+
+def test_links_and_quality_gates_disabled_in_config_on_close():
+    # disabling a gate in config must lift it on BOTH edges, not only create — a closing ticket
+    # with a bare ref / thin impact passes when the respective gate is off.
+    assert check_done(
+        _good_ticket(what="see HYP-789", acceptance=_checked_criteria()),
+        EnforceConfig(links=False),
+    ).ok
+    assert check_done(
+        _good_ticket(user_impact="users", acceptance=_checked_criteria()),
+        EnforceConfig(user_impact_quality=False),
+    ).ok
 
 
 # ── rule 5: plain-language user impact ───────────────────────────────────────────────
@@ -221,6 +255,25 @@ def test_empty_impact_is_the_emptiness_gate_not_quality():
     res = check_create(_good_ticket(user_impact=""), EnforceConfig())
     gates = {v.gate for v in res.violations}
     assert "user-impact" in gates and "user-impact-quality" not in gates
+
+
+def test_thin_impact_blocks_close_too():
+    # rule 5 also gates the close: a close-ready ticket whose impact was never plain-language
+    # (thinned, or authored in the web UI) cannot be closed without rewriting it / skipping.
+    t = _good_ticket(user_impact="users", acceptance=_checked_criteria())
+    res = check_done(t, EnforceConfig())
+    assert any(v.gate == "user-impact-quality" for v in res.violations)
+    # the close command's --skip-user-impact-quality waives a genuine legacy exception
+    t.skips = {"user-impact-quality": "legacy ticket, impact predates the rule"}
+    assert check_done(t, EnforceConfig()).ok
+
+
+def test_empty_impact_with_emptiness_gate_off_is_not_blocked_as_low_quality():
+    # disabling the emptiness gate (user_impact=False) with an EMPTY impact must not then be
+    # re-blocked by the quality gate — an empty impact is empty, not thin/jargon-only.
+    cfg = EnforceConfig(user_impact=False, user_impact_quality=True)
+    res = check_create(_good_ticket(user_impact=""), cfg)
+    assert not any(v.gate in {"user-impact", "user-impact-quality"} for v in res.violations)
 
 
 # ── rule 2: a ticket cannot close with an unchecked criterion ─────────────────────────
