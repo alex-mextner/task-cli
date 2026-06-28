@@ -37,7 +37,9 @@ def _create_argv():
     """A complete ticket (passes every create gate) → creates #1 in the current session."""
     return [
         "create", "--title", "Add a thing", "--what", "the change", "--why", "because",
-        "--impact", "users", "--if-not-done", "pain", "--acceptance", "it works",
+        "--impact",
+        "Users on the dashboard can finally see their report load, so they no longer give up",
+        "--if-not-done", "pain", "--acceptance", "it works", "--acceptance", "it also handles empties",
     ]
 
 

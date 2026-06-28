@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from .model import Screenshot, Ticket
+from .model import Criterion, Screenshot, Ticket
 
 # Fixed section order — the contract. Changing this is a breaking change to the template.
 SECTIONS: tuple[str, ...] = (
@@ -42,7 +42,7 @@ def render(ticket: Ticket) -> str:
     out.append(f"## User impact\n{ticket.user_impact.strip()}")
     out.append(f"## Cost of inaction\n{ticket.cost_of_inaction.strip()}")
 
-    acc = "\n".join(ticket.acceptance_checkboxes()) if ticket.acceptance else "- [ ] (none specified)"
+    acc = "\n".join(_render_criterion(c) for c in ticket.acceptance) if ticket.acceptance else "- [ ] (none specified)"
     out.append(f"## Acceptance criteria\n{acc}")
 
     if ticket.screenshots:
@@ -62,6 +62,19 @@ def render(ticket: Ticket) -> str:
         out.append(f"## {_SKIP_MARKER}\n{lines}")
 
     return "\n\n".join(out) + "\n"
+
+
+def _render_criterion(c: Criterion) -> str:
+    """One acceptance-criterion checkbox line. A checked criterion carries its visual proof
+    (``— proof: ![proof](ref)``) or, when forced, the recorded reason (``— forced: <reason>``)."""
+    box = "x" if c.checked else " "
+    line = f"- [{box}] {c.text}"
+    if c.checked:
+        if c.proof:
+            line += f" — proof: ![proof]({c.proof})"
+        elif c.force_reason:
+            line += f" — forced: {c.force_reason}"
+    return line
 
 
 def _render_shot(shot: Screenshot) -> str:
@@ -107,7 +120,7 @@ def parse(body: str, ticket: Ticket | None = None) -> Ticket:
     base = ticket or Ticket()
     sec = split_sections(body)
 
-    acceptance = _parse_acceptance(sec.get("Acceptance criteria", ""))
+    acceptance = _parse_criteria(sec.get("Acceptance criteria", ""))
     screenshots = _parse_screenshots(sec.get("Screenshots", ""))
     links = _parse_links(sec.get("Links", ""))
     skips = _parse_skips(sec.get(_SKIP_MARKER, ""))
@@ -131,15 +144,47 @@ def parse(body: str, ticket: Ticket | None = None) -> Ticket:
     )
 
 
-def _parse_acceptance(text: str) -> list[str]:
-    items: list[str] = []
+_CRITERION_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s*(.+?)\s*$")
+
+
+def _parse_criteria(text: str) -> list[Criterion]:
+    """Parse the Acceptance-criteria checkbox lines back into Criterion objects (round-trip).
+
+    Reads the checkbox state (``[x]``/``[ ]``) and pulls the trailing proof/forced marker off
+    the criterion text so a checked-with-proof criterion survives a render→parse round-trip.
+    """
+    items: list[Criterion] = []
     for line in text.splitlines():
-        m = re.match(r"^\s*-\s*\[[ xX]\]\s*(.+?)\s*$", line)
-        if m:
-            item = m.group(1).strip()
-            if item and item.lower() != "(none specified)":
-                items.append(item)
+        m = _CRITERION_RE.match(line)
+        if not m:
+            continue
+        checked = m.group(1).lower() == "x"
+        crit_text, proof, force_reason = _split_criterion_rest(m.group(2).strip())
+        if crit_text and crit_text.lower() != "(none specified)":
+            items.append(Criterion(text=crit_text, checked=checked, proof=proof, force_reason=force_reason))
     return items
+
+
+def _split_criterion_rest(rest: str) -> tuple[str, str, str]:
+    """Split a criterion's text from its trailing ``— proof: …`` / ``— forced: …`` marker.
+
+    Returns ``(text, proof_ref, force_reason)``. Anchored on the specific ``— proof:`` /
+    ``— forced:`` markers (unlikely in a normal criterion), so ordinary em-dashes in the text
+    are left alone. The proof capture is GREEDY to the trailing ``)`` so a path/URL that itself
+    contains parens (e.g. ``img(1).png``) round-trips intact instead of truncating at the first
+    ``)`` and falling through to the bare branch (which would re-capture the whole ``![…](…)``
+    wrapper and progressively double-wrap on the next render).
+    """
+    m = re.search(r"\s+—\s+proof:\s*!\[[^\]]*\]\((.+)\)\s*$", rest)
+    if m:
+        return rest[: m.start()].strip(), m.group(1).strip(), ""
+    m = re.search(r"\s+—\s+proof:\s*(\S.*?)\s*$", rest)
+    if m:
+        return rest[: m.start()].strip(), m.group(1).strip(), ""
+    m = re.search(r"\s+—\s+forced:\s*(\S.*?)\s*$", rest)
+    if m:
+        return rest[: m.start()].strip(), "", m.group(1).strip()
+    return rest, "", ""
 
 
 def _parse_screenshots(text: str) -> list[Screenshot]:

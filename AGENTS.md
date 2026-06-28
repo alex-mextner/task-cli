@@ -32,10 +32,21 @@ cheap message classification and is wired into a `tg-cli` inbound hook.
   live in `bin/task` → `tasklib/cli.py`.
 - **Enforcement is the point.** The gates (`policy.py`) run on `create` and again on
   `change`→`done`. Each gate is (a) disable-able per repo via `enforce:` config and (b)
-  skippable with a **recorded, auditable** justification (`--skip-<gate> "<reason>"` → written
-  into the ticket's `Skipped gates` section). The on-done screenshot gate demands the
-  *implementation* proof specifically — a creation shot does not let you close a UI ticket.
-  Never weaken a gate silently; if a gate is wrong, change `policy.py` + add a test.
+  skippable with a **recorded, auditable** justification (`--skip-<gate> "<reason>"`, or
+  `--force "<reason>"` on `create`/`new` for the links + user-impact-quality gates → both
+  written into the ticket's `Skipped gates` section). The content gates also enforce: **≥2
+  acceptance criteria** (`acceptance_min`), a **plain-language, user-framed** user-impact
+  (`quality.py`, the `user-impact-quality` gate), and **links not bare tokens** — any tracker
+  id / `#ref` / commit SHA / repo-path named in the text must be a markdown link or full URL
+  (`references.py`, the `links` gate). The on-done screenshot gate demands the *implementation*
+  proof specifically — a creation shot does not let you close a UI ticket. **Two on-done gates
+  are special:** a ticket cannot close while any acceptance criterion is **unchecked**
+  (`acceptance-checked`) and that gate is a **hard refuse — non-skippable** (see
+  `NON_SKIPPABLE_GATES`); and a checkbox is ticked only via `task check <id> <selector>
+  --proof <path>`, which requires a **visual proof** (or `--force "<reason>"` when a proof is
+  genuinely impossible, recorded on the `Criterion`). Acceptance criteria are `Criterion`
+  objects (text + `checked` + `proof`/`force_reason`), round-tripped by `render.py`. Never
+  weaken a gate silently; if a gate is wrong, change `policy.py` + add a test.
 - **`render.py` is the single source of truth for the ticket body.** The §5 section template
   (fixed order) is the contract; fields are authoritative, the body is derived. Do not
   hand-format a body anywhere else. `validate_format()` is what the formatting gate calls.

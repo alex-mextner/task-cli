@@ -40,7 +40,7 @@ def test_get_round_trips_body(fake_backend):
     created = fake_backend.create(_ticket())
     fetched = fake_backend.get(created.id)
     assert fetched.what == "do the thing"
-    assert fetched.acceptance == ["works"]
+    assert [c.text for c in fetched.acceptance] == ["works"]
 
 
 def test_update_changes_state(fake_backend):
