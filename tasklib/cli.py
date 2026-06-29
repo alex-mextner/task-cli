@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .model import Screenshot, State, Ticket
+from .model import Criterion, Screenshot, State, Ticket
 from .transitions import TransitionError, validate_transition
 
 # ── tiny output helpers (no color dep; honor NO_COLOR) ──────────────────────────────
@@ -58,9 +58,11 @@ _SKIP_FLAGS = (
     ("--skip-acceptance", "acceptance-criteria"),
     ("--skip-motivation", "motivation"),
     ("--skip-user-impact", "user-impact"),
+    ("--skip-user-impact-quality", "user-impact-quality"),
     ("--skip-cost-of-inaction", "cost-of-inaction"),
     ("--skip-screenshots", "screenshots"),
     ("--skip-formatting", "formatting"),
+    ("--skip-links", "links"),
 )
 
 
@@ -83,6 +85,13 @@ def _add_create_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--label", action="append", default=[], help="label (repeatable)")
     p.add_argument("--due", metavar="YYYY-MM-DD", help="due date (the daemon reminds before/at it)")
     p.add_argument("--yes", action="store_true", help="non-interactive; do not prompt")
+    p.add_argument(
+        "--force",
+        dest="force_reason",
+        metavar="REASON",
+        help="override the links / user-impact-quality gates with a recorded reason "
+        "(a false-positive link match, or a genuinely-N/A impact)",
+    )
     _add_skip_flags(p)
 
 
@@ -175,6 +184,21 @@ def build_parser() -> argparse.ArgumentParser:
     dnp.add_argument("--force", action="store_true", help="override the legal-transition check (re-close a cancelled/done ticket)")
     _add_skip_flags(dnp)
 
+    # check — tick an acceptance criterion off, with the visual proof the box demands
+    ckp = sub.add_parser("check", parents=[common], help="check an acceptance criterion (requires a visual proof)")
+    ckp.add_argument("id", help="ticket id (#123 or HYP-456)")
+    ckp.add_argument("selector", help="which criterion: a 1-based index, or a text substring")
+    ckp.add_argument(
+        "--proof", action="append", default=[], metavar="PATH", help="visual proof (screenshot/image) for this criterion (repeatable)"
+    )
+    ckp.add_argument("--screenshot", action="append", default=[], dest="proof", help="alias of --proof")
+    ckp.add_argument(
+        "--force",
+        dest="force_reason",
+        metavar="REASON",
+        help="check WITHOUT a visual proof, recording why one is impossible/impractical",
+    )
+
     # classify
     clp = sub.add_parser("classify", parents=[common], help="classify a message change|justAsk (the tg hook entry)")
     clp.add_argument("text", help="the message text")
@@ -217,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         "change": cmd_change,
         "status": cmd_status,
         "done": cmd_done,
+        "check": cmd_check,
         "classify": cmd_classify,
         "session": cmd_session,
         "install-skill": cmd_install_skill,
@@ -560,16 +585,70 @@ def _enforce_or_die(ticket: Ticket, cfg, phase) -> None:
     from .policy import Phase, check
 
     result = check(ticket, _enforce_config(cfg), phase)
+    _report_and_die(result, "create" if phase is Phase.CREATE else "close")
+
+
+def _report_and_die(result, label: str) -> None:
+    """Print the skipped/violation summary for a PolicyResult and refuse if any gate is unmet."""
     if result.skipped:
         print(_warn(f"  skipped gates (justified): {', '.join(result.skipped)}"))
     if not result.ok:
-        label = "create" if phase is Phase.CREATE else "close"
         print(_err(f"refusing to {label}: {len(result.violations)} gate(s) unmet"))
         for v in result.violations:
             print(_err(f"  ✗ {v.gate}: {v.message}"))
             if v.hint:
                 print(_dim(f"      → {v.hint}  (or --skip-{v.gate} \"<reason>\")"))
         raise _UserError("policy gates not satisfied")
+
+
+def _apply_force(ticket: Ticket, cfg, phase, reason: str | None, forceable: set[str]) -> None:
+    """Record ``reason`` as the skip justification for whichever ``forceable`` gates actually fire.
+
+    This is how ``--force "<reason>"`` overrides the new content gates (links / user-impact-
+    quality): the reason is written onto the ticket's ``skips``, so it lands — audited — in the
+    body's ``Skipped gates`` section, exactly like ``--skip-<gate>``. Only gates that genuinely
+    fail are recorded, so a force never pollutes the audit trail with gates that passed.
+    """
+    if not reason:
+        return
+    from .policy import check
+
+    for v in check(ticket, _enforce_config(cfg), phase).violations:
+        if v.gate in forceable:
+            ticket.skips.setdefault(v.gate, reason)
+
+
+def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact: bool) -> None:
+    """The edit-time gates (rule 1 links, and rule 5 impact-quality when impact was touched).
+
+    A plain ``change`` (not a close) doesn't re-run the full create gates — an edit may be a
+    partial step. The links rule runs only when the edit TOUCHED a scanned text field, so a
+    metadata-only edit (``--due``/``--label``) on a ticket whose body (e.g. one created in the
+    GitHub/Linear web UI) already carries a bare reference is never blocked. The impact-quality
+    rule runs only when the edit sets/changes the impact.
+
+    Note the links scan is a FULL re-scan of the ticket text, not only the changed field: a
+    clean ``--title`` edit on a ticket that already carries a bare reference in another section
+    (e.g. ``why``) is blocked on that pre-existing reference — deliberately, as a nudge to fix
+    it. On this edit path the waiver is ``--skip-links``/``--skip-user-impact-quality`` (the
+    ``--force "<reason>"`` shortcut is a create/new-only flag — on ``change`` ``--force`` is the
+    boolean transition-legality override, not a reason). Only a metadata-only edit, which
+    touches no scanned field, is exempt.
+    """
+    from .policy import apply_skips, impact_quality_violation, links_violation
+
+    cfg_e = _enforce_config(cfg)
+    raw = []
+    if check_links:
+        v = links_violation(ticket, cfg_e)
+        if v is not None:
+            raw.append(v)
+    if check_impact:
+        v = impact_quality_violation(ticket, cfg_e)
+        if v is not None:
+            raw.append(v)
+    if raw:
+        _report_and_die(apply_skips(raw, ticket), "update")
 
 
 def _attach_screenshots(backend, ticket_id: str, screenshots) -> None:
@@ -629,8 +708,9 @@ def cmd_create(args: argparse.Namespace) -> int:
         due=due,
     )
 
-    from .policy import Phase
+    from .policy import GATE_LINKS, GATE_USER_IMPACT_QUALITY, Phase
 
+    _apply_force(ticket, cfg, Phase.CREATE, getattr(args, "force_reason", None), {GATE_LINKS, GATE_USER_IMPACT_QUALITY})
     _enforce_or_die(ticket, cfg, Phase.CREATE)
 
     backend = _backend(cfg)
@@ -1076,9 +1156,11 @@ def cmd_change(args: argparse.Namespace) -> int:
         ticket.user_impact = args.impact
     if args.if_not_done:
         ticket.cost_of_inaction = args.if_not_done
+    existing_texts = {c.text for c in ticket.acceptance}
     for crit in args.acceptance:
-        if crit not in ticket.acceptance:
-            ticket.acceptance.append(crit)
+        if crit not in existing_texts:
+            ticket.acceptance.append(Criterion(text=crit))
+            existing_texts.add(crit)
     if getattr(args, "due", None) is not None:
         # --due passed (incl. --due "" to clear): validate then set. Not passed → leave as-is.
         ticket.due = _normalize_due(args.due)
@@ -1089,11 +1171,24 @@ def cmd_change(args: argparse.Namespace) -> int:
             ticket.labels.append(label)
     ticket.skips.update(_collect_skips(args))
 
+    # An edit that TOUCHES a text field is re-scanned for bare references (rule 1) and re-graded
+    # on impact quality (rule 5) — whether or not this same command ALSO closes the ticket, so
+    # `change --what "…HYP-789…" --done` cannot smuggle a bare reference (or a thinned impact)
+    # past the edit gates on its way to DONE. The scan is conservative (it re-validates the whole
+    # body, not only the new bytes); a pure metadata edit (--due/--label) touches no scanned
+    # field and is exempt entirely (see _enforce_edit_or_die).
+    touched_text = any(
+        [args.title, args.what, args.why, args.impact, args.if_not_done, args.acceptance]
+    )
+    _enforce_edit_or_die(ticket, cfg, check_links=touched_text, check_impact=bool(args.impact))
+
     if args.done:
-        ticket.state = State.DONE
         from .policy import Phase
 
+        # enforce the close gates BEFORE the state flip so a refusal doesn't dirty the fetched
+        # ticket (#10).
         _enforce_or_die(ticket, cfg, Phase.DONE)
+        ticket.state = State.DONE
 
     try:
         updated = backend.update(ticket)
@@ -1136,18 +1231,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     # ticket can't be silently revived and a same-state re-write is rejected (#10).
     validate_transition(ticket.state, new_state, force=args.force)
     ticket.skips.update(skips)
-    ticket.state = new_state
     try:
         if new_state is State.DONE:
             from .policy import Phase
 
+            # enforce BEFORE the state flip so a refusal doesn't dirty the fetched ticket (#10).
             _enforce_or_die(ticket, cfg, Phase.DONE)
+            ticket.state = new_state
             # persist the MUTATED ticket (carries the recorded skip justifications) — using
             # transition() here would re-fetch and drop ticket.skips, silently losing the
             # audit section a gate was waived under. update() writes the body with the skips.
             updated = backend.update(ticket)
         elif skips:
             # a skip recorded on a non-done transition is still an auditable decision → persist.
+            ticket.state = new_state
             updated = backend.update(ticket)
         else:
             updated = backend.transition(args.id, new_state)
@@ -1180,8 +1277,10 @@ def cmd_done(args: argparse.Namespace) -> int:
     new_shots = [Screenshot(ref=path, kind="implementation") for path in args.screenshot]
     ticket.screenshots.extend(new_shots)
     ticket.skips.update(_collect_skips(args))
-    ticket.state = State.DONE
+    # enforce BEFORE mutating state (the DONE phase is passed explicitly, not read off the
+    # ticket), so a gate refusal leaves the fetched ticket undirtied — same rule as #10.
     _enforce_or_die(ticket, cfg, Phase.DONE)
+    ticket.state = State.DONE
 
     try:
         updated = backend.update(ticket)
@@ -1194,6 +1293,76 @@ def cmd_done(args: argparse.Namespace) -> int:
     log_event("ticket.transition", ticket_id=updated.id, state=State.DONE.value)
     print(_ok(f"{updated.id} → {State.DONE.value}"))
     return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Check an acceptance criterion off — but only WITH a visual proof (rule 3).
+
+    A checkbox cannot be ticked without a screenshot/image backing it (``--proof <path>``).
+    When a visual proof is genuinely impossible, ``--force "<reason>"`` records the reason on
+    the criterion (audited). The checked state + proof live in the body, so the on-done gate
+    (rule 2) can refuse a close while any criterion is still unchecked.
+    """
+    cfg = _load(args)
+    backend = _backend_for_id(cfg, args.id)
+    from .backends import BackendError
+
+    try:
+        ticket = backend.get(args.id)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    crit = _select_criterion(ticket, args.selector)
+    proofs = list(args.proof or [])
+    force_reason = getattr(args, "force_reason", None)
+    if not proofs and not force_reason:
+        raise _UserError(
+            f"refusing to check {crit.text!r}: a visual proof is required.\n"
+            "  why: a criterion is only 'done' when there's a screenshot/image proving it.\n"
+            '  fix: task check <id> <selector> --proof <path>   (or --force "<reason>" if a '
+            "proof is genuinely impossible)."
+        )
+
+    crit.checked = True
+    if proofs:
+        crit.proof = proofs[0]
+        crit.force_reason = ""
+    else:
+        crit.proof = ""
+        crit.force_reason = force_reason or ""
+
+    try:
+        updated = backend.update(ticket)
+        _attach_screenshots(backend, updated.id, [Screenshot(ref=p, kind="implementation") for p in proofs])
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    from .logging import log_event
+
+    log_event("criterion.checked", ticket_id=updated.id, forced=bool(force_reason and not proofs))
+    proof_note = f"proof {proofs[0]}" if proofs else f"forced ({force_reason})"
+    remaining = len(updated.unchecked_criteria())
+    print(_ok(f"checked {crit.text!r} on {updated.id}  ({proof_note}; {remaining} left)"))
+    return 0
+
+
+def _select_criterion(ticket: Ticket, selector: str) -> Criterion:
+    """Resolve a criterion by 1-based index or by a unique text substring; raise on miss/ambiguity."""
+    crits = ticket.acceptance
+    if not crits:
+        raise _UserError(f"ticket {ticket.id or '(unknown)'} has no acceptance criteria to check")
+    sel = selector.strip()
+    if sel.isdigit():
+        idx = int(sel)
+        if not 1 <= idx <= len(crits):
+            raise _UserError(f"criterion index {idx} out of range (1..{len(crits)})")
+        return crits[idx - 1]
+    matches = [c for c in crits if sel.lower() in c.text.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise _UserError(f"no acceptance criterion matches {selector!r}; use an index (1..{len(crits)})")
+    raise _UserError(f"{len(matches)} criteria match {selector!r}; use an index (1..{len(crits)}) to disambiguate")
 
 
 def cmd_classify(args: argparse.Namespace) -> int:
@@ -1262,7 +1431,7 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
         why="(auto-created from an inbound message; needs triage)",
         user_impact="(needs triage)",
         cost_of_inaction="(needs triage)",
-        acceptance=["triage this request and fill in the criteria"],
+        acceptance=[Criterion(text="triage this request and fill in the criteria")],
         labels=list(dict.fromkeys([*cfg.section("github").get("default_labels", []), session.label, "needs-triage"])),
         links={"Session": session.label},
     )

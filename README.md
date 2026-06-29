@@ -39,14 +39,15 @@ linear auth        # Linear (per-repo, via the rig.yaml task: block)
 ## Commands
 
 ```
-task new      --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..." [--due YYYY-MM-DD]
-task create                        # alias of `new` (same arguments, same gates)
+task new --title "..." --why "..." --impact "..." --if-not-done "..." --acceptance "..." --acceptance "..." [--due YYYY-MM-DD]
+task create                        # alias of `new` (same arguments, same gates)  [--force "<reason>"]
 task list                          # THIS session's tickets (falls back to all when empty)
 task list --all                    # every known project's tickets, grouped by project
 task gantt        [--all] [--json] # read-only due-date timeline (Gantt) — see below
 task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
 task find "<query>"                # search title+body (cross-project when outside a repo)
-task done <id>    [--screenshot p] # close a ticket — runs the on-done gates
+task check <id> <n|text> --proof p # tick an acceptance criterion (needs a visual proof)
+task done <id>    [--screenshot p] # close a ticket — runs the on-done gates (all criteria checked)
 task change <id>  [--due ...] [--done]  # update; --due sets/clears the due date; --done closes (gates)
 task status <id> [<new-state>]     # read or transition state (works outside a repo)
 #   close/transition verbs validate legality first: a cancelled ticket is a dead-end and a
@@ -128,25 +129,74 @@ the exact flag (or escape hatch) to satisfy it.
 
 On `create`, and again on `change`→`done`:
 
-1. **Acceptance criteria** — ≥1, rendered as a checkbox list. Required.
+1. **Acceptance criteria** — **≥2**, rendered as a checkbox list. A real ticket has more than
+   one provable outcome.
 2. **Motivation / User impact / Cost of inaction** — three required, non-empty sections.
-3. **Screenshots** — required at *creation* and at *done* for UI/visual tickets (label-gated,
+3. **Plain-language user impact** — the User-impact section must be written for someone only
+   weakly familiar with the product, in their world's terms (their tasks/goals/what they see),
+   not in implementation/jargon terms. A one-word or jargon-only impact is rejected with
+   guidance.
+4. **Related entities are links** — anything that names another entity (a tracker id like
+   `HYP-789`, an issue/PR `#123`, a commit SHA, a repo/path slug) must be a proper **link**
+   (markdown link / full URL), not a bare token. The scan is broad; `--force "<reason>"`
+   overrides a genuine false positive.
+5. **Screenshots** — required at *creation* and at *done* for UI/visual tickets (label-gated,
    configurable). The on-done gate demands the **implementation** proof specifically — a
    creation mock does not let you close a UI ticket. That is why the gate runs twice.
-4. **Formatting** — the body must match the fixed section template (`render.py` validates).
+6. **Formatting** — the body must match the fixed section template (`render.py` validates).
 
-Every gate has an **escape hatch**: `--skip-<gate> "<reason>"` writes the justification into
-the ticket's `Skipped gates` section (auditable, recorded forever). Gates are also disable-able
-per repo via `enforce:` in config.
+On `change`→`done` (close) two more gates apply:
+
+7. **Every criterion checked** — a ticket cannot close while any acceptance-criterion checkbox
+   is unchecked. This gate is a **hard** refuse — no escape hatch waives it (only disabling it
+   in config does).
+8. **Each check carries a visual proof** — a checkbox is ticked with `task check <id>
+   <selector> --proof <path>` and that requires a screenshot/image. When a proof is genuinely
+   impossible, `task check … --force "<reason>"` records the reason on the criterion (audited).
+
+Every gate (except *every-criterion-checked*) has an **escape hatch**: `--skip-<gate>
+"<reason>"` (or `--force "<reason>"` on `create`/`new` for the links / user-impact-quality
+gates) writes the justification into the ticket's `Skipped gates` section (auditable, recorded
+forever). Gates are also disable-able per repo via `enforce:` in config.
 
 | gate | flag to satisfy | escape hatch |
 | --- | --- | --- |
-| acceptance-criteria | `--acceptance "..."` (repeatable) | `--skip-acceptance "<reason>"` |
+| acceptance-criteria (≥2) | `--acceptance "..."` (≥2, repeatable) | `--skip-acceptance "<reason>"` |
 | motivation | `--why "..."` | `--skip-motivation "<reason>"` |
 | user-impact | `--impact "..."` | `--skip-user-impact "<reason>"` |
+| user-impact-quality | `--impact "<plain-language, user-framed>"` | `--skip-user-impact-quality "<reason>"` (or `--force "<reason>"` on create/new) |
 | cost-of-inaction | `--if-not-done "..."` | `--skip-cost-of-inaction "<reason>"` |
+| links | make each reference a link / full URL | `--skip-links "<reason>"` (or `--force "<reason>"` on create/new) |
 | screenshots | `--screenshot <path>` | `--skip-screenshots "<reason>"` |
 | formatting | (automatic — body is rendered) | `--skip-formatting "<reason>"` |
+| acceptance-checked (close) | `task check <id> <n> --proof <path>` for each | **none** (hard; disable in config only) |
+
+### Checking criteria off — `task check`
+
+```
+task check <id> <selector> --proof <path>     # tick a criterion WITH its visual proof
+task check <id> <selector> --force "<reason>"  # tick it when a proof is genuinely impossible
+```
+
+`<selector>` is a 1-based index or a text substring of the criterion. The checked state and
+the proof live in the body (`- [x] … — proof: ![proof](path)`), so the close gate can see what
+is and isn't done.
+
+### Upgrading to 0.6.0 — the close gates are stricter
+
+0.6.0 adds the **every-criterion-checked-with-proof** close gate (`acceptance-checked`, a
+*hard* refuse) and the **≥2 criteria** rule, and both run on `done`. The **links** and
+**plain-language user-impact** gates also run on close now (not only create), so a ticket that
+never passed the new create gates — one opened before 0.6.0, or edited directly in the
+GitHub/Linear web UI — is caught at the close boundary too. A pre-0.6.0 ticket therefore cannot
+be closed as-is when it has unchecked / proof-less `- [ ]` criteria, fewer than two criteria, a
+bare reference (`HYP-789`), or a thin impact: run `task check <id> <selector> --proof <path>` for
+each criterion (use `--force "<reason>"` when a proof is genuinely impossible), add a second
+criterion if it has only one, and link the references / rewrite the impact — or waive a genuine
+legacy exception on the close command itself with `--skip-links` / `--skip-user-impact-quality`
+`"<reason>"`. If you need to close a batch of legacy tickets without that migration, disable the
+gates per repo in `enforce:` (`acceptance_checked: false`, `acceptance_min: 1`, `links: false`,
+`user_impact_quality: false`) rather than fighting it ticket-by-ticket.
 
 ## The ticket body template
 

@@ -70,6 +70,12 @@ def test_subcommand_parses(argv):
 # ── create flow + enforcement ───────────────────────────────────────────────────────
 
 
+_GOOD_IMPACT = (
+    "Users on the dashboard can finally see their report load, so they no longer give up and "
+    "leave thinking the page is broken"
+)
+
+
 def _create_argv(**over):
     argv = [
         "create",
@@ -80,15 +86,25 @@ def _create_argv(**over):
         "--why",
         "because",
         "--impact",
-        "users",
+        _GOOD_IMPACT,
         "--if-not-done",
         "pain",
         "--acceptance",
         "it works",
+        "--acceptance",
+        "it also handles the empty case",
     ]
     for k, v in over.items():
         argv += [k, v]
     return argv
+
+
+def _ready_to_close(fake, ticket_id="#1"):
+    """Tick every acceptance criterion (with a dummy proof) so a ticket can pass the on-done
+    'all criteria checked' gate (rule 2). Returns nothing — the backend is mutated in place."""
+    count = len(fake.get(ticket_id).acceptance)
+    for i in range(1, count + 1):
+        main(["check", ticket_id, str(i), "--proof", "proof.png"])
 
 
 def test_create_complete_ticket_succeeds(capsys, _inject_fake):
@@ -114,8 +130,9 @@ def test_create_refuses_when_gate_unmet(capsys):
 
 def test_create_escape_hatch_allows_skip(capsys, _inject_fake):
     argv = [
-        "create", "--title", "t", "--what", "c", "--impact", "u", "--if-not-done", "p",
-        "--acceptance", "works", "--skip-motivation", "spike, no motivation needed",
+        "create", "--title", "t", "--what", "c", "--impact", _GOOD_IMPACT, "--if-not-done", "p",
+        "--acceptance", "works", "--acceptance", "also handles the empty input",
+        "--skip-motivation", "spike, no motivation needed",
     ]
     rc = main(argv)
     assert rc == 0
@@ -126,7 +143,8 @@ def test_create_from_message_derives_title(capsys, _inject_fake):
     rc = main(
         [
             "create", "--from-message", "fix the broken header on mobile", "--why", "b",
-            "--impact", "u", "--if-not-done", "p", "--acceptance", "works",
+            "--impact", _GOOD_IMPACT, "--if-not-done", "p",
+            "--acceptance", "works", "--acceptance", "also covers the empty input",
         ]
     )
     assert rc == 0
@@ -164,6 +182,7 @@ def test_new_enforces_the_create_gates(capsys, _inject_fake):
 
 def test_done_closes_a_non_ui_ticket(capsys, _inject_fake):
     main(_create_argv())
+    _ready_to_close(_inject_fake)
     capsys.readouterr()
     rc = main(["done", "#1"])
     assert rc == 0
@@ -183,6 +202,7 @@ def test_done_runs_the_on_done_gates(capsys, _inject_fake):
 
 def test_done_with_implementation_screenshot_closes_and_attaches(_inject_fake):
     main(_create_argv() + ["--label", "ui", "--screenshot", "creation.png"])
+    _ready_to_close(_inject_fake)
     rc = main(["done", "#1", "--screenshot", "after.png"])
     assert rc == 0
     assert ("#1", "after.png") in _inject_fake.attachments
@@ -191,12 +211,62 @@ def test_done_with_implementation_screenshot_closes_and_attaches(_inject_fake):
 def test_done_persists_skip_justification(_inject_fake):
     # `done --skip-screenshots` records the waiver in the body, not lost to a re-fetch.
     main(_create_argv() + ["--label", "ui", "--skip-screenshots", "no proof at create"])
+    _ready_to_close(_inject_fake)
     rc = main(["done", "#1", "--skip-screenshots", "config-only change, no UI"])
     assert rc == 0
     from tasklib.render import render
 
     body = render(_inject_fake.get("#1"))
     assert "## Skipped gates" in body and "config-only change, no UI" in body
+
+
+def test_done_skip_links_waives_the_close_phase_links_gate(capsys, _inject_fake):
+    # the close-command --skip-links flag is wired and waives the now-active close-phase links
+    # gate: a close-ready ticket carrying a bare reference (e.g. one edited in the web UI) closes
+    # with a recorded reason instead of being stuck. Inject the bare ref into the stored ticket to
+    # simulate a body that never passed the create gate.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    _inject_fake.get("#1").what = "regressed by HYP-789"  # a bare ref the create gate never saw
+    capsys.readouterr()
+    # without the skip, the close is refused on links
+    assert main(["done", "#1"]) == 2
+    assert "links" in capsys.readouterr().out
+    # with --skip-links on the close command, it closes and records the waiver in the body
+    rc = main(["done", "#1", "--skip-links", "legacy ref edited in the GitHub UI"])
+    assert rc == 0
+    from tasklib.render import render
+
+    t = _inject_fake.get("#1")
+    assert t.state.value == "done"
+    assert "## Skipped gates" in render(t) and "legacy ref edited in the GitHub UI" in render(t)
+
+
+def test_done_skip_user_impact_quality_waives_the_close_phase_quality_gate(capsys, _inject_fake):
+    # symmetric to the links case: the close-command --skip-user-impact-quality flag is wired and
+    # waives the now-active close-phase quality gate, so a close-ready ticket whose impact was
+    # thinned (e.g. edited in the web UI) closes with a recorded reason instead of being stuck.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    _inject_fake.get("#1").user_impact = "users"  # a thin impact the create gate never graded
+    capsys.readouterr()
+    assert main(["done", "#1"]) == 2
+    assert "user-impact-quality" in capsys.readouterr().out
+    rc = main(["done", "#1", "--skip-user-impact-quality", "internal tool, no end user"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
+
+
+def test_create_force_links_waiver_persists_through_close(capsys, _inject_fake):
+    # the documented migration: a bare reference waived at create with --force is recorded in the
+    # body's Skipped gates, so the ticket closes WITHOUT re-specifying the skip — the close-phase
+    # links gate honors the persisted waiver via the render/parse round-trip.
+    main(_create_argv() + ["--what", "follow-up to HYP-789", "--force", "legacy ref, pre-link era"])
+    _ready_to_close(_inject_fake)
+    capsys.readouterr()
+    rc = main(["done", "#1"])
+    assert rc == 0
+    assert _inject_fake.get("#1").state.value == "done"
 
 
 def test_done_on_unknown_id_is_clean_error_not_traceback(capsys, _inject_fake):
@@ -356,7 +426,7 @@ def test_change_adds_acceptance(capsys, _inject_fake):
     capsys.readouterr()
     main(["change", "#1", "--acceptance", "also handles edge case"])
     fetched = _inject_fake.get("#1")
-    assert "also handles edge case" in fetched.acceptance
+    assert "also handles edge case" in [c.text for c in fetched.acceptance]
 
 
 def test_status_read_only(capsys, _inject_fake):
@@ -381,6 +451,7 @@ def test_status_transition_to_done_enforces(capsys, _inject_fake):
 def test_status_transition_done_non_ui_succeeds(capsys, _inject_fake):
     # a non-UI ticket has no screenshot gate → status done just transitions.
     main(_create_argv())
+    _ready_to_close(_inject_fake)
     capsys.readouterr()
     rc = main(["status", "#1", "done"])
     assert rc == 0
@@ -391,6 +462,7 @@ def test_status_done_persists_skip_justification(_inject_fake):
     # closing a UI ticket via `status done --skip-screenshots` must RECORD the waiver in the
     # body (not lose it to a re-fetching transition()). Regression for the Codex/Opus P1.
     main(_create_argv() + ["--label", "ui", "--skip-screenshots", "no proof at create"])
+    _ready_to_close(_inject_fake)
     rc = main(["status", "#1", "done", "--skip-screenshots", "config-only change, no UI"])
     assert rc == 0
     from tasklib.render import render
@@ -433,6 +505,7 @@ def test_change_close_refuses_ui_without_implementation_screenshot(capsys, _inje
 
 def test_change_close_allowed_with_implementation_screenshot(capsys, _inject_fake):
     main(_create_argv() + ["--label", "ui", "--screenshot", "creation.png"])
+    _ready_to_close(_inject_fake)
     capsys.readouterr()
     rc = main(["change", "#1", "--screenshot", "after.png", "--done"])
     assert rc == 0
@@ -441,6 +514,7 @@ def test_change_close_allowed_with_implementation_screenshot(capsys, _inject_fak
 def test_change_close_recorded_waiver_persists(capsys, _inject_fake):
     # a recorded screenshots waiver is an auditable decision and legitimately carries through.
     main(_create_argv() + ["--label", "ui", "--skip-screenshots", "config-only, not real UI"])
+    _ready_to_close(_inject_fake)
     capsys.readouterr()
     rc = main(["change", "#1", "--done"])
     assert rc == 0
@@ -499,6 +573,7 @@ def test_close_on_already_done_ticket_refuses(capsys, _inject_fake, close_argv):
 def test_close_on_open_ticket_still_works(capsys, _inject_fake, close_argv):
     # the legal todo → done path is UNCHANGED: a fresh ticket still closes cleanly via every verb.
     main(_create_argv())
+    _ready_to_close(_inject_fake)
     capsys.readouterr()
     rc = main(close_argv)
     out = capsys.readouterr().out
@@ -547,6 +622,7 @@ def test_status_read_only_never_validates(capsys, _inject_fake):
 def test_done_force_overrides_on_cancelled(_inject_fake):
     # `task done --force` is the explicit override: it re-closes a cancelled ticket to done.
     main(_create_argv())
+    _ready_to_close(_inject_fake)
     _force_state(_inject_fake, "#1", "cancelled")
     rc = main(["done", "#1", "--force"])
     assert rc == 0
@@ -556,6 +632,7 @@ def test_done_force_overrides_on_cancelled(_inject_fake):
 def test_change_done_force_overrides_on_done(_inject_fake):
     # `task change --done --force` re-closes an already-done ticket (the no-op block is bypassed).
     main(_create_argv())
+    _ready_to_close(_inject_fake)
     _force_state(_inject_fake, "#1", "done")
     rc = main(["change", "#1", "--done", "--force"])
     assert rc == 0
@@ -585,6 +662,259 @@ def test_illegal_change_done_with_screenshot_fires_no_attachment(capsys, _inject
     assert fetched.screenshots == shots_before
     assert fetched.labels == labels_before
     assert fetched.title == title_before
+
+
+# ── rule 1: related entities must be links (create + edit) ───────────────────────────
+
+
+def test_create_blocks_unlinked_reference(capsys, _inject_fake):
+    rc = main(_create_argv() + ["--what", "blocked by HYP-789 until it lands"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "links" in out and "HYP-789" in out
+
+
+def test_create_force_overrides_unlinked_reference(capsys, _inject_fake):
+    rc = main(_create_argv() + ["--what", "the SKU HYP-789 ships", "--force", "HYP-789 is a product SKU, not a ticket"])
+    assert rc == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "## Skipped gates" in body and "product SKU" in body
+
+
+def test_change_edit_blocks_unlinked_reference(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["change", "#1", "--what", "now also see tasklib/cli.py"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "links" in out
+
+
+def test_change_edit_links_skippable(_inject_fake):
+    main(_create_argv())
+    rc = main(["change", "#1", "--what", "see HYP-9", "--skip-links", "HYP-9 is a SKU"])
+    assert rc == 0
+    # the waiver is an auditable decision and persists in the body even on a non-closing edit
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "## Skipped gates" in body and "HYP-9 is a SKU" in body
+
+
+def test_create_force_overrides_links_and_impact_together(_inject_fake):
+    rc = main(_create_argv() + ["--what", "see HYP-1", "--impact", "n/a", "--force", "spike: SKU + internal tool"])
+    assert rc == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "links" in body and "user-impact-quality" in body and "spike: SKU + internal tool" in body
+
+
+def test_force_records_only_the_gate_that_failed(_inject_fake):
+    # --force only waives the gate that actually fired: a links-only force must NOT silently
+    # record a user-impact-quality skip when the impact is perfectly fine.
+    rc = main(_create_argv() + ["--what", "see HYP-1", "--force", "HYP-1 is a SKU"])
+    assert rc == 0
+    skips = _inject_fake.get("#1").skips
+    assert "links" in skips and "user-impact-quality" not in skips
+
+
+def test_unlinked_reference_in_criterion_blocks_create(capsys, _inject_fake):
+    # the links scan covers acceptance-criterion text too, not only --what
+    rc = main(_create_argv() + ["--acceptance", "fixes #123 on mobile"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "links" in out and "#123" in out
+
+
+def test_change_impact_edit_enforces_quality(capsys, _inject_fake):
+    # editing the impact to something thin (non-closing edit) re-runs the quality gate
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["change", "#1", "--impact", "users"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "user-impact-quality" in out
+
+
+def test_change_done_cannot_smuggle_an_unlinked_reference(capsys, _inject_fake):
+    # a close-ready ticket: `change --what "…HYP-789…" --done` is an EDIT plus a close, so the
+    # links edit-gate must fire on the touched text BEFORE the close — not be bypassed by --done.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    capsys.readouterr()
+    rc = main(["change", "#1", "--what", "now blocked by HYP-789", "--done"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "links" in out
+    assert _inject_fake.get("#1").state.value != "done"  # the close did NOT go through
+
+
+def test_change_done_cannot_smuggle_a_thinned_impact(capsys, _inject_fake):
+    # same hole on rule 5: closing while thinning the impact must still trip user-impact-quality.
+    main(_create_argv())
+    _ready_to_close(_inject_fake)
+    capsys.readouterr()
+    rc = main(["change", "#1", "--impact", "users", "--done"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "user-impact-quality" in out
+    assert _inject_fake.get("#1").state.value != "done"
+
+
+def test_metadata_only_edit_does_not_rescan_links(_inject_fake):
+    # a ticket whose body already carries a bare ref (e.g. created in the web UI) — a pure
+    # metadata edit (--due) must NOT be re-blocked by the links gate (regression guard).
+    from tasklib.model import Ticket
+
+    _inject_fake.create(
+        Ticket(
+            title="web-created",
+            what="blocked by HYP-1",
+            why="x",
+            user_impact="Users can read the page without the menu covering the text, so they stay",
+            cost_of_inaction="y",
+            acceptance=["a", "b"],
+        )
+    )
+    rc = main(["change", "#1", "--due", "2026-07-01"])
+    assert rc == 0
+
+
+def test_create_force_overrides_thin_impact(_inject_fake):
+    rc = main(_create_argv() + ["--impact", "n/a", "--force", "internal tool, no end user"])
+    assert rc == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "user-impact-quality" in body and "internal tool" in body
+
+
+# ── rule 4 + rule 5 at create ────────────────────────────────────────────────────────
+
+
+def test_create_blocks_single_criterion(capsys, _inject_fake):
+    argv = [
+        "create", "--title", "t", "--what", "c", "--why", "b", "--impact", _GOOD_IMPACT,
+        "--if-not-done", "p", "--acceptance", "only one",
+    ]
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "at least 2" in out
+
+
+def test_create_blocks_thin_impact(capsys, _inject_fake):
+    rc = main(_create_argv() + ["--impact", "users"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "user-impact-quality" in out
+
+
+# ── rule 3: checking a criterion needs a visual proof ────────────────────────────────
+
+
+def test_check_requires_a_visual_proof(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["check", "#1", "1"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "visual proof" in out
+    assert not _inject_fake.get("#1").acceptance[0].checked
+
+
+def test_check_with_proof_marks_and_attaches(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["check", "#1", "1", "--proof", "shot.png"])
+    assert rc == 0
+    crit = _inject_fake.get("#1").acceptance[0]
+    assert crit.checked and crit.proof == "shot.png"
+    assert ("#1", "shot.png") in _inject_fake.attachments
+
+
+def test_check_force_records_reason_without_proof(_inject_fake):
+    main(_create_argv())
+    rc = main(["check", "#1", "1", "--force", "this is a backend invariant, no UI to shoot"])
+    assert rc == 0
+    crit = _inject_fake.get("#1").acceptance[0]
+    assert crit.checked and crit.proof == "" and "backend invariant" in crit.force_reason
+
+
+def test_check_screenshot_is_an_alias_of_proof(_inject_fake):
+    # --screenshot writes into the same dest as --proof, so it satisfies the proof requirement
+    main(_create_argv())
+    rc = main(["check", "#1", "1", "--screenshot", "shot.png"])
+    assert rc == 0
+    crit = _inject_fake.get("#1").acceptance[0]
+    assert crit.checked and crit.proof == "shot.png"
+    assert ("#1", "shot.png") in _inject_fake.attachments
+
+
+def test_check_by_text_selector(_inject_fake):
+    main(_create_argv())
+    rc = main(["check", "#1", "empty", "--proof", "shot.png"])
+    assert rc == 0
+    # the substring 'empty' matches the second criterion ("it also handles the empty case")
+    assert _inject_fake.get("#1").acceptance[1].checked
+
+
+def test_check_ambiguous_text_selector_is_clean_error(capsys, _inject_fake):
+    # both default criteria ("it works" / "it also handles the empty case") contain "it" —
+    # an ambiguous substring must refuse and ask for an index, not silently pick one.
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["check", "#1", "it", "--proof", "shot.png"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "match" in out and "disambiguate" in out
+    # neither criterion was checked by the ambiguous attempt
+    assert not any(c.checked for c in _inject_fake.get("#1").acceptance)
+
+
+def test_check_bad_index_is_clean_error(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["check", "#1", "9", "--proof", "shot.png"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "out of range" in out
+
+
+def test_check_on_ticket_without_criteria_is_clean_error(capsys, _inject_fake):
+    # a ticket created with the acceptance gate skipped has no criteria → a clean error, no crash
+    main(
+        [
+            "create", "--title", "spike", "--what", "c", "--why", "b", "--impact", _GOOD_IMPACT,
+            "--if-not-done", "p", "--skip-acceptance", "spike, criteria pending",
+        ]
+    )
+    capsys.readouterr()
+    rc = main(["check", "#1", "1", "--proof", "shot.png"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no acceptance criteria" in out
+
+
+# ── rule 2: a ticket cannot close while a criterion is unchecked ──────────────────────
+
+
+def test_done_blocked_until_all_criteria_checked(capsys, _inject_fake):
+    main(_create_argv())
+    main(["check", "#1", "1", "--proof", "shot.png"])  # only the first
+    capsys.readouterr()
+    rc = main(["done", "#1"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "unchecked" in out
+    assert _inject_fake.get("#1").state.value != "done"
+    # check the remaining one → close now succeeds
+    main(["check", "#1", "2", "--proof", "shot.png"])
+    assert main(["done", "#1"]) == 0
+    assert _inject_fake.get("#1").state.value == "done"
 
 
 # ── classify ─────────────────────────────────────────────────────────────────────────

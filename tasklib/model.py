@@ -73,6 +73,23 @@ class Screenshot:
 
 
 @dataclass
+class Criterion:
+    """One acceptance criterion: its text, whether it is checked, and the proof for the check.
+
+    A criterion may be CHECKED only with a *visual proof* (``proof`` = an image path/URL) — or,
+    when a proof is genuinely impractical, with a recorded ``force_reason`` (audited). The
+    ``check`` command and the on-done gate enforce this; ``render`` serializes the checkbox line
+    (``- [x] text — proof: ![proof](ref)``) and round-trips it. Plain text constructs an
+    unchecked criterion (see :meth:`Ticket.__post_init__`'s string coercion).
+    """
+
+    text: str
+    checked: bool = False
+    proof: str = ""  # visual-proof ref (image path/URL) backing a checked criterion
+    force_reason: str = ""  # recorded justification when checked WITHOUT a visual proof
+
+
+@dataclass
 class Ticket:
     """A backend-agnostic ticket.
 
@@ -87,7 +104,9 @@ class Ticket:
     why: str = ""  # motivation
     user_impact: str = ""
     cost_of_inaction: str = ""
-    acceptance: list[str] = field(default_factory=list)  # checkbox items (text only)
+    # Accepts plain strings at construction (coerced to unchecked Criterion in __post_init__) so
+    # callers/tests can pass `["a", "b"]`; the stored value is always a list[Criterion].
+    acceptance: list[Criterion] = field(default_factory=list)
     screenshots: list[Screenshot] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     links: dict[str, str] = field(default_factory=dict)  # e.g. {"PR": "...", "Session": "session:abc"}
@@ -104,15 +123,21 @@ class Ticket:
     # silently bind the wrong field. Keeping it trailing makes the addition order-safe.
     due: str = ""  # ISO date YYYY-MM-DD the daemon watches; "" = no due date
 
+    def __post_init__(self) -> None:
+        # Coerce plain-string criteria to unchecked Criterion objects. This keeps construction
+        # ergonomic (`Ticket(acceptance=["a", "b"])`) while the rest of the code — render, parse,
+        # the gates, the `check` command — always works in terms of Criterion (text/checked/proof).
+        self.acceptance = [c if isinstance(c, Criterion) else Criterion(text=str(c)) for c in self.acceptance]
+
     @property
     def is_ui(self) -> bool:
         """A UI/visual ticket triggers the screenshot gates (label-gated, see policy)."""
         ui_labels = {"ui", "visual"}
         return any(label.strip().lower() in ui_labels for label in self.labels)
 
-    def acceptance_checkboxes(self) -> list[str]:
-        """The acceptance criteria rendered as GitHub-flavored markdown checkbox lines."""
-        return [f"- [ ] {item}" for item in self.acceptance]
+    def unchecked_criteria(self) -> list[Criterion]:
+        """The acceptance criteria still unchecked — what blocks a close (the on-done gate)."""
+        return [c for c in self.acceptance if not c.checked]
 
     def session_label(self) -> str | None:
         """The ``session:<id>`` label if present, else ``None``."""

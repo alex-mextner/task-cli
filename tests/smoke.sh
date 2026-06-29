@@ -20,7 +20,7 @@ $TASK --version >/dev/null 2>&1 || fail "task --version"
 pass "task --help / --version"
 
 # ── 2. every subcommand --help ────────────────────────────────────────────────
-for sub in create list read view find change status classify session install-skill; do
+for sub in create list read view find change status done check classify session install-skill; do
   $TASK "$sub" --help >/dev/null 2>&1 || fail "task $sub --help"
 done
 pass "every subcommand --help"

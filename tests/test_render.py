@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tasklib.model import Screenshot, Ticket
+from tasklib.model import Criterion, Screenshot, Ticket
 from tasklib.render import SECTIONS, parse, render, split_sections, validate_format
 
 
@@ -30,6 +30,45 @@ def test_render_acceptance_as_checkboxes():
     body = render(_full_ticket())
     assert "- [ ] toggle persists across reloads" in body
     assert "- [ ] respects prefers-color-scheme" in body
+
+
+def test_render_checked_criterion_carries_proof():
+    t = _full_ticket()
+    t.acceptance = [
+        Criterion("toggle persists across reloads", checked=True, proof="after.png"),
+        Criterion("respects prefers-color-scheme", checked=False),
+    ]
+    body = render(t)
+    assert "- [x] toggle persists across reloads — proof: ![proof](after.png)" in body
+    assert "- [ ] respects prefers-color-scheme" in body
+
+
+def test_round_trip_preserves_checked_state_and_proof():
+    t = _full_ticket()
+    t.acceptance = [
+        Criterion("a", checked=True, proof="p.png"),
+        Criterion("b", checked=True, force_reason="proof impossible for a CLI flag"),
+        Criterion("c", checked=False),
+    ]
+    parsed = parse(render(t))
+    assert [(c.text, c.checked, c.proof, c.force_reason) for c in parsed.acceptance] == [
+        ("a", True, "p.png", ""),
+        ("b", True, "", "proof impossible for a CLI flag"),
+        ("c", False, "", ""),
+    ]
+
+
+def test_round_trip_preserves_proof_path_containing_parens():
+    # a proof path/URL with literal parens must survive render→parse intact (greedy capture),
+    # not truncate at the first ')' and re-wrap into ![proof](![proof](...)) on the next render.
+    t = _full_ticket()
+    t.acceptance = [Criterion("a", checked=True, proof="https://s3/img(1).png")]
+    once = render(t)
+    parsed = parse(once)
+    assert parsed.acceptance[0].proof == "https://s3/img(1).png"
+    # idempotent: a second render→parse round produces the same proof (no progressive wrapping)
+    assert parse(render(parsed)).acceptance[0].proof == "https://s3/img(1).png"
+    assert "![proof](![proof]" not in render(parsed)
 
 
 def test_round_trip_preserves_fields():

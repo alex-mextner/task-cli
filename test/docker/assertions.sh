@@ -49,6 +49,7 @@ NEW_JSON="$(task new \
   --impact "without it, bug reports omit the version and triage stalls" \
   --if-not-done "support keeps guessing versions; repro is unreliable" \
   --acceptance "running 'demo --version' prints the semver and exits 0" \
+  --acceptance "the --version flag is listed in 'demo --help' output" \
   --json)"
 echo "$NEW_JSON" | grep -q '"id": "#1"' || { echo "$NEW_JSON" >&2; fail "task new did not return issue #1"; }
 echo "$NEW_JSON" | grep -q "github.com/mock/mock/issues/1" || fail "task new url not from the mock backend"
@@ -63,6 +64,16 @@ pass "task list read the ticket back from the backend"
 # ── 5. USABLE: task read shows the full ticket body (read is never paged) ───────────────
 READ_OUT="$(task read '#1' 2>&1)"
 echo "$READ_OUT" | grep -qi "Acceptance" || fail "task read missing the Acceptance section"
-pass "task read returned the full ticket body"
+# Both acceptance criteria must round-trip through the real backend — i.e. repeated --acceptance
+# aggregates both (not last-wins). Flatten whitespace first so a word-wrapped body can't split a
+# phrase across lines, then match each criterion's full, unique phrasing so a substring elsewhere
+# in the body can't mask a dropped criterion. (Rule 4's >=2 BLOCK itself is covered by the unit /
+# CLI suite; here the ticket simply carries two criteria so the USABLE round-trip can run.)
+READ_FLAT="$(echo "$READ_OUT" | tr -s '[:space:]' ' ')"
+echo "$READ_FLAT" | grep -q "running 'demo --version' prints the semver and exits 0" \
+  || fail "task read missing the first acceptance criterion"
+echo "$READ_FLAT" | grep -q "the --version flag is listed in 'demo --help' output" \
+  || fail "task read missing the second acceptance criterion"
+pass "task read returned the full ticket body with both acceptance criteria"
 
 echo "── deterministic assertions: ALL PASSED ──"
