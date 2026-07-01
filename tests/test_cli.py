@@ -1207,3 +1207,115 @@ def test_daemon_disabled_does_not_start(capsys, _inject_fake, tmp_path, monkeypa
     assert rc == 0
     assert "disabled" in capsys.readouterr().out
     assert spawned == []
+
+
+# ── mutation notifications (TG hook) ────────────────────────────────────────────────
+
+
+def _patch_notify(monkeypatch):
+    """Capture daemon.notify calls; return the list of (message, notifier) tuples."""
+    from tasklib import daemon as _d
+
+    calls: list[tuple[str, tuple]] = []
+
+    def _fake_notify(msg, notifier):
+        calls.append((msg, notifier))
+        return True
+
+    monkeypatch.setattr(_d, "notify", _fake_notify)
+    return calls
+
+
+def test_create_sends_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    rc = main(_create_argv())
+    assert rc == 0
+    assert len(calls) == 1
+    msg, notifier = calls[0]
+    assert "#1" in msg
+    assert "created" in msg
+    assert "Add a thing" in msg
+    assert "tg" in notifier[0]
+
+
+def test_done_sends_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    main(_create_argv())
+    calls.clear()
+    _ready_to_close(_inject_fake)
+    rc = main(["done", "#1"])
+    assert rc == 0
+    assert len(calls) == 1
+    msg, _ = calls[0]
+    assert "done" in msg and "#1" in msg
+
+
+def test_change_done_sends_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    main(_create_argv())
+    calls.clear()
+    _ready_to_close(_inject_fake)
+    rc = main(["change", "#1", "--done"])
+    assert rc == 0
+    assert len(calls) == 1
+    msg, _ = calls[0]
+    assert "done" in msg and "#1" in msg
+
+
+def test_change_update_sends_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    main(_create_argv())
+    calls.clear()
+    rc = main(["change", "#1", "--title", "Updated title"])
+    assert rc == 0
+    assert len(calls) == 1
+    msg, _ = calls[0]
+    assert "changed" in msg and "#1" in msg
+
+
+def test_status_transition_sends_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    main(_create_argv())
+    calls.clear()
+    rc = main(["status", "#1", "in-progress"])
+    assert rc == 0
+    assert len(calls) == 1
+    msg, _ = calls[0]
+    assert "changed" in msg and "#1" in msg
+
+
+def test_list_does_not_send_tg_notification(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    main(_create_argv())
+    calls.clear()
+    rc = main(["list"])
+    assert rc == 0
+    assert calls == [], "list must not trigger a notification"
+
+
+def test_notification_disabled_by_config(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    # Inject notifications.on_mutation: false into the loaded config
+    from tasklib import cli as _cli
+    from tasklib.config import LoadedConfig
+
+    orig_load = _cli._load
+
+    def _patched_load(args):
+        cfg = orig_load(args)
+        cfg.data.setdefault("notifications", {})["on_mutation"] = False
+        return cfg
+
+    monkeypatch.setattr(_cli, "_load", _patched_load)
+    rc = main(_create_argv())
+    assert rc == 0
+    assert calls == [], "notification must be suppressed when on_mutation: false"
+
+
+def test_notification_failure_does_not_fail_ticket_op(monkeypatch, _inject_fake, capsys):
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(_d, "notify", lambda msg, notifier: False)
+    rc = main(_create_argv())
+    assert rc == 0
+    assert "created #1" in capsys.readouterr().out

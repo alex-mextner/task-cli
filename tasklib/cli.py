@@ -651,6 +651,38 @@ def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact
         _report_and_die(apply_skips(raw, ticket), "update")
 
 
+def _notify_mutation(cfg, ticket, action: str) -> None:
+    """Send a TG notification after a ticket mutation (create/update/done/transition).
+
+    Uses the daemon's notifier config (default: tg --tag report) and the daemon's
+    notifications.on_mutation enable flag. Best-effort: a notifier failure never fails the
+    ticket op. Read-only commands (list/find/read/session) never call this.
+    """
+    # Config gate: notifications.on_mutation (default True). Set to false to silence.
+    notif_section = cfg.section("notifications")
+    if not _as_bool_cfg(notif_section.get("on_mutation"), default=True):
+        return
+    from . import daemon as _daemon
+
+    dcfg = _daemon.DaemonConfig.from_config(cfg)
+    notifier = dcfg.notifier
+    state_str = ticket.state.value if ticket.state else "unknown"
+    url_part = f"\n{ticket.url}" if ticket.url else ""
+    msg = f"[task {action}] {ticket.id}: {ticket.title} [{state_str}]{url_part}"
+    _daemon.notify(msg, notifier)
+
+
+def _as_bool_cfg(value, *, default: bool) -> bool:
+    """Coerce a config value to bool (mirrors daemon._as_bool without importing daemon)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "0", "off", "")
+    return bool(value)
+
+
 def _attach_screenshots(backend, ticket_id: str, screenshots) -> None:
     """Push each screenshot to the backend's attachment endpoint (durable proof).
 
@@ -728,6 +760,7 @@ def cmd_create(args: argparse.Namespace) -> int:
     from .logging import log_event
 
     log_event("ticket.created", ticket_id=created.id, backend=cfg.backend, session=session.id)
+    _notify_mutation(cfg, created, "created")
 
     if args.json:
         import json
@@ -1199,6 +1232,7 @@ def cmd_change(args: argparse.Namespace) -> int:
     from .logging import log_event
 
     log_event("ticket.changed", ticket_id=updated.id, backend=cfg.backend, closed=args.done)
+    _notify_mutation(cfg, updated, "done" if args.done else "changed")
     if args.json:
         import json
 
@@ -1253,6 +1287,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     from .logging import log_event
 
     log_event("ticket.transition", ticket_id=updated.id, state=new_state.value)
+    _notify_mutation(cfg, updated, "done" if new_state is State.DONE else "changed")
     print(_ok(f"{updated.id} → {new_state.value}"))
     return 0
 
@@ -1291,6 +1326,7 @@ def cmd_done(args: argparse.Namespace) -> int:
     from .logging import log_event
 
     log_event("ticket.transition", ticket_id=updated.id, state=State.DONE.value)
+    _notify_mutation(cfg, updated, "done")
     print(_ok(f"{updated.id} → {State.DONE.value}"))
     return 0
 
