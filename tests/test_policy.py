@@ -123,12 +123,15 @@ def test_enforce_config_from_spec_dict():
 
 
 def test_from_dict_disables_new_gates():
-    cfg = EnforceConfig.from_dict({"links": False, "user_impact_quality": False, "acceptance_checked": False})
+    cfg = EnforceConfig.from_dict(
+        {"links": False, "user_impact_quality": False, "acceptance_checked": False, "msgref_title": False}
+    )
     assert cfg.links is False
     assert cfg.user_impact_quality is False
     assert cfg.acceptance_checked is False
-    # with the new gates off, a bare-reference / thin-impact / unchecked ticket passes
-    assert check_create(_good_ticket(what="see HYP-789", user_impact="users"), cfg).ok
+    assert cfg.msgref_title is False
+    # with the new gates off, a bare-reference / thin-impact / unchecked / tg#-titled ticket passes
+    assert check_create(_good_ticket(what="see HYP-789", user_impact="users", title="tg#5900"), cfg).ok
     assert check_done(_good_ticket(), cfg).ok  # unchecked criteria no longer block close
 
 
@@ -219,6 +222,66 @@ def test_unlinked_reference_blocks_close_too():
 
 def test_links_gate_disabled_in_config():
     assert check_create(_good_ticket(what="see HYP-789"), EnforceConfig(links=False)).ok
+
+
+def test_msgref_in_title_blocks_create():
+    res = check_create(_good_ticket(title="see tg#5900"), EnforceConfig())
+    assert not res.ok
+    v = next(v for v in res.violations if v.gate == "msgref-title")
+    assert "tg#5900" in v.message
+
+
+def test_msgref_in_body_does_not_trip_the_title_gate():
+    # tg#<id> is a DIFFERENT namespace from the links gate's bare #N — it belongs in prose, not
+    # the title, and must not itself be treated as an unlinked "issue/PR ref" either.
+    res = check_create(_good_ticket(what="per tg#5900 do X"), EnforceConfig())
+    assert res.ok
+
+
+def test_quoted_blockquote_line_is_excluded_from_the_links_scan():
+    # a tasklib.msgrefs.render_msgref_quotes quote block is `> …` lines (+ provenance marker)
+    # appended to a prose field. Whatever that quoted (someone-else's) message happens to mention
+    # must never trip the links gate — the ticket's own author can't be expected to fix quoted
+    # third-party text. This is the fix for the review finding that "expand only after THIS
+    # command's own gates" (an earlier version) protects only the expanding command: a LATER
+    # command re-scans the already-stored, already-expanded field. Stripping the blockquote at
+    # the scan site (here) instead of at expansion time is what makes the protection survive
+    # across commands.
+    quoted_what = (
+        "per tg#42 do X\n\n> **tg#42** — Alex, 2026-01-01 00:00 UTC:\n> blocked by HYP-999"
+        "\n<!-- tasklib:msgref-quote:42 -->"
+    )
+    assert check_create(_good_ticket(what=quoted_what), EnforceConfig()).ok
+
+
+def test_a_hand_typed_lookalike_without_the_provenance_marker_still_trips_the_links_gate():
+    # task-cli#45 review finding: without a provenance marker, ANY text shaped like
+    # `> **tg#<id>** ...` was excluded from the scan — an author could hand-type that exact
+    # shape to smuggle a bare reference past the links gate with no audited --skip-links. The
+    # SAME text WITHOUT the genuine marker must still be scanned normally.
+    spoofed_what = "per tg#42 do X\n\n> **tg#42** — Alex, 2026-01-01 00:00 UTC:\n> blocked by HYP-999"
+    res = check_create(_good_ticket(what=spoofed_what), EnforceConfig())
+    assert not res.ok
+    assert any(v.gate == "links" for v in res.violations)
+
+
+def test_msgref_title_gate_is_not_skippable():
+    # deliberately hard (task 6109): a recorded skip does NOT waive it — the fix is always
+    # "move it into the body", never a judgment call.
+    t = _good_ticket(title="see tg#5900", skips={"msgref-title": "trust me"})
+    assert not check_create(t, EnforceConfig()).ok
+
+
+def test_msgref_title_gate_disabled_in_config():
+    assert check_create(_good_ticket(title="see tg#5900"), EnforceConfig(msgref_title=False)).ok
+
+
+def test_msgref_title_gate_also_blocks_close():
+    # mirrors the links gate: a ticket whose title carries a bare tg# ref (created before this
+    # rule, or edited in the web UI) cannot be closed with it still there either.
+    t = _good_ticket(title="see tg#5900", acceptance=_checked_criteria())
+    res = check_done(t, EnforceConfig())
+    assert any(v.gate == "msgref-title" for v in res.violations)
 
 
 def test_links_and_quality_gates_disabled_in_config_on_close():

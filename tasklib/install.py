@@ -76,9 +76,14 @@ task session                     # show current session + its tickets
 
 ## Key facts
 - **Enforcement gates** (on create + on change→done): acceptance criteria, motivation,
-  user impact, cost of inaction, screenshots (UI/visual tickets), section formatting.
-- **Escape hatch**: any gate is skippable with a written justification recorded ON the
+  user impact, cost of inaction, screenshots (UI/visual tickets), section formatting, a
+  `tg#<id>` reference banned from the title (move it into `--what`/`--why`/etc. instead).
+- **Escape hatch**: most gates are skippable with a written justification recorded ON the
   ticket — `--skip-<gate> "<reason>"` (e.g. `--skip-screenshots "no UI in this change"`).
+  Two are hard (no per-ticket skip, only a config-level toggle disables them, and the config
+  key uses an UNDERSCORE, not the gate's hyphenated display name): every-criterion-checked-
+  with-proof on close (`enforce.acceptance_checked: false`), and the title's `tg#<id>` ban
+  (`enforce.msgref_title: false`).
 - **Backends call the API directly** and harvest credentials from `gh auth token` /
   `~/.config/linear/credentials.toml` — no extra setup if you've already authed those CLIs.
 - **Session-scoped**: `task list` defaults to the current session (env:TASK_SESSION →

@@ -152,6 +152,26 @@ def test_create_from_message_derives_title(capsys, _inject_fake):
     assert created.title.startswith("fix the broken header")
 
 
+def test_create_from_message_strips_tg_inbound_wrap_from_title(capsys, _inject_fake):
+    # task-cli#45 review finding: --from-message is the documented tg-cli hook path (see
+    # tasklib.msgrefs's module docstring) -- an agent forwarding an inbound message passes the
+    # WHOLE wrapped text, `[TG from Alex tg#1234] <message>`. The wrap's own tg#1234 must not
+    # end up in the derived TITLE (it would trip the non-skippable msgref-title gate on a
+    # message that legitimately quotes itself); it must still reach `what` untouched.
+    rc = main(
+        [
+            "create", "--from-message", "[TG from Alex tg#1234] fix the broken header on mobile",
+            "--why", "b", "--impact", _GOOD_IMPACT, "--if-not-done", "p",
+            "--acceptance", "works", "--acceptance", "also covers the empty input",
+        ]
+    )
+    assert rc == 0
+    created = _inject_fake.list()[0]
+    assert created.title == "fix the broken header on mobile"
+    assert "tg#1234" not in created.title
+    assert "[TG from Alex tg#1234]" in created.what
+
+
 def test_create_records_session_sidecar(_inject_fake):
     from tasklib.session import read_ids
 
@@ -792,6 +812,167 @@ def test_create_force_overrides_thin_impact(_inject_fake):
     assert "user-impact-quality" in body and "internal tool" in body
 
 
+# ── tg#<id> message references (task 6109): title guard + local-history quote expansion ──
+
+
+def _write_tg_history(isolated_tmp_path, records: list[dict]) -> None:
+    """Write a fake tg-cli history JSONL into the isolated ``$XDG_CONFIG_HOME`` (see the
+    ``isolated_state`` fixture) so :func:`tasklib.msgrefs.load_history` finds it via glob."""
+    import json
+
+    config_dir = isolated_tmp_path / "config" / "tg-cli"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "tg-ctl.999.history.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+
+
+def test_create_title_with_msgref_refuses(capsys, _inject_fake):
+    argv = [
+        "create", "--title", "see tg#5900", "--what", "c", "--why", "b",
+        "--impact", _GOOD_IMPACT, "--if-not-done", "p", "--acceptance", "works", "--acceptance", "also empty",
+    ]
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "msgref-title" in out and "tg#5900" in out
+
+
+def test_create_body_msgref_does_not_trip_the_title_gate(capsys, _inject_fake):
+    rc = main(_create_argv() + ["--what", "per tg#5900 do X"])
+    assert rc == 0
+
+
+def test_create_expands_msgref_quote_from_local_history(_inject_fake, isolated_state):
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "fix the props bug", "pane": "%0"}],
+    )
+    rc = main(_create_argv() + ["--what", "per tg#42 do X"])
+    assert rc == 0
+    stored = _inject_fake.get("#1")
+    assert "per tg#42 do X" in stored.what
+    assert "fix the props bug" in stored.what
+    assert "Alex" in stored.what
+
+
+def test_create_msgref_not_found_in_history_still_succeeds(_inject_fake, isolated_state):
+    # no history file written at all — the reference is unresolvable, but creation must still
+    # succeed (never block a ticket on tg-cli being absent/empty), with a plain "not found" note.
+    rc = main(_create_argv() + ["--what", "per tg#999999 do X"])
+    assert rc == 0
+    stored = _inject_fake.get("#1")
+    assert "not found" in stored.what
+
+
+def test_quoted_message_carrying_a_bare_reference_does_not_trip_the_links_gate(_inject_fake, isolated_state):
+    # the quoted message's text is arbitrary — it happens to mention "HYP-999" here. Without the
+    # blockquote-line exclusion in policy._scanned_text, this would wrongly refuse creation on
+    # text the author never wrote (task-cli#45 review finding). It must succeed.
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "blocked by HYP-999", "pane": None}],
+    )
+    rc = main(_create_argv() + ["--what", "per tg#42 do X"])
+    assert rc == 0
+
+
+def test_stored_quote_does_not_trip_links_gate_on_a_later_UNRELATED_edit(capsys, _inject_fake, isolated_state):
+    # task-cli#45 review finding (the main one): an earlier version protected only the command
+    # that DID the expanding — the quote, once stored, was re-scanned (and could refuse) on any
+    # LATER command. Create with a quote carrying a bare reference, then edit a DIFFERENT field
+    # (--why) — the stored `what` (with its embedded "HYP-999") must not block this edit.
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "blocked by HYP-999", "pane": None}],
+    )
+    main(_create_argv() + ["--what", "per tg#42 do X"])
+    capsys.readouterr()
+    rc = main(["change", "#1", "--why", "updated motivation"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+
+
+def test_stored_quote_does_not_block_close(_inject_fake, isolated_state):
+    # same finding, on the close path: `change --done` re-runs the FULL create-shaped gate set
+    # (links + impact-quality) against the stored ticket — a bare reference or thin-looking text
+    # buried in an already-stored quote must not block closing a ticket that is otherwise ready.
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "blocked by HYP-999", "pane": None}],
+    )
+    main(_create_argv() + ["--what", "per tg#42 do X"])
+    _ready_to_close(_inject_fake, "#1")
+    rc = main(["change", "#1", "--done"])
+    assert rc == 0
+
+
+def test_acceptance_criterion_msgref_stays_bare_not_expanded(_inject_fake, isolated_state):
+    # acceptance criteria are excluded from expansion (single-line checkbox format can't carry a
+    # multi-line quote — see the msgrefs.py module docstring). The mention survives verbatim.
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "quoted text", "pane": None}],
+    )
+    rc = main(_create_argv() + ["--acceptance", "verify per tg#42"])
+    assert rc == 0
+    stored = _inject_fake.get("#1")
+    texts = [c.text for c in stored.acceptance]
+    assert "verify per tg#42" in texts
+    assert not any("quoted text" in t for t in texts)
+
+
+def test_change_expands_msgref_and_repeat_change_is_not_duplicated(_inject_fake, isolated_state):
+    main(_create_argv())
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "fix the props bug", "pane": None}],
+    )
+    rc = main(["change", "#1", "--what", "per tg#42 do X"])
+    assert rc == 0
+    what_after_first = _inject_fake.get("#1").what
+    assert what_after_first.count("tg#42") <= 2  # the mention itself + the quote header, never more
+    # re-applying the SAME edit must not pile up a second quote block underneath the first.
+    rc = main(["change", "#1", "--what", "per tg#42 do X"])
+    assert rc == 0
+    what_after_second = _inject_fake.get("#1").what
+    assert what_after_second == what_after_first
+
+
+def test_change_resubmitting_the_full_already_expanded_value_is_not_duplicated(_inject_fake, isolated_state):
+    # task-cli#45 review finding: a read-modify-write flow (read the CURRENT what, tweak it,
+    # write the whole thing back) resubmits a value that already contains the quote block --
+    # not just the bare mention like the test above. That must not pile up a second quote either.
+    main(_create_argv())
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "fix the props bug", "pane": None}],
+    )
+    main(["change", "#1", "--what", "per tg#42 do X"])
+    current_what = _inject_fake.get("#1").what
+    rc = main(["change", "#1", "--what", current_what])
+    assert rc == 0
+    assert _inject_fake.get("#1").what == current_what
+
+
+def test_change_title_with_msgref_refuses(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+    rc = main(["change", "#1", "--title", "see tg#5900"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "msgref-title" in out
+
+
+def test_change_not_touching_title_does_not_trigger_the_title_gate(_inject_fake):
+    # a pre-existing tg#<id> in the title (created before this gate existed, or edited in the
+    # web UI) must not block an UNRELATED edit that leaves the title alone.
+    main(_create_argv())
+    _inject_fake.get("#1").title = "see tg#5900"  # simulate a legacy/web-UI-edited title
+    rc = main(["change", "#1", "--why", "updated motivation"])
+    assert rc == 0
+
+
 # ── rule 4 + rule 5 at create ────────────────────────────────────────────────────────
 
 
@@ -935,6 +1116,29 @@ def test_classify_change_creates_ticket(capsys, monkeypatch, _inject_fake):
     assert "created" in out
 
 
+def test_classify_create_dedup_matches_against_wrap_stripped_title(capsys, monkeypatch, _inject_fake):
+    # task-cli#45 review finding: the stored ticket's title is ALWAYS wrap-stripped (every
+    # ticket this path creates goes through _derive_title_from_message). A repeat inbound
+    # message wrapped the SAME way must dedup-comment on that existing ticket, not create a
+    # second one just because the raw wrapped first line scores low similarity against the
+    # already-clean stored title.
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    main(["classify", "[TG from Alex tg#100] please add a dark mode toggle to settings", "--create"])
+    assert len(_inject_fake.list()) == 1
+    capsys.readouterr()
+    rc = main(["classify", "[TG from Alex tg#200] please add a dark mode toggle to settings", "--create"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dedup" in out
+    assert len(_inject_fake.list()) == 1  # still one ticket — the repeat was a comment, not a create
+
+
 def test_classify_create_makes_policy_clean_draft(capsys, monkeypatch, _inject_fake):
     # the inbound-create path runs the gates and records every failing one as an auditable
     # auto-skip, so the draft is policy-clean by construction (no silent bypass).
@@ -952,6 +1156,87 @@ def test_classify_create_makes_policy_clean_draft(capsys, monkeypatch, _inject_f
 
     # the stored draft passes the create gates (failing ones were waived with a recorded skip)
     assert check_create(created, EnforceConfig()).ok
+
+
+def test_classify_create_expands_msgref_quote_in_what(capsys, monkeypatch, _inject_fake, isolated_state):
+    # task-cli#45 review finding: classify --create IS a tg-cli hook entry point (an agent runs
+    # `task classify "<inbound msg>" --create`) and must expand tg#<id> in `what` the same way
+    # cmd_create's --from-message path does -- it must not be the one path that silently drops
+    # the quote a reader would otherwise get everywhere else.
+    _write_tg_history(
+        isolated_state,
+        [{"ts": 1700000000, "message_id": 42, "direction": "user", "from": "Alex", "text": "fix the props bug", "pane": None}],
+    )
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    # the tg#<id> reference is on a SECOND line so the derived title (first line only) stays
+    # clean and the msgref-title gate doesn't fire -- this test is about `what` expansion.
+    rc = main(["classify", "add the login page redesign\nper tg#42 do X", "--create"])
+    assert rc == 0
+    created = _inject_fake.list()[0]
+    assert "fix the props bug" in created.what
+
+
+def test_classify_create_strips_tg_inbound_wrap_from_title(capsys, monkeypatch, _inject_fake):
+    # task-cli#45 review finding: `classify --create` is ALSO a tg-cli hook entry point (an
+    # inbound message routed straight through classify) and must derive its title the SAME way
+    # cmd_create's --from-message path does -- otherwise this path silently creates a ticket
+    # whose title carries the wrap's own tg#<id>, exactly what msgref-title exists to prevent.
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    rc = main(["classify", "[TG from Alex tg#4242] please add a logout button", "--create"])
+    assert rc == 0
+    created = _inject_fake.list()[0]
+    assert "tg#4242" not in created.title
+    assert created.title.startswith("please add a logout button")
+
+
+def test_classify_create_refuses_rather_than_silently_bypass_a_non_skippable_gate(capsys, monkeypatch, _inject_fake):
+    # the user's OWN message (not the wrap) starts with a tg#<id> mention that survives wrap-
+    # stripping -- the title is still non-compliant. _auto_skip_failing_gates must NOT silently
+    # auto-skip msgref-title (it is non-skippable); _classify_create must refuse instead of
+    # persisting a ticket that violates a rule with no legitimate exception.
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    rc = main(["classify", "tg#99 is broken, please fix it", "--create"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "msgref-title" in out
+    assert _inject_fake.list() == []
+
+
+def test_classify_create_refuses_a_wrap_only_message_with_no_derivable_title(capsys, monkeypatch, _inject_fake):
+    # task-cli#45 review finding: a wrap-only inbound message (no content after the wrap --
+    # a malformed/truncated hook call) derives an EMPTY title. cmd_create's --from-message path
+    # already refuses this (`if not title: raise`); classify --create must refuse the same way
+    # rather than silently create a titleless ticket.
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    rc = main(["classify", "[TG from Alex tg#1234]", "--create"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no title" in out
+    assert _inject_fake.list() == []
 
 
 def test_classify_just_ask_creates_nothing(capsys, monkeypatch, _inject_fake):

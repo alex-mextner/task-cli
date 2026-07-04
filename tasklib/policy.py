@@ -19,7 +19,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .model import Ticket
+from .msgrefs import strip_quoted_blocks as _strip_quoted_blocks
 from .render import validate_format
+
+# _strip_quoted_blocks (tasklib.msgrefs.strip_quoted_blocks) removes an appended tg#<id> quote
+# block before the `links`/`user-impact-quality` gates scan any text — that quote is machine-
+# appended text from someone ELSE's Telegram message, not authored prose, so its content must
+# never itself cause a refusal. Without this, "expand only after THIS command's own gates"
+# (cmd_create/cmd_change in cli.py) protects only the command that did the expanding: the quote
+# is then STORED on the ticket, and any LATER command (an edit to an unrelated field, or `change
+# --done`) re-scans the stored, already-expanded text and can refuse on content the author never
+# wrote and cannot fix (task-cli#45 review finding — verified: the first "expand after gates" fix
+# does not survive a second command). Stripping at the SCAN site is order-independent and covers
+# every phase/command uniformly. The stripper is anchored on the EXACT quote-block shape
+# tasklib.msgrefs generates (not any `>`-prefixed line), so a hand-authored blockquote elsewhere
+# in ticket prose — a different shape — is not swept up and stays subject to the links gate.
 
 # The canonical gate names. These are also the ``--skip-<gate>`` suffixes (hyphenated).
 GATE_ACCEPTANCE = "acceptance-criteria"
@@ -34,6 +48,11 @@ GATE_USER_IMPACT_QUALITY = "user-impact-quality"  # impact must be plain-languag
 # DONE-phase only, and deliberately NOT skippable: a ticket cannot close with an unchecked
 # acceptance criterion. It is absent from `normalize_skip_gate` so no `--skip-…` can waive it.
 GATE_ACCEPTANCE_CHECKED = "acceptance-checked"
+# Deliberately NOT skippable (task 6109): a `tg#<id>` reference in the title has no legitimate
+# reason to stay there — the fix is always "move it into a prose field", never a judgment call
+# the way a false-positive `links` match can be. Absent from `normalize_skip_gate` for the same
+# reason GATE_ACCEPTANCE_CHECKED is: no `--skip-…` can waive it.
+GATE_MSGREF_TITLE = "msgref-title"
 
 # The minimum number of acceptance criteria a ticket must declare (rule: a real ticket has
 # more than one provable outcome). Overridable via `enforce.acceptance_min`.
@@ -41,7 +60,7 @@ DEFAULT_ACCEPTANCE_MIN = 2
 
 # Gates that NO recorded justification can waive — a hard refuse. A ticket must not be closed
 # with an unchecked criterion under any escape hatch; only disabling the gate in config removes it.
-NON_SKIPPABLE_GATES: frozenset[str] = frozenset({GATE_ACCEPTANCE_CHECKED})
+NON_SKIPPABLE_GATES: frozenset[str] = frozenset({GATE_ACCEPTANCE_CHECKED, GATE_MSGREF_TITLE})
 
 ALL_GATES: tuple[str, ...] = (
     GATE_ACCEPTANCE,
@@ -53,6 +72,7 @@ ALL_GATES: tuple[str, ...] = (
     GATE_FORMATTING,
     GATE_LINKS,
     GATE_ACCEPTANCE_CHECKED,
+    GATE_MSGREF_TITLE,
 )
 
 
@@ -101,6 +121,7 @@ class EnforceConfig:
     user_impact_quality: bool = True
     acceptance_checked: bool = True  # block close while any criterion is unchecked
     acceptance_min: int = DEFAULT_ACCEPTANCE_MIN  # minimum acceptance criteria a ticket must declare
+    msgref_title: bool = True  # refuse a tg#<id> reference in the title (task 6109)
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "EnforceConfig":
@@ -147,6 +168,7 @@ class EnforceConfig:
             user_impact_quality=_on("user_impact_quality"),
             acceptance_checked=_on("acceptance_checked"),
             acceptance_min=acc_min,
+            msgref_title=_on("msgref_title"),
         )
 
 
@@ -194,6 +216,9 @@ def check(ticket: Ticket, cfg: EnforceConfig, phase: Phase) -> PolicyResult:
     # closed with an un-linked HYP-789 or a "users"-thin impact. A genuine legacy exception is
     # waived on the close command with --skip-links / --skip-user-impact-quality (both wired there).
     v = links_violation(ticket, cfg)
+    if v is not None:
+        raw.append(v)
+    v = msgref_title_violation(ticket, cfg)
     if v is not None:
         raw.append(v)
     raw.extend(_screenshot_gate(ticket, cfg, phase))
@@ -302,10 +327,11 @@ def _formatting_gate(ticket: Ticket, cfg: EnforceConfig) -> list[Violation]:
 
 
 def _scanned_text(ticket: Ticket) -> str:
-    """The ticket text the links gate scans: title + every prose field + criterion texts."""
+    """The ticket text the links gate scans: title + every prose field + criterion texts, minus
+    any tg#<id> quote block (see :func:`_strip_quoted_blocks`)."""
     parts = [ticket.title, ticket.what, ticket.why, ticket.user_impact, ticket.cost_of_inaction]
     parts += [c.text for c in ticket.acceptance]
-    return "\n".join(p for p in parts if p)
+    return _strip_quoted_blocks("\n".join(p for p in parts if p))
 
 
 def links_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
@@ -332,13 +358,45 @@ def links_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     )
 
 
+def msgref_title_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
+    """The title must never carry a ``tg#<id>`` Telegram-message reference (task 6109): a title
+    is one line with no room to quote the message, and it is never linkified downstream — so the
+    reference is functionally useless there and must move into a prose field. Non-skippable (see
+    :data:`GATE_MSGREF_TITLE` in :data:`NON_SKIPPABLE_GATES`) — there is no legitimate reason to
+    keep it in the title, only a config-level opt-out (``enforce.msgref_title: false``).
+
+    KNOWN LIMITATION (task-cli#45 review finding): the ``tg#[1-9][0-9]*`` pattern is broad by
+    design (mirrors tg-cli's own detector) and could in principle false-positive on an ordinary
+    title that happens to contain that exact shape (e.g. "migrate tg#2 protocol"). Because this
+    gate also runs at CLOSE (not just create — see :func:`check`) and carries no per-ticket
+    ``--skip-…`` waiver, such a title would need to be rewritten (or the gate disabled globally
+    via ``enforce.msgref_title: false``) before the ticket could close. Accepted: a real
+    `tg#<id>` string colliding with unrelated prose is rare, and the fix (rename the title) is
+    always available — unlike the quoted-message content the ``links``/``user-impact-quality``
+    gates must never block on.
+    """
+    if not cfg.msgref_title:
+        return None
+    from .msgrefs import title_msgrefs
+
+    refs = title_msgrefs(ticket.title)
+    if not refs:
+        return None
+    listed = ", ".join(f"tg#{r}" for r in refs)
+    return Violation(
+        GATE_MSGREF_TITLE,
+        f"the title contains a Telegram message reference ({listed}) — move it into the body",
+        hint='rewrite --title without the tg#<id>, and add "per tg#<id>…" to --what/--why/etc. instead',
+    )
+
+
 def impact_quality_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     """Rule 5: the user-impact must be plain-language and user-framed (only when non-empty)."""
     if not cfg.user_impact_quality or not ticket.user_impact.strip():
         return None
     from .quality import assess_user_impact
 
-    problems = assess_user_impact(ticket.user_impact)
+    problems = assess_user_impact(_strip_quoted_blocks(ticket.user_impact))
     if not problems:
         return None
     return Violation(

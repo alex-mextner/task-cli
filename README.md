@@ -154,10 +154,10 @@ On `change`→`done` (close) two more gates apply:
    <selector> --proof <path>` and that requires a screenshot/image. When a proof is genuinely
    impossible, `task check … --force "<reason>"` records the reason on the criterion (audited).
 
-Every gate (except *every-criterion-checked*) has an **escape hatch**: `--skip-<gate>
-"<reason>"` (or `--force "<reason>"` on `create`/`new` for the links / user-impact-quality
-gates) writes the justification into the ticket's `Skipped gates` section (auditable, recorded
-forever). Gates are also disable-able per repo via `enforce:` in config.
+Every gate except *every-criterion-checked* and *msgref-title* has an **escape hatch**:
+`--skip-<gate> "<reason>"` (or `--force "<reason>"` on `create`/`new` for the links /
+user-impact-quality gates) writes the justification into the ticket's `Skipped gates` section
+(auditable, recorded forever). Gates are also disable-able per repo via `enforce:` in config.
 
 | gate | flag to satisfy | escape hatch |
 | --- | --- | --- |
@@ -169,6 +169,7 @@ forever). Gates are also disable-able per repo via `enforce:` in config.
 | links | make each reference a link / full URL | `--skip-links "<reason>"` (or `--force "<reason>"` on create/new) |
 | screenshots | `--screenshot <path>` | `--skip-screenshots "<reason>"` |
 | formatting | (automatic — body is rendered) | `--skip-formatting "<reason>"` |
+| msgref-title | keep `--title` free of a `tg#<id>` reference (put it in `--what`/`--why`/etc. instead) | **none** (hard; disable in config only via `enforce.msgref_title: false`) |
 | acceptance-checked (close) | `task check <id> <n> --proof <path>` for each | **none** (hard; disable in config only) |
 
 ### Checking criteria off — `task check`
