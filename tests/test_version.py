@@ -1,18 +1,14 @@
 """Version drift guards — `task --version` must track pyproject.toml, never a stale literal.
 
 Regression for #22: `__version__` was a hardcoded `"0.1.0"` that nobody ever bumped, so
-`task --version` lied. The version is now resolved dynamically — installed-distribution
-metadata (``importlib.metadata``) first, falling back to parsing the repo's pyproject.toml
-when the package isn't pip-installed (a raw git checkout). pyproject.toml is the single
-source of truth; there is no hardcoded literal to drift.
+`task --version` lied. The version is now resolved dynamically from the repo's
+pyproject.toml when running from a live checkout, falling back to installed-distribution
+metadata (``importlib.metadata``) only for packaged installs without a sibling pyproject.
+pyproject.toml is the single source of truth; there is no hardcoded literal to drift.
 
-These tests pin that contract WITHOUT coupling to ambient install state. We deliberately do
-NOT assert `tasklib.__version__ == <pyproject>` unconditionally: when the package is installed
-editable at one version and pyproject is later bumped without reinstalling, the metadata path
-correctly returns the *installed* (frozen) version — that equality would be a flaky,
-install-state-dependent assertion. So the pyproject-equality contract is pinned only on the
-live-checkout branch (forced via a mocked ``PackageNotFoundError``), which is the branch #22
-actually fixed.
+These tests pin that contract without coupling to ambient install state. A live checkout must
+prefer its own pyproject even if the interpreter also has stale task-cli metadata installed;
+that is what lets the legacy symlink install update by fast-forwarding the checkout.
 """
 
 from __future__ import annotations
@@ -51,6 +47,21 @@ def test_pyproject_fallback_matches_declared_version(monkeypatch):
 
     monkeypatch.setattr(tasklib, "_pkg_version", _raise)
     assert tasklib._resolve_version() == _declared_version()
+
+
+def test_live_checkout_version_prefers_pyproject_over_stale_metadata(monkeypatch):
+    """A symlink checkout must not report a stale globally installed task-cli version."""
+
+    monkeypatch.setattr(tasklib, "_pkg_version", lambda _dist: "0.5.1")
+    assert tasklib._resolve_version() == _declared_version()
+
+
+def test_packaged_install_uses_metadata_when_pyproject_missing(monkeypatch, tmp_path):
+    """A wheel/pipx install has no sibling pyproject.toml, so metadata remains authoritative."""
+
+    monkeypatch.setattr(tasklib, "__file__", str(tmp_path / "site-packages" / "tasklib" / "__init__.py"))
+    monkeypatch.setattr(tasklib, "_pkg_version", lambda _dist: "2.3.4")
+    assert tasklib._resolve_version() == "2.3.4"
 
 
 def test_resolved_version_is_not_the_stale_literal():
