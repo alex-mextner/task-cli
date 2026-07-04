@@ -38,17 +38,19 @@ def _version_from_pyproject() -> str:
 
 
 def _resolve_version() -> str:
-    """Resolve the version dynamically: installed-distribution metadata, else pyproject.toml.
+    """Resolve the version dynamically: checkout pyproject.toml, else package metadata.
 
     pyproject.toml is the single source of truth; there is no hardcoded literal to drift.
     """
     try:
+        return _version_from_pyproject()
+    except OSError:
+        pass
+
+    try:
         return _pkg_version(_DISTRIBUTION)
     except PackageNotFoundError:
-        try:
-            return _version_from_pyproject()
-        except OSError:
-            return "0+unknown"
+        return "0+unknown"
 
 
 __version__ = _resolve_version()
