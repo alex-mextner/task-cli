@@ -14,6 +14,7 @@ Global flags: --backend, --repo, --config, --json, --yes, and per-gate --skip-<g
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import subprocess
 import sys
@@ -719,11 +720,65 @@ def _notify_mutation(cfg, ticket, action: str) -> None:
     from . import daemon as _daemon
 
     dcfg = _daemon.DaemonConfig.from_config(cfg)
-    notifier = dcfg.notifier
+    notifier, html_mode = _resolve_notification_notifier(dcfg.notifier)
     state_str = ticket.state.value if ticket.state else "unknown"
-    url_part = f"\n{ticket.url}" if ticket.url else ""
-    msg = f"[task {action}] {ticket.id}: {ticket.title} [{state_str}]{url_part}"
+    msg = _mutation_message(ticket, action, state_str, html_mode=html_mode)
     _daemon.notify(msg, notifier)
+
+
+def _mutation_message(ticket: Ticket, action: str, state_str: str, *, html_mode: bool) -> str:
+    """Render the one-line mutation notice in plain text or Telegram HTML."""
+    ticket_id = ticket.id or "(new)"
+    if not html_mode:
+        url_part = f"\n{ticket.url}" if ticket.url else ""
+        return f"[task {action}] {ticket_id}: {ticket.title} [{state_str}]{url_part}"
+
+    safe_action = html.escape(action, quote=False)
+    safe_title = html.escape(ticket.title or "", quote=False)
+    safe_state = html.escape(state_str, quote=False)
+    display_id = html.escape(ticket_id, quote=False)
+    if ticket.url:
+        display_id = f'<a href="{html.escape(ticket.url, quote=True)}">{display_id}</a>'
+    return f"[task {safe_action}] {display_id}: {safe_title} [{safe_state}]"
+
+
+def _resolve_notification_notifier(notifier: tuple[str, ...]) -> tuple[tuple[str, ...], bool]:
+    if not _is_tg_notifier(notifier):
+        return notifier, False
+    notifier, fmt = _normalize_format_arg(notifier)
+    if fmt is None:
+        return (*notifier, "--format", "html"), True
+    return notifier, fmt.strip().lower() == "html"
+
+
+def _is_tg_notifier(notifier: tuple[str, ...]) -> bool:
+    return bool(notifier) and Path(notifier[0]).name == "tg"
+
+
+def _normalize_format_arg(notifier: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
+    normalized: list[str] = []
+    fmt: str | None = None
+    idx = 0
+    while idx < len(notifier):
+        arg = notifier[idx]
+        if arg == "--format":
+            normalized.append(arg)
+            if idx + 1 < len(notifier):
+                fmt = notifier[idx + 1]
+                normalized.append(fmt)
+                idx += 2
+            else:
+                fmt = ""
+                idx += 1
+            continue
+        if arg.startswith("--format="):
+            fmt = arg.split("=", 1)[1]
+            normalized.extend(["--format", fmt])
+            idx += 1
+            continue
+        normalized.append(arg)
+        idx += 1
+    return tuple(normalized), fmt
 
 
 def _as_bool_cfg(value, *, default: bool) -> bool:

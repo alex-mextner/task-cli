@@ -9,7 +9,8 @@ from __future__ import annotations
 import pytest
 
 from tasklib import cli
-from tasklib.cli import build_parser, main
+from tasklib.cli import _mutation_message, build_parser, main
+from tasklib.model import Ticket
 
 
 @pytest.fixture(autouse=True)
@@ -1517,10 +1518,11 @@ def test_create_sends_tg_notification(monkeypatch, _inject_fake):
     assert rc == 0
     assert len(calls) == 1
     msg, notifier = calls[0]
-    assert "#1" in msg
+    assert '<a href="https://fake/1">#1</a>' in msg
     assert "created" in msg
     assert "Add a thing" in msg
     assert "tg" in notifier[0]
+    assert "--format" in notifier and "html" in notifier
 
 
 def test_done_sends_tg_notification(monkeypatch, _inject_fake):
@@ -1533,6 +1535,7 @@ def test_done_sends_tg_notification(monkeypatch, _inject_fake):
     assert len(calls) == 1
     msg, _ = calls[0]
     assert "done" in msg and "#1" in msg
+    assert '<a href="https://fake/1">#1</a>' in msg
 
 
 def test_change_done_sends_tg_notification(monkeypatch, _inject_fake):
@@ -1545,6 +1548,7 @@ def test_change_done_sends_tg_notification(monkeypatch, _inject_fake):
     assert len(calls) == 1
     msg, _ = calls[0]
     assert "done" in msg and "#1" in msg
+    assert '<a href="https://fake/1">#1</a>' in msg
 
 
 def test_change_update_sends_tg_notification(monkeypatch, _inject_fake):
@@ -1556,6 +1560,7 @@ def test_change_update_sends_tg_notification(monkeypatch, _inject_fake):
     assert len(calls) == 1
     msg, _ = calls[0]
     assert "changed" in msg and "#1" in msg
+    assert '<a href="https://fake/1">#1</a>' in msg
 
 
 def test_status_transition_sends_tg_notification(monkeypatch, _inject_fake):
@@ -1567,6 +1572,7 @@ def test_status_transition_sends_tg_notification(monkeypatch, _inject_fake):
     assert len(calls) == 1
     msg, _ = calls[0]
     assert "changed" in msg and "#1" in msg
+    assert '<a href="https://fake/1">#1</a>' in msg
 
 
 def test_list_does_not_send_tg_notification(monkeypatch, _inject_fake):
@@ -1604,3 +1610,72 @@ def test_notification_failure_does_not_fail_ticket_op(monkeypatch, _inject_fake,
     rc = main(_create_argv())
     assert rc == 0
     assert "created #1" in capsys.readouterr().out
+
+
+def test_notification_html_escapes_title(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    rc = main(_create_argv() + ["--title", "Fix <preview> & links"])
+    assert rc == 0
+    msg, _ = calls[0]
+    assert "Fix &lt;preview&gt; &amp; links" in msg
+    assert "<preview>" not in msg
+
+
+def test_notification_custom_notifier_stays_plain(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(
+        _d.DaemonConfig,
+        "from_config",
+        classmethod(lambda cls, cfg: _d.DaemonConfig(notifier=("mynotify", "--quiet"))),
+    )
+    rc = main(_create_argv())
+    assert rc == 0
+    msg, notifier = calls[0]
+    assert notifier == ("mynotify", "--quiet")
+    assert msg.startswith("[task created] #1: Add a thing [todo]")
+    assert "\nhttps://fake/1" in msg
+
+
+def test_notification_tg_format_plain_override_is_not_mutated(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(
+        _d.DaemonConfig,
+        "from_config",
+        classmethod(lambda cls, cfg: _d.DaemonConfig(notifier=("tg", "--format", "plain"))),
+    )
+    rc = main(_create_argv())
+    assert rc == 0
+    msg, notifier = calls[0]
+    assert notifier == ("tg", "--format", "plain")
+    assert '<a href="https://fake/1">#1</a>' not in msg
+    assert msg.startswith("[task created] #1: Add a thing [todo]")
+
+
+def test_notification_tg_format_equals_html_is_not_duplicated(monkeypatch, _inject_fake):
+    calls = _patch_notify(monkeypatch)
+    from tasklib import daemon as _d
+
+    monkeypatch.setattr(
+        _d.DaemonConfig,
+        "from_config",
+        classmethod(lambda cls, cfg: _d.DaemonConfig(notifier=("tg", "--format=html"))),
+    )
+    rc = main(_create_argv())
+    assert rc == 0
+    msg, notifier = calls[0]
+    assert notifier == ("tg", "--format", "html")
+    assert '<a href="https://fake/1">#1</a>' in msg
+
+
+def test_mutation_message_escapes_href_attributes():
+    msg = _mutation_message(
+        Ticket(id="HYP-903", url='https://linear.example/issue/HYP-903?a=1&b="two"', title="Fix"),
+        "created",
+        "todo",
+        html_mode=True,
+    )
+    assert 'href="https://linear.example/issue/HYP-903?a=1&amp;b=&quot;two&quot;"' in msg
