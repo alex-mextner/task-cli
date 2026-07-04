@@ -593,11 +593,18 @@ def _report_and_die(result, label: str) -> None:
     if result.skipped:
         print(_warn(f"  skipped gates (justified): {', '.join(result.skipped)}"))
     if not result.ok:
+        from .policy import NON_SKIPPABLE_GATES
+
         print(_err(f"refusing to {label}: {len(result.violations)} gate(s) unmet"))
         for v in result.violations:
             print(_err(f"  ✗ {v.gate}: {v.message}"))
             if v.hint:
-                print(_dim(f"      → {v.hint}  (or --skip-{v.gate} \"<reason>\")"))
+                # A NON_SKIPPABLE gate (e.g. acceptance-checked, msgref-title) has no
+                # --skip-<gate> flag at all -- suggesting one is actively misleading (task-cli#45
+                # review finding: the new msgref-title gate inherited this pre-existing wart from
+                # acceptance-checked). Only append the skip hint for a gate that actually has one.
+                skip_hint = "" if v.gate in NON_SKIPPABLE_GATES else f'  (or --skip-{v.gate} "<reason>")'
+                print(_dim(f"      → {v.hint}{skip_hint}"))
         raise _UserError("policy gates not satisfied")
 
 
@@ -618,14 +625,57 @@ def _apply_force(ticket: Ticket, cfg, phase, reason: str | None, forceable: set[
             ticket.skips.setdefault(v.gate, reason)
 
 
-def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact: bool) -> None:
+def _derive_title_from_message(text: str) -> str:
+    """Derive a ticket title from raw inbound text (the ``--from-message`` / ``classify
+    --create`` hook path): first line, truncated to 72 chars — but with a leading tg-cli inbound-
+    inject wrap (``[TG from <name> tg#<id>]``) stripped FIRST, so the title never inherits the
+    wrap's own ``tg#<id>`` and trips the non-skippable ``msgref-title`` gate (task-cli#45 review
+    finding: this is the documented hook path tasklib.msgrefs's module docstring names as the
+    whole feature's motivating case — it must not be the one path that breaks). Shared by
+    :func:`cmd_create` and :func:`_classify_create` so both derive a title the same way."""
+    from .msgrefs import strip_inbound_wrap
+
+    unwrapped = strip_inbound_wrap(text.strip())
+    first = unwrapped.split("\n", 1)[0]
+    return first[:72]
+
+
+def _expand_msgrefs(text: str, history=None):
+    """Expand every ``tg#<id>`` mention in ``text`` into itself plus a quote pulled from
+    tg-cli's local message history (task 6109 / HYP-897) — see :mod:`tasklib.msgrefs`. A no-op
+    when ``text`` carries no reference (or ``text`` is falsy), so calling this on every prose
+    field is always safe. ``history`` lets a caller load the (potentially large, append-only)
+    history log ONCE per command via :func:`_load_msgref_history` and reuse it across fields,
+    instead of re-reading it from disk for every field that happens to carry a reference."""
+    if not text:
+        return text
+    from .msgrefs import render_msgref_quotes
+
+    return render_msgref_quotes(text, history=history)
+
+
+def _load_msgref_history_if_needed(*texts: str):
+    """Load tg-cli's local message history ONCE per command — but only when at least one of
+    ``texts`` actually names a ``tg#<id>`` reference. A metadata-only edit, or a ticket that
+    never mentions one, never touches disk for this (the log is append-only and can grow large;
+    task-cli#45 review finding)."""
+    from .msgrefs import detect_msgrefs, load_history
+
+    if not any(detect_msgrefs(t) for t in texts if t):
+        return None
+    return load_history()
+
+
+def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact: bool, check_title: bool = False) -> None:
     """The edit-time gates (rule 1 links, and rule 5 impact-quality when impact was touched).
 
     A plain ``change`` (not a close) doesn't re-run the full create gates — an edit may be a
     partial step. The links rule runs only when the edit TOUCHED a scanned text field, so a
     metadata-only edit (``--due``/``--label``) on a ticket whose body (e.g. one created in the
     GitHub/Linear web UI) already carries a bare reference is never blocked. The impact-quality
-    rule runs only when the edit sets/changes the impact.
+    rule runs only when the edit sets/changes the impact. ``check_title`` runs the (non-skippable)
+    ``msgref-title`` gate only when this edit is SETTING the title (``--title``) — an edit that
+    leaves the title alone can't be blocked by a title it didn't touch.
 
     Note the links scan is a FULL re-scan of the ticket text, not only the changed field: a
     clean ``--title`` edit on a ticket that already carries a bare reference in another section
@@ -635,7 +685,7 @@ def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact
     boolean transition-legality override, not a reason). Only a metadata-only edit, which
     touches no scanned field, is exempt.
     """
-    from .policy import apply_skips, impact_quality_violation, links_violation
+    from .policy import apply_skips, impact_quality_violation, links_violation, msgref_title_violation
 
     cfg_e = _enforce_config(cfg)
     raw = []
@@ -645,6 +695,10 @@ def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact
             raw.append(v)
     if check_impact:
         v = impact_quality_violation(ticket, cfg_e)
+        if v is not None:
+            raw.append(v)
+    if check_title:
+        v = msgref_title_violation(ticket, cfg_e)
         if v is not None:
             raw.append(v)
     if raw:
@@ -716,22 +770,40 @@ def cmd_create(args: argparse.Namespace) -> int:
     title = args.title
     what = args.what or ""
     if args.from_message and not title:
-        # derive a title from the first line of the raw message (the hook path)
-        first = args.from_message.strip().split("\n", 1)[0]
-        title = first[:72]
+        # derive a title from the first line of the raw message (the hook path) — see
+        # _derive_title_from_message for why this strips a leading tg-cli inbound wrap first.
+        title = _derive_title_from_message(args.from_message)
         what = what or args.from_message.strip()
     if not title:
         raise _UserError("a title is required (--title, or --from-message to derive one)")
 
+    # Expand tg#<id> mentions in each prose field, once history is loaded (a single read of
+    # tg-cli's local history log, reused across all four fields — see _load_msgref_history).
+    # Safe to do BEFORE the gates run: `links`/`user-impact-quality` ignore any `>` blockquote
+    # line (policy._strip_quoted_blocks), which is exactly the shape the appended quote takes, so
+    # the quoted Telegram message — arbitrary text the ticket's author didn't write — can never
+    # itself cause a refusal, no matter which command later re-scans the stored field
+    # (task-cli#45 review finding: an earlier "expand only after THIS command's gates" version
+    # protected only the expanding command itself — a later edit or close re-scanned the already-
+    # expanded stored text and reintroduced the same failure).
+    #
+    # Acceptance criteria are deliberately EXCLUDED: render.py serializes each criterion as ONE
+    # markdown checkbox line (`- [ ] <text>`), and _parse_criteria reads it back line-by-line —
+    # a criterion text containing the quote's embedded newlines renders as loose markdown BELOW
+    # the checkbox and is silently dropped on the next parse (verified empirically: render→parse
+    # loses everything after the first line). A tg#<id> in a criterion stays a bare, un-expanded
+    # mention — harmless, since the links gate already excludes tg#<id> from its bare-reference
+    # scan.
+    history = _load_msgref_history_if_needed(what, args.why or "", args.impact or "", args.if_not_done or "")
     labels = list(dict.fromkeys([*args.label, session.label]))
     screenshots = [Screenshot(ref=p, kind="creation") for p in args.screenshot]
     due = _normalize_due(getattr(args, "due", None)) or ""
     ticket = Ticket(
         title=title,
-        what=what,
-        why=args.why or "",
-        user_impact=args.impact or "",
-        cost_of_inaction=args.if_not_done or "",
+        what=_expand_msgrefs(what, history),
+        why=_expand_msgrefs(args.why or "", history),
+        user_impact=_expand_msgrefs(args.impact or "", history),
+        cost_of_inaction=_expand_msgrefs(args.if_not_done or "", history),
         acceptance=list(args.acceptance),
         screenshots=screenshots,
         labels=labels,
@@ -1179,16 +1251,23 @@ def cmd_change(args: argparse.Namespace) -> int:
     if args.done:
         validate_transition(ticket.state, State.DONE, force=args.force)
 
+    # Load tg-cli's local history ONCE for this command, and only if a touched field actually
+    # names a reference (see _load_msgref_history_if_needed) — a metadata-only edit (--due/
+    # --label) or an edit naming no tg#<id> never touches the (potentially large) history log.
+    history = _load_msgref_history_if_needed(args.what or "", args.why or "", args.impact or "", args.if_not_done or "")
     if args.title:
         ticket.title = args.title
     if args.what:
-        ticket.what = args.what
+        ticket.what = _expand_msgrefs(args.what, history)
     if args.why:
-        ticket.why = args.why
+        ticket.why = _expand_msgrefs(args.why, history)
     if args.impact:
-        ticket.user_impact = args.impact
+        ticket.user_impact = _expand_msgrefs(args.impact, history)
     if args.if_not_done:
-        ticket.cost_of_inaction = args.if_not_done
+        ticket.cost_of_inaction = _expand_msgrefs(args.if_not_done, history)
+    # Acceptance criteria are NEVER msgref-expanded (see the cmd_create comment on why: the
+    # single-line checkbox format can't carry a multi-line quote), so this dedup stays plain
+    # equality against the stored (always-raw) text — unchanged from before this feature.
     existing_texts = {c.text for c in ticket.acceptance}
     for crit in args.acceptance:
         if crit not in existing_texts:
@@ -1213,7 +1292,9 @@ def cmd_change(args: argparse.Namespace) -> int:
     touched_text = any(
         [args.title, args.what, args.why, args.impact, args.if_not_done, args.acceptance]
     )
-    _enforce_edit_or_die(ticket, cfg, check_links=touched_text, check_impact=bool(args.impact))
+    _enforce_edit_or_die(
+        ticket, cfg, check_links=touched_text, check_impact=bool(args.impact), check_title=bool(args.title)
+    )
 
     if args.done:
         from .policy import Phase
@@ -1458,12 +1539,23 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
 
     # create from message: an inbound message can't carry full criteria, so the draft is
     # filled with triage placeholders. Rather than silently bypassing policy, we RUN the gates
-    # and record every still-failing gate as an explicit, auditable auto-skip — so the ticket
-    # is always policy-clean by construction and the bypass is visible in the body.
-    first = args.text.strip().split("\n", 1)[0]
+    # and record every still-failing SKIPPABLE gate as an explicit, auditable auto-skip — so the
+    # ticket is always policy-clean by construction and the bypass is visible in the body. The
+    # title is derived the SAME way cmd_create's --from-message path does (strip a leading tg-cli
+    # inbound wrap first) — this is, after all, the exact hook this classify path exists for
+    # (task-cli#45 review finding: the two paths must not derive a title differently).
+    what_raw = args.text.strip()
+    title = _derive_title_from_message(args.text)
+    if not title:
+        # A wrap-only inbound message (`[TG from Alex tg#1234]`, no content after it — a
+        # malformed or truncated hook call) derives an EMPTY title. cmd_create's --from-message
+        # path already refuses this (`if not title: raise _UserError(...)`); this path must
+        # refuse the same way rather than silently create a titleless ticket (task-cli#45
+        # review finding: the two paths must not diverge on this either).
+        raise _UserError("cannot auto-create from this message — no title could be derived from it")
     ticket = Ticket(
-        title=first[:72],
-        what=args.text.strip(),
+        title=title,
+        what=what_raw,
         why="(auto-created from an inbound message; needs triage)",
         user_impact="(needs triage)",
         cost_of_inaction="(needs triage)",
@@ -1471,7 +1563,20 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
         labels=list(dict.fromkeys([*cfg.section("github").get("default_labels", []), session.label, "needs-triage"])),
         links={"Session": session.label},
     )
-    _auto_skip_failing_gates(ticket, cfg)
+    blocking = _auto_skip_failing_gates(ticket, cfg)
+    if blocking:
+        # A NON-skippable gate still fails after auto-skipping everything that CAN be skipped —
+        # e.g. msgref-title, if the title-derivation fix above somehow still let a tg#<id>
+        # through. Refuse loudly rather than silently persist a ticket that violates a rule with
+        # no legitimate exception (task-cli#45 review finding: this is exactly the scenario the
+        # non-skippable gate exists to prevent, and it must never be bypassed here either).
+        names = "; ".join(f"{v.gate}: {v.message}" for v in blocking)
+        raise _UserError(f"cannot auto-create from this message — non-skippable gate(s) failed: {names}")
+    # Expand tg#<id> mentions in `what` the SAME way cmd_create's --from-message path does — this
+    # classify path is ALSO a tg-cli hook entry point (it IS the `task classify "<msg>" --create`
+    # call an agent makes from an inbound message), so it must not be the one path that silently
+    # drops the quote a reader would otherwise get everywhere else (task-cli#45 review finding).
+    ticket.what = _expand_msgrefs(ticket.what, _load_msgref_history_if_needed(what_raw))
     try:
         created = backend.create(ticket)
     except BackendError as exc:
@@ -1483,17 +1588,26 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
     return 0
 
 
-def _auto_skip_failing_gates(ticket: Ticket, cfg) -> None:
-    """Run the create gates and record any failure as an auditable auto-skip on the ticket.
+def _auto_skip_failing_gates(ticket: Ticket, cfg) -> list:
+    """Run the create gates and record any failing SKIPPABLE gate as an auditable auto-skip.
 
-    Used by the inbound-classify path, where a message can't satisfy every gate up front. The
-    result is a ticket that passes policy by construction, with each waived gate visible in the
-    ``Skipped gates`` section — never a silent bypass.
+    Used by the inbound-classify path, where a message can't satisfy every gate up front. A
+    skippable gate's waiver is recorded, visible in the ``Skipped gates`` section — never a
+    silent bypass. Returns any violations that are NOT skippable (see
+    ``policy.NON_SKIPPABLE_GATES``): those are NEVER auto-skipped here — a gate with no
+    legitimate exception (e.g. ``msgref-title``) must not be silently waived just because this
+    path can't fill in every field up front (task-cli#45 review finding). The caller must refuse
+    the create when this returns anything.
     """
-    from .policy import Phase, check
+    from .policy import NON_SKIPPABLE_GATES, Phase, check
 
+    blocking = []
     for v in check(ticket, _enforce_config(cfg), Phase.CREATE).violations:
-        ticket.skips.setdefault(v.gate, "auto-created from inbound message; pending triage")
+        if v.gate in NON_SKIPPABLE_GATES:
+            blocking.append(v)
+        else:
+            ticket.skips.setdefault(v.gate, "auto-created from inbound message; pending triage")
+    return blocking
 
 
 def _classify_append(args: argparse.Namespace, cfg) -> int:
@@ -1509,10 +1623,19 @@ def _classify_append(args: argparse.Namespace, cfg) -> int:
 
 
 def _best_dedup_match(text: str, candidates: list[Ticket]) -> Ticket | None:
-    """Conservative dedup: pick the candidate whose title is highly similar to the message."""
+    """Conservative dedup: pick the candidate whose title is highly similar to the message.
+
+    ``text`` is matched via the SAME title derivation :func:`_derive_title_from_message` uses
+    (strip a leading tg-cli inbound wrap, first line, truncate) — not the raw first line — so a
+    wrapped inbound message (``[TG from Alex tg#1234] <message>``) is compared against a stored
+    candidate's title on equal terms. A stored title is ALREADY wrap-stripped (every ticket this
+    path creates goes through the same derivation); comparing it against the raw wrapped first
+    line would score a genuine repeat-message low on similarity and create a duplicate ticket
+    instead of dedup-commenting on the existing one (task-cli#45 review finding).
+    """
     import difflib
 
-    target = text.strip().split("\n", 1)[0].lower()
+    target = _derive_title_from_message(text).lower()
     best: tuple[float, Ticket] | None = None
     for t in candidates:
         if t.state in (State.DONE, State.CANCELLED):
