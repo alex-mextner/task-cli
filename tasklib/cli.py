@@ -18,6 +18,7 @@ import html
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -902,6 +903,10 @@ def cmd_create(args: argparse.Namespace) -> int:
 # in an interactive TTY where the pager scrolls and a 30-row cap would just hide tickets.
 _LIMIT_PIPED = 30
 _LIMIT_INTERACTIVE = 100
+_STALE_WARNING_SECONDS = 4 * 60 * 60
+_RECENT_WARNING_SECONDS = 30 * 60
+_ATTENTION_STATES = {State.TODO, State.IN_PROGRESS, State.IN_REVIEW}
+_RECENT_PRIORITY_STATES = {State.IN_PROGRESS, State.IN_REVIEW}
 
 
 def _effective_limit(args: argparse.Namespace) -> int:
@@ -925,6 +930,101 @@ def _emit_list(args: argparse.Namespace, blocks: list[str]) -> None:
 
     text = "\n".join(b for b in blocks if b)
     page(text, no_pager_flag=getattr(args, "no_pager", False))
+
+
+def _env_seconds(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(0, value)
+
+
+def _age_text(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def _attention_line(ticket: Ticket, age: int | None) -> str:
+    suffix = f" (touched {_age_text(age)})" if age is not None else ""
+    return f"{ticket.id} [{ticket.state.value}] {ticket.title}{suffix}"
+
+
+def _session_attention_notice(session, tickets: list[Ticket]) -> str:
+    """Human-only warning for active session tasks that are easy to forget.
+
+    Backend timestamps are not portable across GitHub/Linear, but the session sidecar records
+    when task-cli last touched a ticket in this session. Use that as a conservative signal:
+    old active work suggests parallel follow-up; recently touched in-progress work suggests the
+    agent should ask whether to continue it before switching priority.
+    """
+    if session.source == "none":
+        return ""
+    active = [t for t in tickets if t.state in _ATTENTION_STATES]
+    if not active:
+        return ""
+
+    from .session import read_entries
+
+    entries = {entry.id: entry for entry in read_entries(session.id)}
+    now = int(time.time())
+    stale_after = _env_seconds("TASK_STALE_WARNING_SECONDS", _STALE_WARNING_SECONDS)
+    recent_before = _env_seconds("TASK_RECENT_WARNING_SECONDS", _RECENT_WARNING_SECONDS)
+    stale: list[tuple[Ticket, int | None]] = []
+    recent: list[tuple[Ticket, int | None]] = []
+    for ticket in active:
+        entry = entries.get(ticket.id)
+        age = (now - entry.ts) if (entry and entry.ts > 0) else None
+        if age is not None and stale_after and age >= stale_after:
+            stale.append((ticket, age))
+            continue
+        if (
+            len(active) > 1
+            and ticket.state in _RECENT_PRIORITY_STATES
+            and age is not None
+            and age >= 0
+            and recent_before
+            and age <= recent_before
+        ):
+            recent.append((ticket, age))
+
+    if not stale and not recent:
+        return ""
+
+    lines = [_warn("warning: active tasks in this session may need attention:")]
+    if stale:
+        lines.append(_dim("  forgotten/old: consider handling in parallel or explicitly parking:"))
+        lines.extend(_dim(f"    - {_attention_line(ticket, age)}") for ticket, age in stale[:3])
+    if recent:
+        lines.append(_dim("  recently touched active task: ask whether to continue it or park it before switching priorities:"))
+        lines.extend(_dim(f"    - {_attention_line(ticket, age)}") for ticket, age in recent[:3])
+    return "\n".join(lines)
+
+
+def _record_session_touch(cfg, ticket: Ticket) -> None:
+    """Refresh this session's sidecar timestamp for a ticket mutation."""
+    if not ticket.id:
+        return
+    session = _detect_session(cfg)
+    if session.source == "none":
+        return
+    if session.label not in ticket.labels:
+        return
+    from .session import record
+
+    record(session.id, ticket.id, ticket.title)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -994,7 +1094,11 @@ def _list_session_scoped(args, cfg, state, current) -> int:
     if args.json:
         _print_tickets_json(tickets)
         return 0
-    _emit_list(args, [_dim(f"session {session.id} ({session.source}):"), _format_tickets(tickets)])
+    _emit_list(args, [
+        _session_attention_notice(session, session_tickets),
+        _dim(f"session {session.id} ({session.source}):"),
+        _format_tickets(tickets),
+    ])
     return 0
 
 
@@ -1367,6 +1471,7 @@ def cmd_change(args: argparse.Namespace) -> int:
 
     from .logging import log_event
 
+    _record_session_touch(cfg, updated)
     log_event("ticket.changed", ticket_id=updated.id, backend=cfg.backend, closed=args.done)
     _notify_mutation(cfg, updated, "done" if args.done else "changed")
     if args.json:
@@ -1422,6 +1527,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         raise _UserError(str(exc)) from exc
     from .logging import log_event
 
+    _record_session_touch(cfg, updated)
     log_event("ticket.transition", ticket_id=updated.id, state=new_state.value)
     _notify_mutation(cfg, updated, "done" if new_state is State.DONE else "changed")
     print(_ok(f"{updated.id} → {new_state.value}"))
@@ -1461,6 +1567,7 @@ def cmd_done(args: argparse.Namespace) -> int:
 
     from .logging import log_event
 
+    _record_session_touch(cfg, updated)
     log_event("ticket.transition", ticket_id=updated.id, state=State.DONE.value)
     _notify_mutation(cfg, updated, "done")
     print(_ok(f"{updated.id} → {State.DONE.value}"))
@@ -1511,6 +1618,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     from .logging import log_event
 
+    _record_session_touch(cfg, updated)
     log_event("criterion.checked", ticket_id=updated.id, forced=bool(force_reason and not proofs))
     proof_note = f"proof {proofs[0]}" if proofs else f"forced ({force_reason})"
     remaining = len(updated.unchecked_criteria())
@@ -1589,6 +1697,7 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
             backend.comment(match.id, f"(restated) {args.text.strip()}")
         except BackendError as exc:
             raise _UserError(str(exc)) from exc
+        _record_session_touch(cfg, match)
         print(_ok(f"appended to {match.id} (dedup)"))
         return 0
 
@@ -1673,6 +1782,12 @@ def _classify_append(args: argparse.Namespace, cfg) -> int:
         backend.comment(args.update, f"(restated) {args.text.strip()}")
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
+    try:
+        ticket = backend.get(args.update)
+    except BackendError:
+        ticket = None
+    if ticket is not None:
+        _record_session_touch(cfg, ticket)
     print(_ok(f"appended to {args.update}"))
     return 0
 
