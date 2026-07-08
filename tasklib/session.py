@@ -46,6 +46,15 @@ class Session:
         return f"{self.prefix}{self.id}"
 
 
+@dataclass(frozen=True)
+class SessionEntry:
+    """One sidecar touch record after de-duplication."""
+
+    id: str
+    title: str = ""
+    ts: int = 0
+
+
 def _slug(value: str) -> str:
     """Make a label-safe, filesystem-safe id from a raw source string.
 
@@ -143,10 +152,20 @@ def record(session_id: str, ticket_id: str, title: str, env: dict[str, str] | No
 
 def read_ids(session_id: str, env: dict[str, str] | None = None) -> list[str]:
     """Return the de-duplicated ticket ids recorded for a session, newest-last."""
+    return [entry.id for entry in read_entries(session_id, env)]
+
+
+def read_entries(session_id: str, env: dict[str, str] | None = None) -> list[SessionEntry]:
+    """Return de-duplicated sidecar entries, newest-last.
+
+    The sidecar is append-only. Re-appending an id is a touch, so the latest line wins and
+    moves that ticket to the end. Malformed legacy lines are ignored; missing timestamps
+    degrade to ``0`` so old sidecars still produce ids without pretending to know recency.
+    """
     path = sidecar_path(session_id, env)
     if not path.is_file():
         return []
-    seen: dict[str, None] = {}
+    seen: dict[str, SessionEntry] = {}
     try:
         for raw in path.read_text(encoding="utf-8").splitlines():
             raw = raw.strip()
@@ -156,10 +175,16 @@ def read_ids(session_id: str, env: dict[str, str] | None = None) -> list[str]:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(obj, dict):
+                continue
             tid = obj.get("id")
-            if tid:
+            if isinstance(tid, str) and tid:
                 seen.pop(tid, None)
-                seen[tid] = None
+                try:
+                    ts = int(obj.get("ts") or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                seen[tid] = SessionEntry(id=tid, title=str(obj.get("title") or ""), ts=ts)
     except OSError:
         return []
-    return list(seen.keys())
+    return list(seen.values())

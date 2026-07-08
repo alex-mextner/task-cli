@@ -352,6 +352,147 @@ def test_list_filter_excludes_all_session_tickets_does_not_fall_back(capsys, _in
     assert "other-session" not in out and "#2" not in out
 
 
+def _write_session_touch(session_id: str, ticket_id: str, title: str, ts: int) -> None:
+    import json
+
+    from tasklib.session import sidecar_path
+
+    path = sidecar_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"id": ticket_id, "title": title, "ts": ts}) + "\n", encoding="utf-8")
+
+
+def _write_raw_session_line(session_id: str, payload: object) -> None:
+    import json
+
+    from tasklib.session import sidecar_path
+
+    path = sidecar_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def test_list_warns_about_stale_active_session_task(capsys, _inject_fake):
+    stale = Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS)
+    _inject_fake.create(stale)
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "active tasks in this session may need attention" in out
+    assert "#1 [in-progress] Old active work" in out
+    assert "parallel" in out
+
+
+def test_list_recent_active_task_prompts_continue_or_deprioritize(capsys, _inject_fake, monkeypatch):
+    import time
+
+    monkeypatch.setenv("TASK_RECENT_WARNING_SECONDS", "999999")
+    _inject_fake.create(Ticket(title="Started just now", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _inject_fake.create(Ticket(title="New priority", labels=["session:testsess"], state=cli.State.TODO))
+    _write_session_touch("testsess", "#1", "Started just now", int(time.time()))
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "recently touched active task" in out
+    assert "ask whether to continue it or park it" in out
+
+
+def test_list_legacy_sidecar_without_timestamp_does_not_warn(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Old sidecar format", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_raw_session_line("testsess", {"id": "#1", "title": "Old sidecar format"})
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "active tasks in this session may need attention" not in out
+    assert "#1" in out
+
+
+def test_list_ignores_non_object_sidecar_lines(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_raw_session_line("testsess", [])
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "#1" in out
+
+
+def test_list_ignores_sidecar_lines_with_non_string_ids(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_raw_session_line("testsess", {"id": ["#1"], "title": "bad id", "ts": 1})
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "#1" in out
+
+
+def test_list_future_sidecar_timestamp_is_not_recent(capsys, _inject_fake, monkeypatch):
+    import time
+
+    monkeypatch.setenv("TASK_RECENT_WARNING_SECONDS", "999999")
+    _inject_fake.create(Ticket(title="Future timestamp", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _inject_fake.create(Ticket(title="Other priority", labels=["session:testsess"], state=cli.State.TODO))
+    _write_session_touch("testsess", "#1", "Future timestamp", int(time.time()) + 3600)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "recently touched active task" not in out
+
+
+def test_list_json_omits_stale_task_warning(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+
+    rc = main(["list", "--json"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "active tasks in this session" not in out
+    import json
+
+    payload = json.loads(out)
+    assert payload[0]["id"] == "#1"
+
+
+def test_status_transition_refreshes_session_touch(capsys, _inject_fake):
+    from tasklib.session import read_entries
+
+    _inject_fake.create(Ticket(title="Touch me", labels=["session:testsess"], state=cli.State.TODO))
+    _write_session_touch("testsess", "#1", "Touch me", 1)
+
+    rc = main(["status", "#1", "in-progress"])
+    capsys.readouterr()
+
+    assert rc == 0
+    entries = read_entries("testsess")
+    assert entries[-1].id == "#1"
+    assert entries[-1].ts > 1
+
+
+def test_status_transition_does_not_record_ticket_from_another_session(capsys, _inject_fake):
+    from tasklib.session import read_entries
+
+    _inject_fake.create(Ticket(title="Other session", labels=["session:elsewhere"], state=cli.State.TODO))
+
+    rc = main(["status", "#1", "in-progress"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert read_entries("testsess") == []
+
+
 # ── gantt (read-only due-date timeline) ──────────────────────────────────────────────
 
 
@@ -1117,6 +1258,33 @@ def test_classify_change_creates_ticket(capsys, monkeypatch, _inject_fake):
     assert "created" in out
 
 
+def test_classify_update_success_not_masked_by_refetch_failure(capsys, monkeypatch, _inject_fake):
+    from tasklib.backends import BackendError
+
+    main(_create_argv())
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+
+    def _comment(ticket_id: str, body: str) -> None:
+        _inject_fake.comments.append((ticket_id, body))
+
+    monkeypatch.setattr(_inject_fake, "comment", _comment)
+    monkeypatch.setattr(_inject_fake, "get", lambda _ticket_id: (_ for _ in ()).throw(BackendError("temporary get failed")))
+
+    rc = main(["classify", "append this context", "--update", "#1"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "appended to #1" in out
+    assert _inject_fake.comments == [("#1", "(restated) append this context")]
+
+
 def test_classify_create_dedup_matches_against_wrap_stripped_title(capsys, monkeypatch, _inject_fake):
     # task-cli#45 review finding: the stored ticket's title is ALWAYS wrap-stripped (every
     # ticket this path creates goes through _derive_title_from_message). A repeat inbound
@@ -1132,12 +1300,16 @@ def test_classify_create_dedup_matches_against_wrap_stripped_title(capsys, monke
     )
     main(["classify", "[TG from Alex tg#100] please add a dark mode toggle to settings", "--create"])
     assert len(_inject_fake.list()) == 1
+    _write_session_touch("testsess", "#1", "please add a dark mode toggle to settings", 1)
     capsys.readouterr()
     rc = main(["classify", "[TG from Alex tg#200] please add a dark mode toggle to settings", "--create"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "dedup" in out
     assert len(_inject_fake.list()) == 1  # still one ticket — the repeat was a comment, not a create
+    from tasklib.session import read_entries
+
+    assert read_entries("testsess")[-1].ts > 1
 
 
 def test_classify_create_makes_policy_clean_draft(capsys, monkeypatch, _inject_fake):
