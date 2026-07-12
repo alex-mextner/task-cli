@@ -113,6 +113,7 @@ def test_create_complete_ticket_succeeds(capsys, _inject_fake):
     assert rc == 0
     out = capsys.readouterr().out
     assert "created #1" in out
+    assert "active tasks in this session" not in out
     assert len(_inject_fake.list()) == 1
 
 
@@ -466,6 +467,95 @@ def test_list_json_omits_stale_task_warning(capsys, _inject_fake):
     assert payload[0]["id"] == "#1"
 
 
+def test_create_warns_about_stale_active_session_task(capsys, _inject_fake):
+    stale = Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS)
+    _inject_fake.create(stale)
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+
+    rc = main(_create_argv())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "created #2" in out
+    assert "active tasks in this session may need attention" in out
+    assert "#1 [in-progress] Old active work" in out
+    assert "parallel" in out
+
+
+def test_create_warns_about_recent_active_session_task(capsys, _inject_fake):
+    import time
+
+    _inject_fake.create(Ticket(title="Started work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Started work", int(time.time()))
+
+    rc = main(_create_argv())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "created #2" in out
+    assert "#1 [in-progress] Started work" in out
+    assert "ask whether to continue it or park it" in out
+
+
+def test_create_json_omits_stale_task_warning(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+
+    rc = main(_create_argv() + ["--json"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "active tasks in this session" not in out
+    import json
+
+    payload = json.loads(out)
+    assert payload["id"] == "#2"
+
+
+def test_create_attention_notice_failure_is_best_effort(capsys, monkeypatch):
+    def _raise_notice(*_args, **_kwargs):
+        raise RuntimeError("broken notice")
+
+    monkeypatch.setattr(cli, "_session_attention_notice", _raise_notice)
+
+    rc = main(_create_argv())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "created #1" in out
+
+
+def test_status_to_in_progress_warns_after_priority_change(capsys, _inject_fake, monkeypatch):
+    import time
+
+    monkeypatch.setenv("TASK_RECENT_WARNING_SECONDS", "999999")
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", int(time.time()))
+    _inject_fake.create(Ticket(title="New priority", labels=["session:testsess"], state=cli.State.TODO))
+
+    rc = main(["status", "#2", "in-progress"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "#2" in out and "in-progress" in out
+    assert "#1 [in-progress] Old active work" in out
+    assert "New priority" not in out
+    assert "ask whether to continue it or park it" in out
+
+
+def test_change_metadata_does_not_emit_priority_attention(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+    _inject_fake.create(Ticket(title="Metadata edit", labels=["session:testsess"], state=cli.State.TODO))
+
+    rc = main(["change", "#2", "--title", "Renamed metadata edit"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "updated #2" in out
+    assert "active tasks in this session" not in out
+
+
 def test_status_transition_refreshes_session_touch(capsys, _inject_fake):
     from tasklib.session import read_entries
 
@@ -618,6 +708,21 @@ def test_status_transition_done_non_ui_succeeds(capsys, _inject_fake):
     rc = main(["status", "#1", "done"])
     assert rc == 0
     assert "→ done" in capsys.readouterr().out
+
+
+def test_status_done_does_not_emit_priority_attention(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+    main(_create_argv())
+    _ready_to_close(_inject_fake, "#2")
+    capsys.readouterr()
+
+    rc = main(["status", "#2", "done"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "→ done" in out
+    assert "active tasks in this session" not in out
 
 
 def test_status_done_persists_skip_justification(_inject_fake):
@@ -1256,6 +1361,25 @@ def test_classify_change_creates_ticket(capsys, monkeypatch, _inject_fake):
     out = capsys.readouterr().out
     assert "change" in out
     assert "created" in out
+
+
+def test_classify_create_omits_priority_attention_for_hook_output(capsys, monkeypatch, _inject_fake):
+    _inject_fake.create(Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS))
+    _write_session_touch("testsess", "#1", "Old active work", 1)
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+
+    rc = main(["classify", "please add a logout button", "--create"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "created #2" in out
+    assert "active tasks in this session" not in out
 
 
 def test_classify_update_success_not_masked_by_refetch_failure(capsys, monkeypatch, _inject_fake):

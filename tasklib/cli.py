@@ -896,6 +896,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         print(json.dumps(_ticket_dict(created), ensure_ascii=False, indent=2))
     else:
         print(_ok(f"created {created.id}  {created.url}"))
+        _print_session_attention_after_mutation(args, cfg, backend, current_id=created.id)
     return 0
 
 
@@ -962,7 +963,7 @@ def _attention_line(ticket: Ticket, age: int | None) -> str:
     return f"{ticket.id} [{ticket.state.value}] {ticket.title}{suffix}"
 
 
-def _session_attention_notice(session, tickets: list[Ticket]) -> str:
+def _session_attention_notice(session, tickets: list[Ticket], *, priority_change: bool = False) -> str:
     """Human-only warning for active session tasks that are easy to forget.
 
     Backend timestamps are not portable across GitHub/Linear, but the session sidecar records
@@ -991,7 +992,7 @@ def _session_attention_notice(session, tickets: list[Ticket]) -> str:
             stale.append((ticket, age))
             continue
         if (
-            len(active) > 1
+            (len(active) > 1 or priority_change)
             and ticket.state in _RECENT_PRIORITY_STATES
             and age is not None
             and age >= 0
@@ -1005,7 +1006,7 @@ def _session_attention_notice(session, tickets: list[Ticket]) -> str:
 
     lines = [_warn("warning: active tasks in this session may need attention:")]
     if stale:
-        lines.append(_dim("  forgotten/old: consider handling in parallel or explicitly parking:"))
+        lines.append(_dim("  forgotten/old: consider continuing in parallel or explicitly parking:"))
         lines.extend(_dim(f"    - {_attention_line(ticket, age)}") for ticket, age in stale[:3])
     if recent:
         lines.append(_dim("  recently touched active task: ask whether to continue it or park it before switching priorities:"))
@@ -1025,6 +1026,27 @@ def _record_session_touch(cfg, ticket: Ticket) -> None:
     from .session import record
 
     record(session.id, ticket.id, ticket.title)
+
+
+def _print_session_attention_after_mutation(args: argparse.Namespace, cfg, backend, *, current_id: str | None = None) -> None:
+    """Best-effort human warning after commands that can switch task context."""
+    if args.json:
+        return
+    try:
+        session = _detect_session(cfg)
+        if session.source == "none":
+            return
+        tickets = backend.session_tickets(session.label, limit=_LIMIT_INTERACTIVE)
+        if current_id is not None:
+            tickets = [ticket for ticket in tickets if ticket.id != current_id]
+        notice = _session_attention_notice(session, tickets, priority_change=True)
+    except Exception as exc:
+        from .logging import log_event
+
+        log_event("session.attention.skipped", error=type(exc).__name__)
+        return
+    if notice:
+        print(notice)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -1531,6 +1553,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     log_event("ticket.transition", ticket_id=updated.id, state=new_state.value)
     _notify_mutation(cfg, updated, "done" if new_state is State.DONE else "changed")
     print(_ok(f"{updated.id} → {new_state.value}"))
+    if new_state in _RECENT_PRIORITY_STATES:
+        _print_session_attention_after_mutation(
+            args,
+            cfg,
+            backend,
+            current_id=updated.id,
+        )
     return 0
 
 
@@ -1748,6 +1777,8 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
     from .session import record
 
     record(session.id, created.id, created.title)
+    # classify --create is the tg-cli inbound hook path; unlike cmd_create, it must not append
+    # a session-attention notice because the hook consumes stdout programmatically.
     print(_ok(f"created {created.id} from message  {created.url}"))
     return 0
 
