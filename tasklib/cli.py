@@ -1759,7 +1759,8 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
         acceptance=[Criterion(text="triage this request and fill in the criteria")],
         labels=list(dict.fromkeys([*cfg.section("github").get("default_labels", []), session.label, "needs-triage"])),
         # See the matching NOTE in cmd_create: the session id belongs in `labels` only, never
-        # duplicated into `links` (that field must contain real URLs only).
+        # duplicated into `links` (which is for real URL references like a PR link, not session
+        # metadata — the Links renderer does not enforce URLs, so junk there slips through).
     )
     blocking = _auto_skip_failing_gates(ticket, cfg)
     if blocking:

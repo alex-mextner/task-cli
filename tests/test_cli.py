@@ -181,6 +181,25 @@ def test_create_records_session_sidecar(_inject_fake):
     assert read_ids("testsess") == ["#1"]
 
 
+def test_create_puts_session_in_labels_not_links(_inject_fake):
+    # Regression (issue #54): `create` must NOT duplicate the session id into the Links section.
+    # The session lives in `labels` only (the value session_tickets() queries by); a non-URL
+    # "Session: session:<id>" entry under `## Links` surfaced as junk in the rendered ticket.
+    from tasklib.render import render
+
+    main(_create_argv())
+    created = _inject_fake.list()[0]
+    assert created.links == {}
+    assert "session:testsess" in created.labels
+    # and the rendered body shows an empty Links section, not the fake session "link".
+    # Bound the slice to the Links section itself (up to the next `## ` heading, if any) so the
+    # assertions measure that section rather than the rest of the document.
+    body = render(created)
+    links_section = body.split("## Links", 1)[1].split("\n## ", 1)[0]
+    assert "session:testsess" not in links_section
+    assert "- (none)" in links_section
+
+
 # ── `new` alias + `done` close verb (CTO-requested ergonomics, issue #8) ─────────────
 
 
@@ -1361,6 +1380,23 @@ def test_classify_change_creates_ticket(capsys, monkeypatch, _inject_fake):
     out = capsys.readouterr().out
     assert "change" in out
     assert "created" in out
+
+
+def test_classify_create_puts_session_in_labels_not_links(monkeypatch, _inject_fake):
+    # Regression (issue #54): the classify --create triage path must also keep the session id
+    # in `labels` only, never duplicated into `links` (mirrors the `create` path).
+    monkeypatch.setattr(cli, "_run_review_just_ask", lambda model, prompt: "change")
+    monkeypatch.setattr(
+        "tasklib.classify.resolve_chain",
+        lambda fallbacks=None, env=None, **_kw: __import__("tasklib.classify", fromlist=["ResolvedModel"]).ResolvedModel(
+            "anthropic", "claude:claude-haiku-4-5"
+        ),
+    )
+    rc = main(["classify", "please add a logout button", "--create"])
+    assert rc == 0
+    created = _inject_fake.list()[0]
+    assert created.links == {}
+    assert "session:testsess" in created.labels
 
 
 def test_classify_create_omits_priority_attention_for_hook_output(capsys, monkeypatch, _inject_fake):

@@ -127,8 +127,13 @@ disable-able globally or per-repo via `enforce:` in config. (Mirrors the existin
 ## Screenshots
 - creation: <img>      - implementation: <img>
 ## Links
-- PR: …    Session: session:<id>
+- PR: …    Deploy: …
 ```
+
+The `## Links` section is for real URL references only (a PR link, a deploy URL, an
+issue link). Session identity is NOT a link: it is carried as a `session:<id>` **label**
+(what `session_tickets()` queries by), never duplicated into Links — a non-URL
+`Session: session:<id>` entry there is junk (issue #54).
 
 This is deliberately the **same section set** as agent-tools' existing
 `ci/pr-checklist/pull_request_template.md` (Motivation/what&why · Acceptance criteria · Screenshots/proof)
