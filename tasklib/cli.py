@@ -863,7 +863,11 @@ def cmd_create(args: argparse.Namespace) -> int:
         acceptance=list(args.acceptance),
         screenshots=screenshots,
         labels=labels,
-        links={"Session": session.label},
+        # NOTE: the session id already lives in `labels` (the value `session_tickets()` queries
+        # by) — it must NOT also go into `links`. The Links section renders as `- key: value`
+        # with no URL requirement, so a "Session: session:2" entry silently escaped the links
+        # gate (which only scans prose fields, see policy._scanned_text) and showed up in the
+        # ticket as a fake, non-URL "link". Reported by the CTO as junk (2026-07-17).
         skips=_collect_skips(args),
         due=due,
     )
@@ -1754,7 +1758,8 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
         cost_of_inaction="(needs triage)",
         acceptance=[Criterion(text="triage this request and fill in the criteria")],
         labels=list(dict.fromkeys([*cfg.section("github").get("default_labels", []), session.label, "needs-triage"])),
-        links={"Session": session.label},
+        # See the matching NOTE in cmd_create: the session id belongs in `labels` only, never
+        # duplicated into `links` (that field must contain real URLs only).
     )
     blocking = _auto_skip_failing_gates(ticket, cfg)
     if blocking:
