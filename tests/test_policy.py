@@ -578,6 +578,33 @@ def test_links_url_rejects_embedded_credentials():
         assert any(v.gate == "links-url" for v in res.violations), bad
 
 
+def test_links_url_rejects_credentials_outside_userinfo():
+    # a token-shaped value can also ride in the path/query/fragment, not just userinfo — this
+    # gate persists the value verbatim, so it leaks the same way embedded userinfo does
+    # (review finding).
+    bad_values = (
+        "https://example.com/download?token=ghp_" + "a" * 20,  # query param
+        "https://example.com/artifacts/ghp_" + "b" * 20 + "/build",  # path segment
+        "https://example.com/x#lin_api_" + "c" * 20,  # fragment
+    )
+    for bad in bad_values:
+        res = check_create(_good_ticket(links={"Ref": bad}), EnforceConfig())
+        assert not res.ok, bad
+        assert any(v.gate == "links-url" for v in res.violations), bad
+
+
+def test_links_url_message_redacts_a_secret_shaped_value_under_a_sensitive_key():
+    # a value that doesn't match the value-shape regex (not gh_/lin_api_/sk-/Bearer-shaped)
+    # still gets redacted wholesale in the violation message when its KEY name alone is a clear
+    # secret signal (api_key, token, secret, …) — mirrors the key-aware masking tasklib.logging
+    # already applies to log lines (review finding). PLACEHOLDER value, not a real credential.
+    fake_secret_value = "PLACEHOLDER-NOT-A-REAL-SECRET-" + "a" * 24
+    res = check_create(_good_ticket(links={"api_key": fake_secret_value}), EnforceConfig())
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert fake_secret_value not in v.message
+    assert "<redacted>" in v.message
+
+
 def test_links_url_message_strips_control_chars_from_key_and_value():
     # an untrusted key/value (from a backend body round-trip) must not inject a terminal escape
     # into the diagnostic printed to the console / a TG notification.

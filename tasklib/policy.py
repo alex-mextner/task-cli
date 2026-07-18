@@ -556,6 +556,20 @@ def _redact_link_display(s: str) -> str:
     return _safe_display(redact(s))
 
 
+def _redact_link_value_display(key: str, value: str) -> str:
+    """Like :func:`_redact_link_display` for a link VALUE, but also KEY-aware: mirrors
+    :func:`tasklib.logging._redact_fields`'s secret-KEY masking (``api_key``, ``token``,
+    ``secret``, …), not just the value-shape regex. A value-shape-only check misses a
+    non-gh/lin_api/sk-/Bearer-shaped secret (e.g. a Slack ``xoxb-…`` token) sitting under an
+    obviously-sensitive key name — the key name alone is enough signal to redact wholesale
+    rather than echo it back in a violation message (review finding)."""
+    from .logging import _REDACTED, _SECRET_KEY_RE
+
+    if _SECRET_KEY_RE.search(key):
+        return _REDACTED
+    return _redact_link_display(value)
+
+
 def _is_valid_link_key(key: str) -> bool:
     """A Links KEY must round-trip through render→parse and be safe to echo. ``render._render_links``
     writes ``- {key}: {value}`` and ``render._parse_links`` splits on the FIRST ``:``, so a key
@@ -597,6 +611,16 @@ def _is_http_url(value: str) -> bool:
     # legitimate reason for a ticket Link to carry embedded auth.
     if parsed.username is not None or parsed.password is not None:
         return False
+    # A credential can also ride in the path/query/fragment, not just userinfo
+    # (`https://example.com/download?token=ghp_...`, `.../ghp_.../artifact`) — this gate
+    # persists the value verbatim, so that leaks it into a shared, often-public tracker the
+    # same as embedded userinfo does (review finding). Reuse the shared token-shaped-value
+    # detector (gh/Linear/OpenAI-style opaque tokens, `Bearer ...`) rather than duplicating
+    # its pattern here.
+    from .logging import _SECRET_VALUE_RE
+
+    if _SECRET_VALUE_RE.search(stripped):
+        return False
     # Require a real host: `https://` (empty), `https://user@` / `https://user@:443` (userinfo
     # only, empty host), and `https://.` (no alphanumeric host character) are all rejected (review
     # finding). `parsed.hostname` strips any userinfo/port, leaving the host alone to inspect.
@@ -626,7 +650,7 @@ def links_url_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     # is validated but a REJECTED one still reaches this message, and the KEY is never validated
     # at all — either could carry an ANSI/bidi escape that would inject into the console output or
     # a TG notification (review finding).
-    listed = "; ".join(f"{_redact_link_display(k)}: {_redact_link_display(v)}" for k, v in bad)
+    listed = "; ".join(f"{_redact_link_display(k)}: {_redact_link_value_display(k, v)}" for k, v in bad)
     return Violation(
         GATE_LINKS_URL,
         f"the Links section must contain only URLs (http(s)://…), not bare values: {listed}",
