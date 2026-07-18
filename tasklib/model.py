@@ -123,6 +123,14 @@ class Ticket:
     # silently bind the wrong field. Keeping it trailing makes the addition order-safe.
     due: str = ""  # ISO date YYYY-MM-DD the daemon watches; "" = no due date
 
+    # Also appended last (same reasoning as ``due`` above). Populated by the backend from its
+    # native "last modified" timestamp (GitHub's ``updated_at``, Linear's ``updatedAt``) as a
+    # UTC ISO8601 string; "" means the backend didn't supply one (e.g. a not-yet-created ticket,
+    # or the FakeBackend in tests). Read by ``stale_notice.py`` (issue #59) to flag tickets with
+    # no backend activity in N hours — never part of the rendered body (operational metadata,
+    # not ticket content), so ``render``/``parse`` never touch it.
+    updated_at: str = ""
+
     def __post_init__(self) -> None:
         # Coerce plain-string criteria to unchecked Criterion objects. This keeps construction
         # ergonomic (`Ticket(acceptance=["a", "b"])`) while the rest of the code — render, parse,

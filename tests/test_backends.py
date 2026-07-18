@@ -173,6 +173,33 @@ def test_github_attach_posts_reference_comment(monkeypatch):
     assert any("/7/comments" in url for url, _ in calls)
 
 
+def test_github_row_to_ticket_maps_updated_at(monkeypatch):
+    # issue #59's global stale-ticket nudge reads Ticket.updated_at; GitHub's REST rows carry
+    # this natively as `updated_at`, so _row_to_ticket must pass it through.
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {
+        "number": 1,
+        "title": "a",
+        "state": "open",
+        "labels": [],
+        "body": "",
+        "html_url": "https://github.com/o/r/issues/1",
+        "updated_at": "2026-07-01T12:00:00Z",
+    }
+    ticket = be._row_to_ticket(row)
+    assert ticket.updated_at == "2026-07-01T12:00:00Z"
+
+
+def test_github_row_to_ticket_defaults_updated_at_to_empty():
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {"number": 1, "title": "a", "state": "open", "labels": [], "body": ""}
+    assert be._row_to_ticket(row).updated_at == ""
+
+
 def test_issue_number_removeprefix_not_lstrip():
     from tasklib.backends.github_issues import _issue_number
 
@@ -221,6 +248,61 @@ def test_linear_node_to_ticket_seeds_native_due_date(monkeypatch):
     }
     ticket = be._node_to_ticket(node)
     assert ticket.due == "2026-09-01"
+
+
+def test_linear_node_to_ticket_maps_updated_at():
+    # issue #59's global stale-ticket nudge reads Ticket.updated_at; Linear's node carries this
+    # natively as `updatedAt`, so _node_to_ticket must pass it through.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "t",
+        "url": "https://linear/HYP-7",
+        "description": "",
+        "dueDate": None,
+        "updatedAt": "2026-07-01T12:00:00.000Z",
+        "state": {"type": "unstarted"},
+        "labels": {"nodes": []},
+    }
+    assert be._node_to_ticket(node).updated_at == "2026-07-01T12:00:00.000Z"
+
+
+def test_linear_list_query_requests_updated_at(monkeypatch):
+    # test_linear_node_to_ticket_maps_updated_at above injects `updatedAt` directly into a hand
+    # built node, so it would keep passing even if `_ISSUE_FIELDS` stopped requesting the field
+    # from Linear — silently losing every Linear stale-ticket warning in production. Drive the
+    # real list() query so a dropped `updatedAt` in _ISSUE_FIELDS breaks a test, not just prod.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    seen: dict = {}
+
+    def fake_gql(query, variables=None):
+        seen["query"] = query
+        return {
+            "issues": {
+                "nodes": [
+                    {
+                        "identifier": "HYP-7",
+                        "title": "t",
+                        "url": "https://linear/HYP-7",
+                        "description": "",
+                        "dueDate": None,
+                        "updatedAt": "2026-07-01T12:00:00.000Z",
+                        "state": {"type": "unstarted"},
+                        "labels": {"nodes": []},
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    tickets = be.list()
+    assert "updatedAt" in seen["query"]
+    assert tickets[0].updated_at == "2026-07-01T12:00:00.000Z"
 
 
 def test_linear_body_due_overrides_native_due_date():

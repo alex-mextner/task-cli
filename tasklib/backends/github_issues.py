@@ -112,6 +112,7 @@ class GitHubIssuesBackend:
             state=state,
             id=f"#{row.get('number')}",
             url=row.get("html_url", ""),
+            updated_at=row.get("updated_at", "") or "",
         )
         body = row.get("body") or ""
         return parse(body, base)

@@ -1052,6 +1052,25 @@ def _attention_line(ticket: Ticket, age: int | None) -> str:
     return f"{ticket.id} [{ticket.state.value}] {ticket.title}{suffix}"
 
 
+def _stale_line(ticket: Ticket, age: int) -> str:
+    return f"{ticket.id} [{ticket.state.value}] {ticket.title} (updated {_age_text(age)})"
+
+
+def _format_duration_hours(seconds: int) -> str:
+    """A duration in hours for display, without a naive ``// 3600`` flooring any realistic
+    sub-hour value straight to a misleading "0h".
+
+    ``TASK_GLOBAL_STALE_SECONDS`` accepts any positive value, not just whole hours — integer
+    division would print "0h+" for a configured 30-minute threshold and silently round 90
+    minutes down to "1h+". One decimal place is enough precision for a nudge message; a
+    threshold under ~3 minutes still rounds to "0h+" (a config value that extreme is not a
+    realistic staleness window for this feature, so this stays a display nicety, not a
+    correctness guarantee for arbitrarily tiny thresholds).
+    """
+    hours = round(seconds / 3600, 1)
+    return f"{hours:g}h"
+
+
 def _session_attention_notice(session, tickets: list[Ticket], *, priority_change: bool = False) -> str:
     """Human-only warning for active session tasks that are easy to forget.
 
@@ -1138,6 +1157,58 @@ def _print_session_attention_after_mutation(args: argparse.Namespace, cfg, backe
         print(notice)
 
 
+def _global_stale_notice_block(args: argparse.Namespace, backend, coordinate: str) -> str:
+    """Rate-limited nudge: ANY of the user's own active tickets stale >48h, not just this
+    session's (issue #59 — `_session_attention_notice` above only ever sees session-touched
+    tickets). Fail-soft end to end: a backend hiccup or a malformed cache file here must never
+    break `task list`'s primary output, it's a bonus notice, not the command's job.
+
+    ALWAYS fetches its OWN unfiltered ticket set — never a caller's `--state`/`--label`-filtered
+    `tickets`. A caller in the all-tasks fallback branch already has a ticket list in hand, but
+    reusing it silently narrows "every open ticket" to whatever the user filtered for (e.g.
+    `task list --state done` would only ever see done tickets and could never flag a stale
+    active one). The extra backend round-trip this costs is bounded by the rate limit — at most
+    once per window, not once per invocation.
+
+    Like `daemon.py`'s own polling loop, this reads at most `_LIMIT_INTERACTIVE` (100) tickets
+    per backend page — a project with more than that many open tickets won't have the tail
+    examined. Matches the daemon's existing `query_limit` precedent rather than adding
+    pagination for what's meant to stay a lightweight nudge.
+    """
+    if args.json:
+        return ""
+    from . import stale_notice
+
+    try:
+        if not stale_notice.should_check(coordinate):
+            return ""
+        tickets = backend.list(limit=_LIMIT_INTERACTIVE)
+        stale = stale_notice.stale_tickets(tickets)
+    except Exception as exc:
+        from .logging import log_event
+
+        log_event("global_stale.skipped", error=type(exc).__name__)
+        return ""
+
+    # Mark AFTER a completed check (never inside the try above — a transient backend failure
+    # must not consume the rate-limit window, see should_check's docstring) and in its OWN
+    # try/except: an unwritable cache must not discard an already-computed finding — worst case
+    # we merely check again sooner than the window intends, never worse than that.
+    try:
+        stale_notice.mark_checked(coordinate)
+    except Exception as exc:
+        from .logging import log_event
+
+        log_event("global_stale.mark_failed", error=type(exc).__name__)
+
+    if not stale:
+        return ""
+    threshold = _format_duration_hours(stale_notice.stale_after_seconds())
+    lines = [_warn(f"warning: {len(stale)} open ticket(s) look stale (no backend update in {threshold}+):")]
+    lines.extend(_dim(f"    - {_stale_line(ticket, age)}") for ticket, age in stale[:3])
+    return "\n".join(lines)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     """List tickets. Three shapes, chosen by where you are and what you ask for:
 
@@ -1193,7 +1264,10 @@ def _list_session_scoped(args, cfg, state, current) -> int:
             _print_tickets_json(tickets)
             return 0
         notice = _dim("showing all project tasks (`task list` defaults to tasks created in the agent session)")
-        _emit_list(args, [notice, _format_tickets(tickets)])
+        # deliberately NOT reusing `tickets` here — it may be --state/--label filtered, and the
+        # global check needs its OWN unfiltered view (see _global_stale_notice_block's docstring).
+        stale_notice = _global_stale_notice_block(args, backend, current[0])
+        _emit_list(args, [notice, stale_notice, _format_tickets(tickets)])
         return 0
 
     # session HAS tickets → scope to it, then apply the --state/--label filters within that view.
@@ -1205,8 +1279,12 @@ def _list_session_scoped(args, cfg, state, current) -> int:
     if args.json:
         _print_tickets_json(tickets)
         return 0
+    # session_tickets is scoped to THIS session, so the global check needs its own (rate-limited,
+    # best-effort) fetch of every project ticket — see _global_stale_notice_block.
+    stale_notice = _global_stale_notice_block(args, backend, current[0])
     _emit_list(args, [
         _session_attention_notice(session, session_tickets),
+        stale_notice,
         _dim(f"session {session.id} ({session.source}):"),
         _format_tickets(tickets),
     ])

@@ -153,10 +153,13 @@ class LinearBackend:
             # Seed the native dueDate so a ticket created/edited in the Linear UI (no body
             # section) still carries its due date; parse() lets the body's Due section override.
             due=str(node.get("dueDate") or "").strip(),
+            updated_at=str(node.get("updatedAt") or ""),
         )
         return parse(node.get("description") or "", base)
 
-    _ISSUE_FIELDS = "id identifier url title description dueDate state{type name} labels{nodes{name}}"
+    _ISSUE_FIELDS = (
+        "id identifier url title description dueDate updatedAt state{type name} labels{nodes{name}}"
+    )
 
     # ── protocol ──────────────────────────────────────────────────────────────────
     def create(self, ticket: Ticket) -> Ticket:
