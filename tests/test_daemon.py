@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import time
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -413,8 +416,59 @@ def test_spawn_detached_argv_includes_child_flags(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
     daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=["--backend", "linear"])
     argv = seen["argv"]
-    assert argv[1:5] == ["-m", "tasklib", "daemon", "run"]
+    # -P (PYTHONSAFEPATH) precedes -m: it suppresses Python's auto-prepend of the child's cwd
+    # to sys.path, closing the "managed project ships its own tasklib/" shadowing hole.
+    assert argv[1:6] == ["-P", "-m", "tasklib", "daemon", "run"]
     assert argv[-2:] == ["--backend", "linear"]
+
+
+def _reap(pid: int, timeout: float = 8.0) -> int | None:
+    """Wait up to ``timeout``s for a detached ``pid`` to exit; return its exit code, or ``None``
+    when the exit code could NOT be verified (timeout, OR the rarer GC race below) — NEVER a
+    guessed/sentinel "success", so ``assert rc == 0`` fails loudly instead of silently passing
+    for a child whose actual outcome is unknown.
+
+    The GC race: the caller never keeps the ``Popen`` object ``_spawn_detached`` creates (only
+    the bare pid), so once the child has already exited, CPython MAY finalize and
+    garbage-collect that discarded ``Popen`` before we get to poll — confirmed empirically:
+    ``Popen.__del__`` performs its OWN reaping ``waitpid`` in that case, so our subsequent
+    ``waitpid`` raises ``ChildProcessError: No child processes`` on the now-already-reaped pid.
+    We cannot recover the real exit code here, so we report ``None`` rather than assume 0.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if wpid == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.1)
+    try:  # still alive at the deadline — kill + reap so no orphan/zombie leaks
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except (ProcessLookupError, ChildProcessError):
+        pass
+    return None
+
+
+def _write_decoy_tasklib(root, sentinel) -> None:
+    """Plant a decoy top-level ``tasklib/`` package under ``root`` that, if imported and run as
+    ``__main__``, writes ``sentinel`` and exits 0 — WITHOUT ever reaching the real tasklib's
+    config-driven early exit. So "the child exited 0" alone can't pass a test built on this;
+    the sentinel's absence is what actually proves the decoy never executed.
+    """
+    decoy_pkg = root / "tasklib"
+    decoy_pkg.mkdir()
+    (decoy_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (decoy_pkg / "__main__.py").write_text(f"open({str(sentinel)!r}, 'w').close()\n", encoding="utf-8")
+
+
+def _write_disabled_daemon_config(root) -> None:
+    (root / "task.yaml").write_text(
+        "version: 1\nbackend: github-issues\ngithub: {repo: owner/name}\ndaemon: {enabled: false}\n",
+        encoding="utf-8",
+    )
 
 
 def test_spawn_detached_actually_launches_a_detached_process(tmp_path):
@@ -422,28 +476,156 @@ def test_spawn_detached_actually_launches_a_detached_process(tmp_path):
     # that DISABLES the daemon, so the child exits cleanly on its own. We prove the spawn produced
     # a real child that ran tasklib and exited 0. The spawned process IS this test's child (new
     # SESSION, not reparented), so we reap it with waitpid — os.kill(0) would see a zombie.
-    import os
-    import signal as _signal
-    import time
-
-    (tmp_path / "task.yaml").write_text(
-        "version: 1\nbackend: github-issues\ngithub: {repo: owner/name}\ndaemon: {enabled: false}\n",
-        encoding="utf-8",
-    )
+    _write_disabled_daemon_config(tmp_path)
     pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
     assert pid > 0
-    deadline = time.time() + 8
-    rc = None
-    while time.time() < deadline:
-        wpid, status = os.waitpid(pid, os.WNOHANG)
-        if wpid == pid:
-            rc = os.waitstatus_to_exitcode(status)
-            break
-        time.sleep(0.1)
-    if rc is None:  # somehow still alive — kill + reap so no orphan/zombie leaks
-        os.kill(pid, _signal.SIGKILL)
-        os.waitpid(pid, 0)
-    assert rc == 0, "a disabled daemon should spawn, run tasklib, and exit 0"
+    assert _reap(pid) == 0, "a disabled daemon should spawn, run tasklib, and exit 0"
+
+
+def test_spawn_detached_rejects_a_decoy_tasklib_in_the_target_cwd(tmp_path):
+    # The regression this guards: _spawn_detached's child cwd is the TARGET project being
+    # managed, not task-cli's own checkout. Python auto-prepends a `-m` invocation's process
+    # cwd to sys.path AHEAD of PYTHONPATH, so a managed project shipping its own top-level
+    # `tasklib/` package could shadow the real one and run arbitrary code as this daemon. `-P`
+    # (PYTHONSAFEPATH) must suppress that auto-prepend.
+    sentinel = tmp_path / "decoy-ran.txt"
+    _write_decoy_tasklib(tmp_path, sentinel)
+    _write_disabled_daemon_config(tmp_path)
+
+    pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
+    rc = _reap(pid)
+
+    assert not sentinel.exists(), "the decoy tasklib/__main__.py ran — the cwd shadowed the real package"
+    assert rc == 0, "the REAL tasklib (disabled daemon) should still spawn, run, and exit 0"
+
+
+def test_spawn_detached_rejects_a_decoy_even_with_a_hostile_pythonpath(tmp_path, monkeypatch):
+    # Narrower regression than the cwd-shadow test above: an INHERITED PYTHONPATH that lists the
+    # target project (".") before task-cli's real repo root must NOT let the decoy win. -P only
+    # suppresses Python's OWN auto-prepended entries — PYTHONPATH is an explicit mechanism it
+    # does not touch — so _child_env must itself force the real repo root to the FRONT rather
+    # than merely "somewhere in" PYTHONPATH, or this exact ordering reopens the shadowing hole.
+    sentinel = tmp_path / "decoy-ran.txt"
+    _write_decoy_tasklib(tmp_path, sentinel)
+    _write_disabled_daemon_config(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", f".{os.pathsep}{daemon._repo_root()}")
+
+    pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
+    rc = _reap(pid)
+
+    assert not sentinel.exists(), "a hostile PYTHONPATH let the decoy win over the real tasklib"
+    assert rc == 0, "the REAL tasklib (disabled daemon) should still spawn, run, and exit 0"
+
+
+def test_child_env_prepends_repo_root_when_pythonpath_unset():
+    repo_root = daemon._repo_root()
+    env = daemon._child_env(repo_root, base_env={})
+    assert env["PYTHONPATH"] == str(repo_root)
+    assert env[daemon._BOOTSTRAP_MARKER] == str(repo_root)
+
+
+def test_child_env_moves_an_existing_but_non_first_repo_root_to_the_front():
+    # the ordering bug this guards: a naive "skip if already present anywhere" dedup leaves an
+    # earlier entry (here "/other") ahead of the real repo root, where a decoy could still win.
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f"/other{os.pathsep}{repo_root}"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/other"
+
+
+def test_child_env_preserves_other_pythonpath_entries_behind_repo_root():
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f"/a{os.pathsep}/b"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/a{os.pathsep}/b"
+
+
+def test_child_env_resolves_relative_pythonpath_entries_against_parent_cwd(monkeypatch, tmp_path):
+    # An inherited "." resolves against the PROCESS cwd at import time — for the spawned
+    # child that's the TARGET project being managed, not wherever the parent (this CLI
+    # invocation) was run from. A target repo shipping its own e.g. yaml.py could shadow
+    # a real import the moment the child does `import yaml`. Rather than dropping a
+    # relative entry (which would break a legitimate tox/CI/direnv-style
+    # `PYTHONPATH=src` config), freeze it into an absolute path against the PARENT's cwd
+    # — the child cwd can no longer reinterpret it. A bare/doubled separator ("") has no
+    # intent to preserve and is dropped.
+    # `monkeypatch.chdir` (a real directory) rather than patching `Path.cwd` directly —
+    # the latter mutates the stdlib class process-wide for every caller during the test
+    # (review finding); chdir exercises the real `Path.cwd()` call path with a narrow
+    # blast radius.
+    monkeypatch.chdir(tmp_path)
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f".{os.pathsep}{os.pathsep}relative/dir{os.pathsep}/kept"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == (
+        f"{repo_root}{os.pathsep}{tmp_path}{os.pathsep}{tmp_path / 'relative/dir'}{os.pathsep}/kept"
+    )
+
+
+def test_child_env_dedupes_relative_entry_that_resolves_to_repo_root(monkeypatch):
+    # The common case: running the CLI from the checkout, PYTHONPATH="." set by tox/direnv
+    # in that same repo. "." doesn't string-match repo_root, but it RESOLVES to repo_root —
+    # the dedupe must compare against the resolved value, not the raw entry, or repo_root
+    # ends up twice in the child's PYTHONPATH (review finding).
+    repo_root = daemon._repo_root()
+    monkeypatch.chdir(repo_root)
+    base_env = {"PYTHONPATH": f".{os.pathsep}{repo_root}"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == str(repo_root)
+
+
+def test_scrub_bootstrap_pythonpath_removes_only_the_injected_entry(monkeypatch):
+    repo_root = str(daemon._repo_root())
+    monkeypatch.setenv("PYTHONPATH", f"{repo_root}{os.pathsep}/kept")
+    monkeypatch.setenv(daemon._BOOTSTRAP_MARKER, repo_root)
+    daemon._scrub_bootstrap_pythonpath()
+    assert os.environ["PYTHONPATH"] == "/kept"
+    assert daemon._BOOTSTRAP_MARKER not in os.environ
+
+
+def test_scrub_bootstrap_pythonpath_unsets_the_var_when_nothing_is_left(monkeypatch):
+    repo_root = str(daemon._repo_root())
+    monkeypatch.setenv("PYTHONPATH", repo_root)
+    monkeypatch.setenv(daemon._BOOTSTRAP_MARKER, repo_root)
+    daemon._scrub_bootstrap_pythonpath()
+    assert "PYTHONPATH" not in os.environ
+
+
+def test_scrub_bootstrap_pythonpath_is_a_noop_when_nothing_was_injected(monkeypatch):
+    # no _BOOTSTRAP_MARKER at all — must not raise, must not touch PYTHONPATH either way
+    monkeypatch.delenv(daemon._BOOTSTRAP_MARKER, raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    daemon._scrub_bootstrap_pythonpath()
+    assert "PYTHONPATH" not in os.environ
+
+
+def test_scrub_bootstrap_pythonpath_leaves_a_user_owned_pythonpath_untouched(monkeypatch):
+    # regression: a developer who legitimately runs with PYTHONPATH=<repo_root> themselves
+    # (e.g. an editable-checkout workflow) must NOT have it silently deleted just because the
+    # value happens to match repo_root — only an explicit _child_env handshake may remove it.
+    repo_root = str(daemon._repo_root())
+    monkeypatch.setenv("PYTHONPATH", repo_root)
+    monkeypatch.delenv(daemon._BOOTSTRAP_MARKER, raising=False)  # nothing WE injected
+    daemon._scrub_bootstrap_pythonpath()
+    assert os.environ["PYTHONPATH"] == repo_root
+
+
+def test_run_loop_scrub_does_not_touch_the_calling_process_env_without_a_marker(
+    tmp_path, monkeypatch, capture_notifications
+):
+    # regression: run_loop() is also called IN-PROCESS by tests (max_ticks=), never having gone
+    # through _spawn_detached/_child_env at all. Without the marker gate, run_loop's scrub call
+    # would mutate the CALLING process's (here: this test's) os.environ directly — stripping a
+    # real developer's own PYTHONPATH for the rest of their pytest session, not just some child.
+    from tasklib.config import LoadedConfig
+
+    repo_root = str(daemon._repo_root())
+    monkeypatch.setenv("PYTHONPATH", repo_root)  # simulates a dev's own editable-checkout env
+    monkeypatch.delenv(daemon._BOOTSTRAP_MARKER, raising=False)
+    cfg = LoadedConfig(data={"backend": "github-issues", "daemon": {"enabled": False}}, repo_root=tmp_path)
+    paths = daemon.DaemonPaths(pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log")
+    daemon.run_loop(cfg, paths, max_ticks=1)
+    assert os.environ["PYTHONPATH"] == repo_root
 
 
 def test_stop_not_running_clears_stale(tmp_path):
