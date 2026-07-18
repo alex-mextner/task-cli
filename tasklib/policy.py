@@ -651,35 +651,14 @@ def links_url_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     # at all — either could carry an ANSI/bidi escape that would inject into the console output or
     # a TG notification (review finding).
     listed = "; ".join(f"{_redact_link_display(k)}: {_redact_link_value_display(k, v)}" for k, v in bad)
-    # A value that IS a well-formed https:// URL but was rejected for carrying an embedded
-    # credential gets a message tailored to that reason — "not a URL" is factually wrong for
-    # it and gives no hint the real problem is the embedded credential (review finding).
-    from urllib.parse import urlparse
-
-    from .logging import _SECRET_VALUE_RE
-
-    def _is_credential_reject(value: str) -> bool:
-        if not value or not value.isprintable() or any(ch.isspace() for ch in value):
-            return False
-        try:
-            parsed = urlparse(value)
-        except ValueError:
-            return False
-        if parsed.scheme not in ("http", "https"):
-            return False
-        return parsed.username is not None or parsed.password is not None or bool(_SECRET_VALUE_RE.search(value))
-
-    if any(_is_credential_reject(v) for _, v in bad):
-        message = f"the Links section must not contain a value with an embedded credential: {listed}"
-        hint = "remove the embedded token/credential from the URL (a ticket Link is never the place for " \
-            'one); waive a legacy value with --skip-links-url "<reason>"'
-    else:
-        message = f"the Links section must contain only URLs (http(s)://…), not bare values: {listed}"
-        hint = (
-            "use a full https:// URL for each link (a tg#<id> reference belongs in a body prose "
-            'field, not Links); waive a legacy value with --skip-links-url "<reason>"'
-        )
-    return Violation(GATE_LINKS_URL, message, hint=hint)
+    return Violation(
+        GATE_LINKS_URL,
+        f"the Links section must contain only URLs (http(s)://…), not bare values or an "
+        f"embedded credential: {listed}",
+        hint="use a full https:// URL with no embedded token/credential for each link (a tg#<id> "
+        'reference belongs in a body prose field, not Links); waive a legacy value with '
+        '--skip-links-url "<reason>"',
+    )
 
 
 def impact_quality_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
