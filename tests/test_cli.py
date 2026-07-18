@@ -138,7 +138,8 @@ def test_create_escape_hatch_allows_skip(capsys, _inject_fake):
     ]
     rc = main(argv)
     assert rc == 0
-    assert "skipped gates (justified): motivation" in capsys.readouterr().out
+    # the skipped-gates summary is a diagnostic → stderr, keeping stdout clean for --json
+    assert "skipped gates (justified): motivation" in capsys.readouterr().err
 
 
 def test_create_from_message_derives_title(capsys, _inject_fake):
@@ -2011,3 +2012,221 @@ def test_mutation_message_escapes_href_attributes():
         html_mode=True,
     )
     assert 'href="https://linear.example/issue/HYP-903?a=1&amp;b=&quot;two&quot;"' in msg
+
+
+# ── Links-URL gate + tg#<id> quote warning routing (tg#9179 / tg#9161) ────────────────
+
+
+def test_change_metadata_only_edit_is_exempt_from_links_url(capsys, _inject_fake):
+    # a --due/--label edit touches no scanned field → the links-url gate does not fire, so a
+    # legacy junk link (Session: session:2) can't block an unrelated metadata edit.
+    main(_create_argv())
+    _inject_fake.get("#1").links["Session"] = "session:2"  # legacy junk a real backend read back
+    capsys.readouterr()
+    assert main(["change", "#1", "--due", "2026-12-31"]) == 0
+
+
+def test_change_touching_text_enforces_links_url(capsys, _inject_fake):
+    # editing a scanned field re-validates the Links field: the junk value now blocks the edit,
+    # and --skip-links-url waives it (proving the new skip flag is wired).
+    main(_create_argv())
+    _inject_fake.get("#1").links["Session"] = "session:2"
+    capsys.readouterr()
+    assert main(["change", "#1", "--what", "a real edit"]) == 2
+    assert "links-url" in capsys.readouterr().out
+    assert main(["change", "#1", "--what", "a real edit", "--skip-links-url", "legacy junk"]) == 0
+
+
+def test_report_and_die_prints_warnings_to_stderr_only(capsys):
+    # an unresolvable msgref-quote warning must NOT reach stdout: a non-fatal enforce returns and
+    # the caller may then print a --json payload to stdout that a warning line would corrupt.
+    from tasklib.policy import PolicyResult, Violation
+
+    result = PolicyResult(warnings=[Violation("msgref-quote", "the body references tg#9 but no quote could be attached")])
+    cli._report_and_die(result, "update")  # no violations → does not raise
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "msgref-quote" in cap.err
+
+
+def test_skip_msgref_quote_flag_parses_and_records():
+    ns = build_parser().parse_args([*_create_argv(), "--skip-msgref-quote", "false positive"])
+    assert ns.skip_msgref_quote == "false positive"
+
+
+def _fake_history(msg_id=42, text="the referenced message"):
+    from tasklib.msgrefs import HistoryRecord
+
+    return {msg_id: HistoryRecord(ts=1700000000, message_id=msg_id, direction="user", from_="Alex", text=text, pane=None)}
+
+
+def test_msgref_quote_deny_at_change_when_resolvable(capsys, _inject_fake, monkeypatch):
+    # end-to-end: a backend-authored ticket carries a bare tg#42 (no quote); the message IS in
+    # local history, so touching a text field re-scans the body and the close/edit is refused.
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X"  # a bare ref the create gate never expanded
+    monkeypatch.setattr("tasklib.msgrefs.load_history", lambda env=None: _fake_history(42))
+    capsys.readouterr()
+    assert main(["change", "#1", "--title", "New title"]) == 2
+    assert "msgref-quote" in capsys.readouterr().out
+    # the new skip flag waives it through the full CLI path
+    assert main(["change", "#1", "--title", "New title", "--skip-msgref-quote", "version tag"]) == 0
+
+
+def test_msgref_quote_warn_at_change_preserves_json_stdout(capsys, _inject_fake, monkeypatch):
+    # an UNRESOLVABLE reference only warns (to stderr) and never blocks — and the --json payload
+    # on stdout stays parseable (the whole point of routing the warning off stdout).
+    import json
+
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X"
+    monkeypatch.setattr("tasklib.msgrefs.load_history", lambda env=None: {})  # not in history → warn
+    capsys.readouterr()
+    assert main(["change", "#1", "--title", "New title", "--json"]) == 0
+    cap = capsys.readouterr()
+    json.loads(cap.out)  # stdout is clean JSON, not corrupted by the warning
+    assert "msgref-quote" in cap.err
+
+
+def test_msgref_quote_disabled_does_not_read_history(capsys, _inject_fake, monkeypatch):
+    # enforce.msgref_quote: false must not touch the (potentially large, private) history log.
+    from tasklib.policy import EnforceConfig
+
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X"
+    monkeypatch.setattr(cli, "_enforce_config", lambda cfg: EnforceConfig(msgref_quote=False))
+
+    def _boom(env=None):
+        raise AssertionError("history must not be read when the gate is disabled")
+
+    monkeypatch.setattr("tasklib.msgrefs.load_history", _boom)
+    capsys.readouterr()
+    assert main(["change", "#1", "--title", "New title"]) == 0
+
+
+def test_msgref_quote_no_refs_does_not_read_history(capsys, _inject_fake, monkeypatch):
+    # a ticket with no tg#<id> reference must never touch the history log.
+    main(_create_argv())
+
+    def _boom(env=None):
+        raise AssertionError("history must not be read for a reference-free ticket")
+
+    monkeypatch.setattr("tasklib.msgrefs.load_history", _boom)
+    capsys.readouterr()
+    assert main(["change", "#1", "--title", "New title"]) == 0
+
+
+def test_msgref_quote_already_skipped_does_not_read_history(capsys, _inject_fake, monkeypatch):
+    # once --skip-msgref-quote is recorded, the gate can't fire, so history is not read.
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X"
+
+    def _boom(env=None):
+        raise AssertionError("history must not be read when the gate is already waived")
+
+    monkeypatch.setattr("tasklib.msgrefs.load_history", _boom)
+    capsys.readouterr()
+    assert main(["change", "#1", "--title", "New title", "--skip-msgref-quote", "version tag"]) == 0
+
+
+def test_create_with_active_session_puts_no_link_in_the_links_field(_inject_fake):
+    # #55 moved the session id to labels only; the links-url gate assumes Links is URL-only, so a
+    # create must never plant a non-URL Session link (which would then fail the gate it just passed).
+    main(_create_argv())
+    t = _inject_fake.get("#1")
+    assert t.links == {}
+    assert any(lbl.startswith("session:") for lbl in t.labels)
+
+
+def test_skip_summary_and_warning_keep_json_stdout_clean(capsys, _inject_fake, monkeypatch):
+    # a --json command that BOTH waives a gate (skipped summary) AND carries an untouched
+    # unresolvable reference (warning) must still emit parseable JSON on stdout — both diagnostics
+    # go to stderr. The reference and the bare HYP ref sit in an UNtouched field so they genuinely
+    # fire (a --title edit re-scans the whole body).
+    import json
+
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X, blocked by HYP-789"  # untouched: unresolvable ref + bare ref
+    monkeypatch.setattr("tasklib.msgrefs.load_history", lambda env=None: {})  # tg#42 unresolvable → warn
+    capsys.readouterr()
+    rc = main(["change", "#1", "--title", "New title", "--skip-links", "legacy bare ref", "--json"])
+    assert rc == 0
+    cap = capsys.readouterr()
+    json.loads(cap.out)  # stdout is clean JSON, not corrupted by either diagnostic
+    assert "msgref-quote" in cap.err  # the warning went to stderr
+    assert "skipped gates (justified)" in cap.err  # the skip summary went to stderr
+
+
+def test_skip_msgref_quote_shows_in_the_audit_trail_via_cli(capsys, _inject_fake, monkeypatch):
+    # a waived msgref-quote must appear in the "skipped gates (justified)" summary like every other
+    # skippable gate — even though the CLI skips loading history for it.
+    main(_create_argv())
+    _inject_fake.get("#1").what = "per tg#42 do X"
+    monkeypatch.setattr("tasklib.msgrefs.load_history", lambda env=None: (_ for _ in ()).throw(AssertionError("no read")))
+    capsys.readouterr()
+    rc = main(["change", "#1", "--title", "New title", "--skip-msgref-quote", "version tag"])
+    assert rc == 0
+    assert "skipped gates (justified)" in capsys.readouterr().err
+    from tasklib.render import render
+
+    assert "msgref-quote" in render(_inject_fake.get("#1"))  # recorded in the Skipped gates section
+
+
+def test_skip_msgref_quote_at_create_suppresses_expansion_and_history(capsys, _inject_fake, monkeypatch):
+    # a waived tg#<id> must NOT be expanded into an (unrelated, possibly private) quote, and the
+    # history log must not be read at all — the skip governs expansion, not just the gate.
+    def _boom(env=None):
+        raise AssertionError("history must not be read when msgref-quote is skipped")
+
+    monkeypatch.setattr("tasklib.msgrefs.load_history", _boom)
+    argv = [
+        "create", "--title", "Bump", "--what", "bump to tg#2", "--why", "because",
+        "--impact", _GOOD_IMPACT, "--if-not-done", "pain",
+        "--acceptance", "it works", "--acceptance", "empty case",
+        "--skip-msgref-quote", "version tag, not a message ref",
+    ]
+    assert main(argv) == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "bump to tg#2" in body  # the raw text is preserved
+    assert "msgref-quote:2" not in body  # no quote block was attached
+    assert "msgref-quote" in body  # recorded in the Skipped gates section
+
+
+def test_persisted_msgref_skip_does_not_disable_expansion_of_a_new_reference(capsys, _inject_fake, monkeypatch):
+    # a ticket waived once (msgref-quote in its skips) must still expand a genuinely NEW reference
+    # added by a later change — the waiver is not a permanent expansion kill-switch.
+    main(_create_argv())
+    _inject_fake.get("#1").skips["msgref-quote"] = "waived earlier for a version tag"
+    monkeypatch.setattr("tasklib.msgrefs.load_history", lambda env=None: _fake_history(99, "the new referenced message"))
+    capsys.readouterr()
+    assert main(["change", "#1", "--what", "now genuinely per tg#99"]) == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "the new referenced message" in body  # tg#99 WAS expanded despite the old waiver
+
+
+def test_disabling_msgref_quote_config_stops_expansion_and_history(capsys, _inject_fake, monkeypatch):
+    # enforce.msgref_quote: false is the master switch: a tg#<id> in a touched field is neither
+    # expanded nor resolved against history — the whole feature is off.
+    from tasklib.policy import EnforceConfig
+
+    monkeypatch.setattr(cli, "_enforce_config", lambda cfg: EnforceConfig(msgref_quote=False))
+
+    def _boom(env=None):
+        raise AssertionError("history must not be read when msgref_quote is disabled")
+
+    monkeypatch.setattr("tasklib.msgrefs.load_history", _boom)
+    argv = [
+        "create", "--title", "Ref", "--what", "per tg#2 do the thing", "--why", "because",
+        "--impact", _GOOD_IMPACT, "--if-not-done", "pain",
+        "--acceptance", "it works", "--acceptance", "empty case",
+    ]
+    assert main(argv) == 0
+    from tasklib.render import render
+
+    body = render(_inject_fake.get("#1"))
+    assert "per tg#2 do the thing" in body  # raw text, no quote attached
+    assert "msgref-quote:2" not in body

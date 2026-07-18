@@ -167,10 +167,26 @@ user-impact-quality gates) writes the justification into the ticket's `Skipped g
 | user-impact-quality | `--impact "<plain-language, user-framed>"` | `--skip-user-impact-quality "<reason>"` (or `--force "<reason>"` on create/new) |
 | cost-of-inaction | `--if-not-done "..."` | `--skip-cost-of-inaction "<reason>"` |
 | links | make each reference a link / full URL | `--skip-links "<reason>"` (or `--force "<reason>"` on create/new) |
+| links-url | put only `http(s)://…` URLs in the `## Links` section (a `tg#<id>` reference goes in a prose field, not Links) | `--skip-links-url "<reason>"` |
+| msgref-quote | let a body `tg#<id>` keep its auto-attached quote (re-run `create`/`change` to attach it) | `--skip-msgref-quote "<reason>"` |
 | screenshots | `--screenshot <path>` | `--skip-screenshots "<reason>"` |
 | formatting | (automatic — body is rendered) | `--skip-formatting "<reason>"` |
 | msgref-title | keep `--title` free of a `tg#<id>` reference (put it in `--what`/`--why`/etc. instead) | **none** (hard; disable in config only via `enforce.msgref_title: false`) |
 | acceptance-checked (close) | `task check <id> <n> --proof <path>` for each | **none** (hard; disable in config only) |
+
+The **links-url** gate keeps the `## Links` section strictly URLs — a bare, non-URL value
+(`Session: session:2`) rendered as a fake link and slid past the prose-only `links` gate. The
+**msgref-quote** gate ensures a `tg#<id>` mentioned in a prose field carries the quoted message
+content. On `create`/`change` the reference is auto-expanded from local `tg-cli` history: a
+resolvable id gets its quote inlined, an unresolvable one gets an inline "message not found" note
+(so the reference is never left bare) — either way nothing else is needed. The gate itself is the
+backstop for a ticket authored in the web UI or before the feature existed, whose reference never
+went through that expansion: it only *blocks* when the message resolves in local history yet the
+quote is missing, and merely *warns* (never blocks) when the reference is unresolvable — too old
+for local retention, or `tg-cli` isn't installed here. Passing `--skip-msgref-quote "<reason>"`
+waives the gate AND suppresses expansion for that command (so a false-positive `tg#N` isn't quoted
+at all). Both gates are disable-able per repo via `enforce.links_url: false` /
+`enforce.msgref_quote: false`.
 
 ### Checking criteria off — `task check`
 
@@ -197,7 +213,8 @@ criterion if it has only one, and link the references / rewrite the impact — o
 legacy exception on the close command itself with `--skip-links` / `--skip-user-impact-quality`
 `"<reason>"`. If you need to close a batch of legacy tickets without that migration, disable the
 gates per repo in `enforce:` (`acceptance_checked: false`, `acceptance_min: 1`, `links: false`,
-`user_impact_quality: false`) rather than fighting it ticket-by-ticket.
+`links_url: false`, `msgref_quote: false`, `user_impact_quality: false`) rather than fighting it
+ticket-by-ticket.
 
 ## The ticket body template
 
@@ -327,6 +344,8 @@ enforce:
   user_impact: required
   cost_of_inaction: required
   formatting: strict
+  links_url: required                # the ## Links section holds http(s):// URLs only
+  msgref_quote: required             # a body tg#<id> must carry its auto-attached quote
   screenshots:
     on_create: { required_if_label: [ui, visual] }
     on_done:   { required_if_label: [ui, visual] }

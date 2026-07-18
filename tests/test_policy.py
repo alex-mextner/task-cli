@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tasklib.model import Criterion, Screenshot, Ticket
+from tasklib.msgrefs import render_msgref_quotes
 from tasklib.policy import (
     EnforceConfig,
     Phase,
@@ -133,6 +134,15 @@ def test_from_dict_disables_new_gates():
     # with the new gates off, a bare-reference / thin-impact / unchecked / tg#-titled ticket passes
     assert check_create(_good_ticket(what="see HYP-789", user_impact="users", title="tg#5900"), cfg).ok
     assert check_done(_good_ticket(), cfg).ok  # unchecked criteria no longer block close
+
+
+def test_from_dict_disables_links_url_and_msgref_quote_gates():
+    # the documented enforce.links_url / enforce.msgref_quote keys must reach the gates through
+    # from_dict, so config and CLI behavior can't drift.
+    cfg = EnforceConfig.from_dict({"links_url": False, "msgref_quote": False})
+    assert cfg.links_url is False and cfg.msgref_quote is False
+    assert check_create(_good_ticket(links={"Session": "session:2"}), cfg).ok
+    assert check(_good_ticket(what="per tg#42 do X"), cfg, Phase.CREATE, resolvable_ids={42}).ok
 
 
 def test_from_dict_acceptance_min_override_and_fallback():
@@ -381,3 +391,271 @@ def test_checked_with_force_reason_allows_close():
         ]
     )
     assert check_done(t, EnforceConfig()).ok
+
+
+# ── the Links section must contain only URLs (tg#9179) ────────────────────────────────
+
+
+def test_links_url_rejects_non_url_value():
+    # the session:2 leak: a bare, non-URL value rendered as `- Session: session:2` and slid past
+    # the (prose-only) links gate. The dedicated links-url gate catches it on the field itself.
+    res = check_create(_good_ticket(links={"Session": "session:2"}), EnforceConfig())
+    assert not res.ok
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert "session:2" in v.message
+
+
+def test_links_url_accepts_real_https_url():
+    t = _good_ticket(links={"PR": "https://github.com/x/y/pull/1"})
+    assert check_create(t, EnforceConfig()).ok
+
+
+def test_links_url_rejects_scheme_that_is_not_http():
+    # a Linear key, a mailto:, a bare token — none are http(s) URLs.
+    for bad in ("HYP-1001", "mailto:a@b.c", "ftp://host/x", "just words"):
+        res = check_create(_good_ticket(links={"Ref": bad}), EnforceConfig())
+        assert not res.ok, bad
+        assert any(v.gate == "links-url" for v in res.violations), bad
+
+
+def test_links_url_gate_skippable():
+    t = _good_ticket(links={"Session": "session:2"}, skips={"links-url": "legacy junk, will fix"})
+    res = check_create(t, EnforceConfig())
+    assert res.ok
+    assert "links-url" in res.skipped
+
+
+def test_links_url_gate_disabled_in_config():
+    assert check_create(_good_ticket(links={"Session": "session:2"}), EnforceConfig(links_url=False)).ok
+
+
+def test_links_url_blocks_close_too():
+    # a ticket read back from the backend with junk links can't be closed with it still there.
+    t = _good_ticket(links={"Session": "session:2"}, acceptance=_checked_criteria())
+    res = check_done(t, EnforceConfig())
+    assert any(v.gate == "links-url" for v in res.violations)
+    t.skips = {"links-url": "legacy value predates the rule"}
+    assert check_done(t, EnforceConfig()).ok
+
+
+# ── a body tg#<id> reference must carry its quote (tg#9161) ────────────────────────────
+
+
+def _quoted_what(msg_id: int = 42, text: str = "some quoted message") -> str:
+    """A prose field with tg#<id> ALREADY expanded into a genuine quote block (marker included),
+    produced by the real expander so the block shape can never drift from production."""
+    from tasklib.msgrefs import HistoryRecord
+
+    rec = HistoryRecord(ts=1_700_000_000, message_id=msg_id, direction="user", from_="Alex", text=text, pane=None)
+    return render_msgref_quotes(f"per tg#{msg_id} do X", history={msg_id: rec})
+
+
+def test_msgref_quote_denies_resolvable_unquoted_body_ref():
+    # a body reference whose message IS in history but whose quote was never attached (a web-UI
+    # authored ticket) is refused — the quote can and must be inlined.
+    t = _good_ticket(what="per tg#42 do X")
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    assert not res.ok
+    v = next(v for v in res.violations if v.gate == "msgref-quote")
+    assert "tg#42" in v.message
+
+
+def test_msgref_quote_only_warns_when_unresolvable():
+    # a reference to a message older than local retention (not in the resolvable set) cannot be
+    # quoted → it warns but never blocks.
+    t = _good_ticket(what="per tg#42 do X")
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids=set())
+    assert res.ok
+    assert not any(v.gate == "msgref-quote" for v in res.violations)
+    assert any(w.gate == "msgref-quote" for w in res.warnings)
+
+
+def test_msgref_quote_none_resolvable_ids_never_denies():
+    # the default (no history loaded) can't prove resolvability → every unquoted ref only warns.
+    t = _good_ticket(what="per tg#42 do X")
+    res = check(t, EnforceConfig(), Phase.CREATE)
+    assert res.ok
+    assert any(w.gate == "msgref-quote" for w in res.warnings)
+
+
+def test_msgref_quote_passes_when_already_quoted():
+    # once the quote block is present, neither a violation nor a warning fires (idempotent).
+    t = _good_ticket(what=_quoted_what(42))
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    assert res.ok
+    assert not any(v.gate == "msgref-quote" for v in res.violations)
+    assert not any(w.gate == "msgref-quote" for w in res.warnings)
+
+
+def test_msgref_quote_skippable_when_resolvable():
+    t = _good_ticket(what="per tg#42 do X", skips={"msgref-quote": "false positive, that's a version tag"})
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    assert res.ok
+    assert "msgref-quote" in res.skipped
+
+
+def test_msgref_quote_gate_disabled_in_config():
+    t = _good_ticket(what="per tg#42 do X")
+    assert check(t, EnforceConfig(msgref_quote=False), Phase.CREATE, resolvable_ids={42}).ok
+
+
+def test_msgref_quote_ignores_reference_in_acceptance_criterion():
+    # acceptance criteria are single-line-serialized (no room for a multi-line quote) — a tg#<id>
+    # there is out of the quote gate's scan scope, so it never denies on it.
+    t = _good_ticket(what="the change", acceptance=["do tg#42 first", "and the empty case"])
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    assert not any(v.gate == "msgref-quote" for v in res.violations)
+
+
+def test_msgref_quote_blocks_close_too():
+    t = _good_ticket(what="per tg#42 do X", acceptance=_checked_criteria())
+    res = check(t, EnforceConfig(), Phase.DONE, resolvable_ids={42})
+    assert any(v.gate == "msgref-quote" for v in res.violations)
+
+
+def test_msgref_quote_scans_each_field_independently():
+    # a quote for tg#42 in `why` must NOT mask a still-unquoted tg#42 in `what`: the expander
+    # attaches a quote into the SAME field the reference sits in, so the fields are scanned
+    # separately (a joined scan would wrongly treat `what`'s bare ref as already-quoted).
+    t = _good_ticket(what="per tg#42 do X", why=_quoted_what(42))
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    assert any(v.gate == "msgref-quote" for v in res.violations)
+
+
+def test_msgref_quote_skip_also_suppresses_the_unresolvable_warning():
+    # a recorded --skip-msgref-quote silences the advisory warning too — otherwise the "no quote
+    # could be attached" note reprints on every command with no way to quiet it.
+    t = _good_ticket(what="per tg#42 do X", skips={"msgref-quote": "false positive, version tag"})
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids=set())
+    assert res.ok
+    assert not any(w.gate == "msgref-quote" for w in res.warnings)
+
+
+def test_msgref_quote_partitions_a_mixed_resolvable_and_unresolvable_ticket():
+    # tg#42 resolves (→ deny), tg#99 doesn't (→ warn) — the two land on different channels.
+    t = _good_ticket(what="per tg#42 and also tg#99 do X")
+    res = check(t, EnforceConfig(), Phase.CREATE, resolvable_ids={42})
+    deny = next(v for v in res.violations if v.gate == "msgref-quote")
+    assert "tg#42" in deny.message and "tg#99" not in deny.message
+    warn = next(w for w in res.warnings if w.gate == "msgref-quote")
+    assert "tg#99" in warn.message and "tg#42" not in warn.message
+
+
+def test_links_url_rejects_malformed_http_shapes():
+    # scheme alone isn't enough: internal whitespace, a hostless netloc, userinfo-only authority,
+    # an invalid port, and a URL that makes urlparse itself raise are all rejected.
+    bad_values = (
+        "https://Session: session:2",  # internal whitespace
+        "https://",  # empty netloc
+        "https://.",  # no alphanumeric host char
+        "http:// space.com",  # whitespace
+        "https://user@",  # userinfo only, empty host
+        "https://user@:443",  # userinfo + port, empty host
+        "https://example.com:bad",  # invalid port → urlparse .port raises ValueError
+        "https://[::1",  # malformed IPv6 → urlparse raises ValueError
+        "https://example.com/\x1bevil",  # ESC control char
+        "https://exa\x00mple.com",  # NUL
+        "https://exam‮ple.com",  # bidi override
+    )
+    for bad in bad_values:
+        res = check_create(_good_ticket(links={"Ref": bad}), EnforceConfig())
+        assert not res.ok, bad
+        assert any(v.gate == "links-url" for v in res.violations), bad
+
+
+def test_links_url_rejects_embedded_credentials():
+    # a URL with a real, otherwise-valid host is still rejected when it carries userinfo — this
+    # gate persists the value verbatim into a GitHub/Linear issue body, and an accepted
+    # credential-shaped userinfo segment would leak it into a shared, often-public tracker
+    # (review finding).
+    bad_values = (
+        "https://user:ghp_deadbeef@example.com/",  # username + token-shaped password
+        "https://ghp_deadbeef@example.com/",  # bare token as username, no password
+    )
+    for bad in bad_values:
+        res = check_create(_good_ticket(links={"Ref": bad}), EnforceConfig())
+        assert not res.ok, bad
+        assert any(v.gate == "links-url" for v in res.violations), bad
+
+
+def test_links_url_message_strips_control_chars_from_key_and_value():
+    # an untrusted key/value (from a backend body round-trip) must not inject a terminal escape
+    # into the diagnostic printed to the console / a TG notification.
+    t = _good_ticket(links={"\x1b[31mRef": "session:2\x07"})
+    res = check_create(t, EnforceConfig())
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert "\x1b" not in v.message and "\x07" not in v.message
+    assert "Ref: session:2" in v.message  # printable content preserved
+
+
+def test_links_url_rejects_a_control_char_key_even_with_a_valid_url():
+    # a link KEY is rendered verbatim by task read, so a control/bidi char in the key must be
+    # rejected too — not only the value (which here is a perfectly valid URL).
+    t = _good_ticket(links={"\x1b[31mPR": "https://github.com/x/y/pull/1"})
+    res = check_create(t, EnforceConfig())
+    assert not res.ok
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert "\x1b" not in v.message
+
+
+def test_links_url_redacts_a_token_shaped_rejected_value_in_the_message():
+    # a rejected value that embeds a token must be scrubbed by the shared redactor, not echoed.
+    secret = "ghp_" + "A" * 40  # token-shaped, and not a URL → rejected
+    t = _good_ticket(links={"Ref": secret})
+    res = check_create(t, EnforceConfig())
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert secret not in v.message  # full token never echoed
+    assert "<redacted>" in v.message  # scrubbed via tasklib.logging.redact
+
+
+def test_links_url_redacts_a_token_shaped_key_too():
+    secret = "lin_api_" + "B" * 40
+    res = check_create(_good_ticket(links={secret: "not-a-url"}), EnforceConfig())
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert secret not in v.message
+
+
+def test_links_url_rejects_a_key_with_surrounding_whitespace():
+    # render writes the key verbatim but parse strips it, so a key with surrounding whitespace
+    # doesn't round-trip unchanged → reject it.
+    res = check_create(_good_ticket(links={" PR ": "https://github.com/x/y/pull/1"}), EnforceConfig())
+    assert not res.ok
+    assert any(v.gate == "links-url" for v in res.violations)
+
+
+def test_links_url_rejects_a_key_with_an_embedded_colon():
+    # render writes `- key: value` and parse splits on the FIRST colon, so a key containing ':'
+    # would reparse as a different (non-URL) value after a backend round-trip — reject it up front.
+    t = _good_ticket(links={"Docs: API": "https://example.com/docs"})
+    res = check_create(t, EnforceConfig())
+    assert not res.ok
+    assert any(v.gate == "links-url" for v in res.violations)
+
+
+def test_links_url_lists_every_offending_pair():
+    t = _good_ticket(links={"A": "session:2", "B": "https://ok.example/x", "C": "HYP-9"})
+    res = check_create(t, EnforceConfig())
+    v = next(v for v in res.violations if v.gate == "links-url")
+    assert "A: session:2" in v.message and "C: HYP-9" in v.message
+    assert "B:" not in v.message  # the valid URL is not listed
+
+
+def test_links_url_accepts_urls_with_ports_query_and_paths():
+    for good in ("http://localhost:3000", "https://example.com/a/b?x=1&y=2"):
+        assert check_create(_good_ticket(links={"Ref": good}), EnforceConfig()).ok, good
+
+
+def test_check_wrappers_forward_resolvable_ids():
+    # check_create / check_done are documented entry points — they must be able to DENY, not only
+    # warn, so the optional resolvable_ids has to reach the gate through them.
+    t = _good_ticket(what="per tg#42 do X")
+    assert any(v.gate == "msgref-quote" for v in check_create(t, EnforceConfig(), resolvable_ids={42}).violations)
+    tc = _good_ticket(what="per tg#42 do X", acceptance=_checked_criteria())
+    assert any(v.gate == "msgref-quote" for v in check_done(tc, EnforceConfig(), resolvable_ids={42}).violations)
+
+
+def test_normalize_skip_gate_accepts_new_gates():
+    assert normalize_skip_gate("links-url") == "links-url"
+    assert normalize_skip_gate("link-url") == "links-url"
+    assert normalize_skip_gate("msgref-quote") == "msgref-quote"
+    assert normalize_skip_gate("msgref_quote") == "msgref-quote"

@@ -348,6 +348,25 @@ def strip_quoted_blocks(text: str) -> str:
     return _QUOTE_BLOCK_RE.sub("", text)
 
 
+def unquoted_msgrefs(text: str) -> list[int]:
+    """The ``tg#<id>`` ids MENTIONED in ``text`` that do NOT yet have a genuinely-matched
+    GENERATED quote block, first-appearance order — i.e. exactly the ids
+    :func:`render_msgref_quotes` would append a quote for.
+
+    Pure (no I/O): it says WHICH ids lack a quote, not whether any of them is resolvable in
+    tg-cli history — that resolvability question is the caller's (the ``msgref-quote`` policy
+    gate loads history and decides deny-vs-warn on top of this set). Shared as the single source
+    of the "fresh mention minus already-quoted" computation so the auto-expander and the guard
+    can never diverge on what "already has its quote" means: both derive it from the same
+    :data:`_QUOTE_BLOCK_RE` (header id == marker id), so an innocent bold-markdown mention still
+    counts as unquoted while a spoofed lookalike / marker-shaped literal inside an untrusted
+    quoted message does not.
+    """
+    fresh_mentions = detect_msgrefs(strip_quoted_blocks(text))
+    already_quoted = {int(m.group(1)) for m in _QUOTE_BLOCK_RE.finditer(text)}
+    return [i for i in fresh_mentions if i not in already_quoted]
+
+
 def render_msgref_quotes(text: str, history: dict[int, HistoryRecord] | None = None, env: dict[str, str] | None = None) -> str:
     """Append a quote block for every ``tg#<id>`` mentioned in ``text``, first-appearance order.
 
@@ -368,9 +387,7 @@ def render_msgref_quotes(text: str, history: dict[int, HistoryRecord] | None = N
     one, and a marker-shaped literal sitting INSIDE an untrusted quoted message's own text can't
     corrupt this set either (it has no matching header immediately before it).
     """
-    fresh_mentions = detect_msgrefs(strip_quoted_blocks(text))
-    already_quoted = {int(m.group(1)) for m in _QUOTE_BLOCK_RE.finditer(text)}
-    ids = [i for i in fresh_mentions if i not in already_quoted]
+    ids = unquoted_msgrefs(text)
     if not ids:
         return text
     hist = history if history is not None else load_history(env)

@@ -65,6 +65,8 @@ _SKIP_FLAGS = (
     ("--skip-screenshots", "screenshots"),
     ("--skip-formatting", "formatting"),
     ("--skip-links", "links"),
+    ("--skip-links-url", "links-url"),
+    ("--skip-msgref-quote", "msgref-quote"),
 )
 
 
@@ -583,17 +585,55 @@ def _ticket_dict(t: Ticket) -> dict:
 # ── policy enforcement helper (shared by create + change/close) ─────────────────────
 
 
+def _msgref_resolvable_ids(ticket, cfg_e) -> set[int] | None:
+    """The ``tg#<id>`` ids resolvable in local tg-cli history — loaded ONCE, and ONLY when it can
+    actually matter: the ``msgref-quote`` gate is enabled AND the ticket's prose carries an
+    UNQUOTED reference. A gate disabled via ``enforce.msgref_quote: false``, or a fully-expanded /
+    reference-free ticket, never touches the (potentially large, private) history log (review
+    finding). Feeds the gate's deny-vs-warn split (:func:`tasklib.policy.check`); returns ``None``
+    when there is nothing to assess (the gate then no-ops), else the resolvable-id set. Uses the
+    gate's own :func:`tasklib.policy.unquoted_body_ids` so the "should I load history?" question
+    can never diverge from "what does the gate look at?". ``load_history`` is contractually
+    best-effort (it swallows a missing dir / absent tg-cli / corrupt line and returns ``{}``), so
+    this advisory path never breaks a create/close even where tg-cli was never installed."""
+    from .policy import GATE_MSGREF_QUOTE, unquoted_body_ids
+
+    # Skip the (potentially large, private) history read entirely when it can't change the
+    # outcome: the gate is disabled, already waived on this ticket, or there is nothing unquoted.
+    if not cfg_e.msgref_quote or GATE_MSGREF_QUOTE in ticket.skips:
+        return None
+    if not unquoted_body_ids(ticket):
+        return None
+    from .msgrefs import load_history
+
+    return set(load_history())
+
+
 def _enforce_or_die(ticket: Ticket, cfg, phase) -> None:
     from .policy import Phase, check
 
-    result = check(ticket, _enforce_config(cfg), phase)
+    cfg_e = _enforce_config(cfg)
+    result = check(ticket, cfg_e, phase, resolvable_ids=_msgref_resolvable_ids(ticket, cfg_e))
     _report_and_die(result, "create" if phase is Phase.CREATE else "close")
 
 
 def _report_and_die(result, label: str) -> None:
-    """Print the skipped/violation summary for a PolicyResult and refuse if any gate is unmet."""
+    """Print the skipped/violation summary for a PolicyResult and refuse if any gate is unmet.
+
+    Stream contract: on the SUCCESS path (no violation) the advisory warnings (``result.warnings``)
+    and the "skipped gates (justified)" summary are diagnostics, not data — they go to STDERR so a
+    machine-readable ``--json`` payload the caller then prints to stdout is never corrupted (review
+    finding). The FATAL refusal report below prints to stdout and then raises ``_UserError`` — that
+    is pre-existing behavior shared with every other command's refusal (and asserted by existing
+    tests); a failing command exits non-zero without printing ``--json``, so it does not corrupt a
+    success-path parse. Routing the refusal report to stderr too is a worthwhile follow-up but a
+    cross-cutting change beyond this gate's scope."""
+    import sys
+
+    for w in result.warnings:
+        print(_warn(f"  ⚠ {w.gate}: {w.message}"), file=sys.stderr)
     if result.skipped:
-        print(_warn(f"  skipped gates (justified): {', '.join(result.skipped)}"))
+        print(_warn(f"  skipped gates (justified): {', '.join(result.skipped)}"), file=sys.stderr)
     if not result.ok:
         from .policy import NON_SKIPPABLE_GATES
 
@@ -656,6 +696,20 @@ def _expand_msgrefs(text: str, history=None):
     return render_msgref_quotes(text, history=history)
 
 
+def _msgref_expand_enabled(skips, cfg) -> bool:
+    """Whether tg#<id> auto-expansion should run for a ticket carrying these skips under ``cfg``.
+    OFF when either (a) ``enforce.msgref_quote: false`` — that flag is the single master switch for
+    the whole tg#<id> feature, so disabling the gate also stops the quote machinery and its
+    private-history read (review finding); or (b) a ``--skip-msgref-quote`` is recorded — the
+    author declared the reference a false positive, so it must not be quoted at all. The skip
+    governs expansion, not merely the enforcement gate."""
+    from .policy import GATE_MSGREF_QUOTE
+
+    if not _enforce_config(cfg).msgref_quote:
+        return False
+    return GATE_MSGREF_QUOTE not in skips
+
+
 def _load_msgref_history_if_needed(*texts: str):
     """Load tg-cli's local message history ONCE per command — but only when at least one of
     ``texts`` actually names a ``tg#<id>`` reference. A metadata-only edit, or a ticket that
@@ -687,14 +741,39 @@ def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact
     boolean transition-legality override, not a reason). Only a metadata-only edit, which
     touches no scanned field, is exempt.
     """
-    from .policy import apply_skips, impact_quality_violation, links_violation, msgref_title_violation
+    from .policy import (
+        apply_skips,
+        impact_quality_violation,
+        links_url_violation,
+        links_violation,
+        msgref_quote_reports,
+        msgref_title_violation,
+    )
 
     cfg_e = _enforce_config(cfg)
     raw = []
+    warnings = []
     if check_links:
+        # `check_links` means this edit touched a scanned content field. Re-run the same content
+        # gates the create phase would, over the WHOLE (conservatively re-scanned) body: the prose
+        # bare-reference gate, the Links-field URL gate, and the body tg#<id> quote gate. A pure
+        # metadata edit (--due/--label) leaves check_links False and is exempt from all three, so
+        # a legacy junk link / unquoted reference never blocks an unrelated metadata edit — it is
+        # still caught at create and at close (where these gates run unconditionally via check()).
         v = links_violation(ticket, cfg_e)
         if v is not None:
             raw.append(v)
+        v = links_url_violation(ticket, cfg_e)
+        if v is not None:
+            raw.append(v)
+        # Auto-expansion runs on this same command before enforcement, so a freshly set --what
+        # carrying a reference is already quoted; this catches a pre-existing unquoted reference
+        # in an untouched field — the backstop for a web-UI-authored ticket.
+        deny, warn = msgref_quote_reports(ticket, cfg_e, _msgref_resolvable_ids(ticket, cfg_e))
+        if deny is not None:
+            raw.append(deny)
+        if warn is not None:
+            warnings.append(warn)
     if check_impact:
         v = impact_quality_violation(ticket, cfg_e)
         if v is not None:
@@ -703,8 +782,8 @@ def _enforce_edit_or_die(ticket: Ticket, cfg, *, check_links: bool, check_impact
         v = msgref_title_violation(ticket, cfg_e)
         if v is not None:
             raw.append(v)
-    if raw:
-        _report_and_die(apply_skips(raw, ticket), "update")
+    if raw or warnings:
+        _report_and_die(apply_skips(raw, ticket, warnings), "update")
 
 
 def _notify_mutation(cfg, ticket, action: str) -> None:
@@ -850,16 +929,22 @@ def cmd_create(args: argparse.Namespace) -> int:
     # loses everything after the first line). A tg#<id> in a criterion stays a bare, un-expanded
     # mention — harmless, since the links gate already excludes tg#<id> from its bare-reference
     # scan.
-    history = _load_msgref_history_if_needed(what, args.why or "", args.impact or "", args.if_not_done or "")
+    # A recorded --skip-msgref-quote means the author declares the tg#<id> a false positive (a
+    # version tag, not a message ref), so NEITHER expand it (attaching an unrelated, possibly
+    # private Telegram message) NOR read history at all — the skip must govern expansion, not only
+    # the gate, or the waiver would still leak the very quote it waives (review finding).
+    skips = _collect_skips(args)
+    expand = _msgref_expand_enabled(skips, cfg)
+    history = _load_msgref_history_if_needed(what, args.why or "", args.impact or "", args.if_not_done or "") if expand else None
     labels = list(dict.fromkeys([*args.label, session.label]))
     screenshots = [Screenshot(ref=p, kind="creation") for p in args.screenshot]
     due = _normalize_due(getattr(args, "due", None)) or ""
     ticket = Ticket(
         title=title,
-        what=_expand_msgrefs(what, history),
-        why=_expand_msgrefs(args.why or "", history),
-        user_impact=_expand_msgrefs(args.impact or "", history),
-        cost_of_inaction=_expand_msgrefs(args.if_not_done or "", history),
+        what=_expand_msgrefs(what, history) if expand else what,
+        why=_expand_msgrefs(args.why or "", history) if expand else (args.why or ""),
+        user_impact=_expand_msgrefs(args.impact or "", history) if expand else (args.impact or ""),
+        cost_of_inaction=_expand_msgrefs(args.if_not_done or "", history) if expand else (args.if_not_done or ""),
         acceptance=list(args.acceptance),
         screenshots=screenshots,
         labels=labels,
@@ -868,7 +953,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         # with no URL requirement, so a "Session: session:2" entry silently escaped the links
         # gate (which only scans prose fields, see policy._scanned_text) and showed up in the
         # ticket as a fake, non-URL "link". Reported by the CTO as junk (2026-07-17).
-        skips=_collect_skips(args),
+        skips=skips,
         due=due,
     )
 
@@ -1436,20 +1521,34 @@ def cmd_change(args: argparse.Namespace) -> int:
     if args.done:
         validate_transition(ticket.state, State.DONE, force=args.force)
 
+    # A --skip-msgref-quote passed on THIS edit turns expansion off for this command — the skip
+    # governs the quote machinery, not only the gate (review finding), so a waived false positive
+    # isn't expanded into an unrelated Telegram quote. Gate on THIS command's skips only, NOT a
+    # skip persisted from a past create: a historical waiver must not permanently disable
+    # expansion of a genuinely NEW reference added later (review finding). The enforcement gate
+    # below still honours the persisted skip (it lives in ticket.skips) — only expansion is scoped
+    # to the current command's intent.
+    new_skips = _collect_skips(args)
+    expand = _msgref_expand_enabled(new_skips, cfg)
     # Load tg-cli's local history ONCE for this command, and only if a touched field actually
     # names a reference (see _load_msgref_history_if_needed) — a metadata-only edit (--due/
-    # --label) or an edit naming no tg#<id> never touches the (potentially large) history log.
-    history = _load_msgref_history_if_needed(args.what or "", args.why or "", args.impact or "", args.if_not_done or "")
+    # --label), an edit naming no tg#<id>, or a msgref-quote-waived edit never touches the
+    # (potentially large) history log.
+    history = (
+        _load_msgref_history_if_needed(args.what or "", args.why or "", args.impact or "", args.if_not_done or "")
+        if expand
+        else None
+    )
     if args.title:
         ticket.title = args.title
     if args.what:
-        ticket.what = _expand_msgrefs(args.what, history)
+        ticket.what = _expand_msgrefs(args.what, history) if expand else args.what
     if args.why:
-        ticket.why = _expand_msgrefs(args.why, history)
+        ticket.why = _expand_msgrefs(args.why, history) if expand else args.why
     if args.impact:
-        ticket.user_impact = _expand_msgrefs(args.impact, history)
+        ticket.user_impact = _expand_msgrefs(args.impact, history) if expand else args.impact
     if args.if_not_done:
-        ticket.cost_of_inaction = _expand_msgrefs(args.if_not_done, history)
+        ticket.cost_of_inaction = _expand_msgrefs(args.if_not_done, history) if expand else args.if_not_done
     # Acceptance criteria are NEVER msgref-expanded (see the cmd_create comment on why: the
     # single-line checkbox format can't carry a multi-line quote), so this dedup stays plain
     # equality against the stored (always-raw) text — unchanged from before this feature.
@@ -1466,7 +1565,7 @@ def cmd_change(args: argparse.Namespace) -> int:
     for label in args.label:
         if label not in ticket.labels:
             ticket.labels.append(label)
-    ticket.skips.update(_collect_skips(args))
+    ticket.skips.update(new_skips)
 
     # An edit that TOUCHES a text field is re-scanned for bare references (rule 1) and re-graded
     # on impact quality (rule 5) — whether or not this same command ALSO closes the ticket, so
@@ -1775,7 +1874,10 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
     # classify path is ALSO a tg-cli hook entry point (it IS the `task classify "<msg>" --create`
     # call an agent makes from an inbound message), so it must not be the one path that silently
     # drops the quote a reader would otherwise get everywhere else (task-cli#45 review finding).
-    ticket.what = _expand_msgrefs(ticket.what, _load_msgref_history_if_needed(what_raw))
+    # Honours the same master switch as the other paths: no expansion (nor history read) when
+    # `enforce.msgref_quote: false` or the reference is waived (review finding).
+    if _msgref_expand_enabled(ticket.skips, cfg):
+        ticket.what = _expand_msgrefs(ticket.what, _load_msgref_history_if_needed(what_raw))
     try:
         created = backend.create(ticket)
     except BackendError as exc:

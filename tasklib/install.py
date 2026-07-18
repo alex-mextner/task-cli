@@ -77,7 +77,11 @@ task session                     # show current session + its tickets
 ## Key facts
 - **Enforcement gates** (on create + on change→done): acceptance criteria, motivation,
   user impact, cost of inaction, screenshots (UI/visual tickets), section formatting, a
-  `tg#<id>` reference banned from the title (move it into `--what`/`--why`/etc. instead).
+  `tg#<id>` reference banned from the title (move it into `--what`/`--why`/etc. instead),
+  the `## Links` section restricted to `http(s)://` URLs (`links-url`; a `tg#<id>` goes in a
+  prose field, never Links), and a body `tg#<id>` required to carry its quoted content
+  (`msgref-quote` — auto-attached from local `tg-cli` history; blocks only when the message
+  resolves in history yet the quote is missing, otherwise warns).
 - **Escape hatch**: most gates are skippable with a written justification recorded ON the
   ticket — `--skip-<gate> "<reason>"` (e.g. `--skip-screenshots "no UI in this change"`).
   Two are hard (no per-ticket skip, only a config-level toggle disables them, and the config
