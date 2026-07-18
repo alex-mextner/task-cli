@@ -581,16 +581,27 @@ def test_links_url_rejects_embedded_credentials():
 def test_links_url_rejects_credentials_outside_userinfo():
     # a token-shaped value can also ride in the path/query/fragment, not just userinfo — this
     # gate persists the value verbatim, so it leaks the same way embedded userinfo does
-    # (review finding).
+    # (review finding). Each token is also asserted ABSENT from the violation message itself —
+    # the security property that actually matters (detecting the leak but then printing the
+    # token anyway would defeat the point).
     bad_values = (
-        "https://example.com/download?token=ghp_" + "a" * 20,  # query param
-        "https://example.com/artifacts/ghp_" + "b" * 20 + "/build",  # path segment
-        "https://example.com/x#lin_api_" + "c" * 20,  # fragment
+        ("https://example.com/download?token=ghp_" + "a" * 20, "ghp_" + "a" * 20),  # query param
+        ("https://example.com/artifacts/ghp_" + "b" * 20 + "/build", "ghp_" + "b" * 20),  # path
+        ("https://example.com/x#lin_api_" + "c" * 20, "lin_api_" + "c" * 20),  # fragment
     )
-    for bad in bad_values:
+    for bad, token in bad_values:
         res = check_create(_good_ticket(links={"Ref": bad}), EnforceConfig())
         assert not res.ok, bad
-        assert any(v.gate == "links-url" for v in res.violations), bad
+        v = next(v for v in res.violations if v.gate == "links-url")
+        assert token not in v.message, bad
+        assert "embedded credential" in v.message, bad  # tailored message (review finding)
+
+
+def test_links_url_accepts_a_query_param_that_is_not_token_shaped():
+    # the credential check must not over-trigger on an ordinary, non-token-shaped query value —
+    # only a value matching the shared token-shape regex is rejected (review finding).
+    res = check_create(_good_ticket(links={"Ref": "https://example.com/x?page=2&sort=asc"}), EnforceConfig())
+    assert res.ok, [v.message for v in res.violations]
 
 
 def test_links_url_message_redacts_a_secret_shaped_value_under_a_sensitive_key():
