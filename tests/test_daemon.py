@@ -12,6 +12,7 @@ import os
 import signal
 import time
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -537,6 +538,40 @@ def test_child_env_preserves_other_pythonpath_entries_behind_repo_root():
     base_env = {"PYTHONPATH": f"/a{os.pathsep}/b"}
     env = daemon._child_env(repo_root, base_env=base_env)
     assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/a{os.pathsep}/b"
+
+
+def test_child_env_resolves_relative_pythonpath_entries_against_parent_cwd(monkeypatch, tmp_path):
+    # An inherited "." resolves against the PROCESS cwd at import time — for the spawned
+    # child that's the TARGET project being managed, not wherever the parent (this CLI
+    # invocation) was run from. A target repo shipping its own e.g. yaml.py could shadow
+    # a real import the moment the child does `import yaml`. Rather than dropping a
+    # relative entry (which would break a legitimate tox/CI/direnv-style
+    # `PYTHONPATH=src` config), freeze it into an absolute path against the PARENT's cwd
+    # — the child cwd can no longer reinterpret it. A bare/doubled separator ("") has no
+    # intent to preserve and is dropped.
+    # `monkeypatch.chdir` (a real directory) rather than patching `Path.cwd` directly —
+    # the latter mutates the stdlib class process-wide for every caller during the test
+    # (review finding); chdir exercises the real `Path.cwd()` call path with a narrow
+    # blast radius.
+    monkeypatch.chdir(tmp_path)
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f".{os.pathsep}{os.pathsep}relative/dir{os.pathsep}/kept"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == (
+        f"{repo_root}{os.pathsep}{tmp_path}{os.pathsep}{tmp_path / 'relative/dir'}{os.pathsep}/kept"
+    )
+
+
+def test_child_env_dedupes_relative_entry_that_resolves_to_repo_root(monkeypatch):
+    # The common case: running the CLI from the checkout, PYTHONPATH="." set by tox/direnv
+    # in that same repo. "." doesn't string-match repo_root, but it RESOLVES to repo_root —
+    # the dedupe must compare against the resolved value, not the raw entry, or repo_root
+    # ends up twice in the child's PYTHONPATH (review finding).
+    repo_root = daemon._repo_root()
+    monkeypatch.chdir(repo_root)
+    base_env = {"PYTHONPATH": f".{os.pathsep}{repo_root}"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == str(repo_root)
 
 
 def test_scrub_bootstrap_pythonpath_removes_only_the_injected_entry(monkeypatch):

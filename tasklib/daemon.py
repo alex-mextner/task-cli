@@ -828,7 +828,43 @@ def _child_env(repo_root: Path, *, base_env: dict[str, str] | None = None) -> di
     """
     env = dict(base_env if base_env is not None else os.environ)
     existing = env.get("PYTHONPATH", "")
-    entries = [e for e in (existing.split(os.pathsep) if existing else []) if e != str(repo_root)]
+    raw_entries = existing.split(os.pathsep) if existing else []
+    # A relative entry (e.g. inherited ".") resolves against the PROCESS cwd at import
+    # time — which for the spawned child is the TARGET project being managed, not
+    # wherever the parent (this CLI invocation) was run from. Left as-is, a target repo
+    # shipping its own e.g. yaml.py could shadow a stdlib/site import the moment the
+    # child does `import yaml` — same class of hole `-P` closes for the auto-prepended
+    # cwd entry, but `-P` doesn't touch explicit PYTHONPATH content (review finding).
+    # Rather than DROP a relative entry (which would silently break a legitimate
+    # tox/CI/direnv-style `PYTHONPATH=src` config the parent process relies on), resolve
+    # it against the PARENT's cwd now, while it still means what the caller intended —
+    # freezing it into an absolute path the child cwd can no longer reinterpret (review
+    # finding). An empty entry (bare separator) has no such intent to preserve; drop it.
+    # `Path.cwd()` is called lazily (only when a relative entry actually needs resolving,
+    # the uncommon case) and guarded: a long-lived daemon's cwd can be a worktree deleted
+    # out from under it, which would otherwise turn an unrelated respawn into a crash
+    # (review finding) — fall back to dropping that one entry rather than raising.
+    entries: list[str] = []
+    parent_cwd: Path | None = None
+    for e in raw_entries:
+        if not e:
+            continue
+        if Path(e).is_absolute():
+            resolved = e
+        else:
+            if parent_cwd is None:
+                try:
+                    parent_cwd = Path.cwd()
+                except OSError:
+                    continue  # cwd gone; can't resolve this entry, so drop it
+            resolved = str(parent_cwd / e)
+        # Dedupe on the RESOLVED value (not the raw entry) so e.g. a relative "." that
+        # resolves to repo_root is caught too — matching the raw entry alone would miss
+        # exactly the case (running from repo_root, PYTHONPATH=".") this fix targets
+        # (review finding).
+        if resolved == str(repo_root) or resolved in entries:
+            continue
+        entries.append(resolved)
     env["PYTHONPATH"] = os.pathsep.join([str(repo_root), *entries])
     env[_BOOTSTRAP_MARKER] = str(repo_root)
     return env
