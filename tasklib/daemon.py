@@ -667,6 +667,11 @@ def run_loop(cfg: "LoadedConfig", paths: DaemonPaths, *, max_ticks: int | None =
     """
     from .backends import get_backend
 
+    # tasklib is already imported by now (we're running inside it) — any PYTHONPATH bootstrap
+    # _spawn_detached needed to GET here has done its job. Scrub it before the tick loop can
+    # call notify(), which spawns the notifier as OUR subprocess and would otherwise inherit it.
+    _scrub_bootstrap_pythonpath()
+
     dcfg = DaemonConfig.from_config(cfg)
     if not dcfg.enabled:
         # A direct `task daemon run` must honor the disable switch too, not only `start` — so a
@@ -781,6 +786,86 @@ def start(
     return "started", child
 
 
+def _repo_root() -> Path:
+    """This file's own repo root (``tasklib/daemon.py`` -> two dirs up).
+
+    In a checkout this is the directory ``bin/task`` lives in — the root the shim inserts into
+    ``sys.path`` by hand. In an installed-package layout it's just ``tasklib``'s own parent
+    (e.g. site-packages), which is already importable, so re-adding it is a harmless no-op.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+# The marker _child_env sets alongside its PYTHONPATH prepend, and _scrub_bootstrap_pythonpath
+# looks for before touching anything. An explicit handshake (not "does PYTHONPATH happen to
+# contain repo_root") so the scrub can tell "WE injected this" apart from "the user's own env
+# already had it" — see both functions' docstrings for the two ways a value-based guess breaks.
+_BOOTSTRAP_MARKER = "_TASKLIB_DAEMON_BOOTSTRAP_PYTHONPATH"
+
+
+def _child_env(repo_root: Path, *, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """The env for the detached ``-m tasklib`` re-exec: ``PYTHONPATH`` with ``repo_root`` FIRST.
+
+    The ONLY documented install path (``install.sh``) symlinks ``bin/task`` into
+    ``~/.local/bin`` and never ``pip install``s the package — ``tasklib`` is importable in the
+    *parent* process only because the ``bin/task`` shim inserts the repo root into ``sys.path``
+    by hand. A detached child re-exec'd via a bare ``sys.executable -m tasklib`` does NOT
+    inherit that in-process mutation, so it failed instantly with
+    ``ModuleNotFoundError: No module named 'tasklib'`` — ``start`` reported "started" while
+    ``status`` immediately read back "stopped".
+
+    ``repo_root`` must land at INDEX 0, not merely "somewhere in ``PYTHONPATH``" — an earlier
+    entry (e.g. an inherited ``PYTHONPATH=.:...`` with ``.`` first) would still resolve ``.``
+    against the child's cwd (the TARGET project, per :func:`_spawn_detached`) ahead of the real
+    package, reopening the same shadowing hole ``-P`` closes for the auto-prepended entries —
+    ``PYTHONPATH`` itself is unaffected by ``-P``. So: drop any existing occurrence of
+    ``repo_root`` (this also caps growth across a chain of respawns) and unconditionally
+    prepend it, preserving the rest of the caller's ``PYTHONPATH`` order behind it. Also sets
+    :data:`_BOOTSTRAP_MARKER` to the exact value prepended, so :func:`_scrub_bootstrap_pythonpath`
+    can undo EXACTLY this injection later without guessing from the value alone (a user who
+    legitimately runs with ``PYTHONPATH=<repo_root>`` themselves must not have it stripped).
+    ``base_env`` defaults to ``os.environ`` and exists so tests don't need to monkeypatch it.
+    """
+    env = dict(base_env if base_env is not None else os.environ)
+    existing = env.get("PYTHONPATH", "")
+    entries = [e for e in (existing.split(os.pathsep) if existing else []) if e != str(repo_root)]
+    env["PYTHONPATH"] = os.pathsep.join([str(repo_root), *entries])
+    env[_BOOTSTRAP_MARKER] = str(repo_root)
+    return env
+
+
+def _scrub_bootstrap_pythonpath() -> None:
+    """Undo :func:`_child_env`'s ``PYTHONPATH`` injection in THIS process's own ``os.environ``.
+
+    ``_child_env`` injects ``repo_root`` into ``PYTHONPATH`` so the detached child can
+    ``import tasklib`` at all — but once that import has happened (i.e. by the time this runs,
+    called early in :func:`run_loop`), the entry has done its job. Left in place it would
+    persist in the daemon's env for its ENTIRE lifetime and leak into every subprocess it
+    spawns, notably the notifier command (see :func:`notify`) — a Python-based notifier would
+    then resolve imports through task-cli's own checkout root by accident.
+
+    Gated on :data:`_BOOTSTRAP_MARKER` rather than "does PYTHONPATH happen to contain
+    repo_root" — a value-based guess has two failure modes an explicit handshake avoids:
+    (1) a user who legitimately runs with ``PYTHONPATH=<repo_root>`` themselves would have it
+    silently deleted; (2) ``run_loop`` (which calls this) is also invoked IN-PROCESS by tests
+    with ``max_ticks=``, never having gone through :func:`_spawn_detached` at all — mutating
+    ``os.environ`` there would strip a real developer's own ``PYTHONPATH`` for the rest of
+    their process (e.g. the remainder of a pytest session), not just the intended child.
+    A no-op whenever the marker is absent — which covers both cases above, plus the ordinary
+    "not spawned via ``_spawn_detached``" launches (a real installed-package invocation, a
+    direct foreground ``task daemon run``).
+    """
+    injected = os.environ.pop(_BOOTSTRAP_MARKER, None)
+    if injected is None:
+        return
+    existing = os.environ.get("PYTHONPATH", "")
+    entries = [e for e in existing.split(os.pathsep) if e != injected] if existing else []
+    if entries:
+        os.environ["PYTHONPATH"] = os.pathsep.join(entries)
+    else:
+        os.environ.pop("PYTHONPATH", None)
+
+
 def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) -> int:
     """Spawn ``task daemon run`` fully detached (new session, stdio to the log). Returns its pid.
 
@@ -790,9 +875,39 @@ def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) 
     git checkout (the ``task`` console script may not be on PATH) and from an installed package.
     ``child_flags`` (the backend-selecting global flags) are forwarded so the child resolves the
     same coordinate the launcher did.
+
+    The argv shape (``-m tasklib daemon run …``) and the child's OS-level cwd (the TARGET
+    project's ``cwd``, not task-cli's own checkout) are BOTH deliberately unchanged from before
+    this fix: :func:`argv_is_task_daemon`'s pid-identity matcher keys off the exact
+    ``-m tasklib daemon run`` shape, and ``notify()``/``logging._emit_local`` resolve relative
+    notifier commands / a relative ``TASK_LOG_FILE`` against the daemon's real working
+    directory — repointing either would silently break something else.
+
+    That leaves Python's own behavior of auto-prepending a ``-m`` invocation's process cwd to
+    ``sys.path[0]``, AHEAD of ``PYTHONPATH``, as the actual hole: a managed project that happens
+    to contain its own top-level ``tasklib/`` directory would shadow the real package and run
+    arbitrary code as this daemon. ``-P`` (``PYTHONSAFEPATH``, Python 3.11+, required by
+    ``pyproject.toml`` — though the checkout+shim install path this fix targets never actually
+    enforces that floor; on an older interpreter ``-P`` itself fails loudly with "unknown
+    option", which at least replaces a silent failure with a visible one instead of adding a
+    new one) suppresses exactly that auto-prepend WITHOUT touching ``PYTHONPATH`` — verified
+    empirically: with ``-P`` plus the ``PYTHONPATH`` from :func:`_child_env`, a decoy
+    ``tasklib/`` package in the child's cwd is ignored and the real one loads.
+
+    ACCEPTED RESIDUAL RISK: this closes the concrete, demonstrated hole (a decoy ``tasklib/``),
+    not every hole a fully hostile *inherited* ``PYTHONPATH`` could open — an entry such as
+    ``.`` ahead of ``repo_root`` still resolves against the child's cwd for OTHER imports
+    (``yaml``, etc.), and a managed project could in principle ship a same-named decoy of one
+    of those. Treating that as in-scope would mean not trusting ``PYTHONPATH`` at all (e.g.
+    dropping it entirely and going through a ``-I``/isolated re-exec), which is a materially
+    bigger change than this fix. For a single-user local tool run only against repos the same
+    user already controls, we accept that residual: the concrete, reproduced hole (any project
+    dir shadowing the daemon's own module via a same-named package) is closed; a hypothetical
+    supply-chain-style attack via a same-named STDLIB/dependency decoy is not addressed here.
     """
+    repo_root = _repo_root()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    argv = [sys.executable, "-m", "tasklib", "daemon", "run", "-C", cwd or os.getcwd(), *child_flags]
+    argv = [sys.executable, "-P", "-m", "tasklib", "daemon", "run", "-C", cwd or os.getcwd(), *child_flags]
     logf = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - handed to the child; closed below
     try:
         proc = subprocess.Popen(
@@ -802,6 +917,7 @@ def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) 
             stderr=logf,
             start_new_session=True,
             cwd=cwd or os.getcwd(),
+            env=_child_env(repo_root),
         )
     finally:
         logf.close()
