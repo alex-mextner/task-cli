@@ -52,6 +52,8 @@ enforce:
   user_impact: required           # who / what it affects
   cost_of_inaction: required      # what happens if we don't
   formatting: strict              # body must match the section template
+  links_url: required             # the ## Links section holds http(s):// URLs only
+  msgref_quote: required          # a body tg#<id> must carry its auto-attached quote
   screenshots:
     on_create: required_if_label: [ui, visual]
     on_done:   required_if_label: [ui, visual]
@@ -127,13 +129,14 @@ disable-able globally or per-repo via `enforce:` in config. (Mirrors the existin
 ## Screenshots
 - creation: <img>      - implementation: <img>
 ## Links
-- PR: …    Deploy: …
+- PR: https://…
+- Issue: https://…
 ```
 
-The `## Links` section is for real URL references only (a PR link, a deploy URL, an
-issue link). Session identity is NOT a link: it is carried as a `session:<id>` **label**
-(what `session_tickets()` queries by), never duplicated into Links — a non-URL
-`Session: session:<id>` entry there is junk (issue #54).
+The `## Links` section holds **URLs only** (enforced by the `links_url` gate) — a session id
+lives in the ticket's `session:<id>` label, never here (a non-URL `Session: session:<id>`
+entry there is junk, issue #54). A `tg#<id>` Telegram-message reference goes in a prose field
+(`## What`/`## Why`/…), where the `msgref_quote` gate makes it carry its quoted content.
 
 This is deliberately the **same section set** as agent-tools' existing
 `ci/pr-checklist/pull_request_template.md` (Motivation/what&why · Acceptance criteria · Screenshots/proof)

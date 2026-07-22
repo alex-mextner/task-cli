@@ -109,7 +109,7 @@ class Ticket:
     acceptance: list[Criterion] = field(default_factory=list)
     screenshots: list[Screenshot] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
-    links: dict[str, str] = field(default_factory=dict)  # e.g. {"PR": "...", "Session": "session:abc"}
+    links: dict[str, str] = field(default_factory=dict)  # URLs only, e.g. {"PR": "https://…", "Issue": "https://…"}
     skips: dict[str, str] = field(default_factory=dict)  # gate -> justification (escape hatch)
     state: State = State.TODO
 

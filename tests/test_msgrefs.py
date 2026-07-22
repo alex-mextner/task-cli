@@ -10,6 +10,7 @@ from tasklib.msgrefs import (
     load_history,
     render_msgref_quotes,
     title_msgrefs,
+    unquoted_msgrefs,
 )
 
 
@@ -360,3 +361,32 @@ def test_quote_line_sanitizes_a_display_name_with_embedded_newlines():
     out = render_msgref_quotes("per tg#42 do X", history=history)
     assert "Alex ## Injected Heading malicious" in out  # collapsed onto one line
     assert not re.search(r"^##\s+", out, re.MULTILINE)  # never starts a line -> not a heading
+
+
+def test_unquoted_msgrefs_lists_refs_without_a_quote_block():
+    # a bare mention (no quote yet) is "unquoted".
+    assert unquoted_msgrefs("per tg#42 do X, also tg#7") == [42, 7]
+
+
+def test_unquoted_msgrefs_excludes_an_already_quoted_ref():
+    # once render_msgref_quotes has appended a genuine (marker-bearing) block, that id is no
+    # longer unquoted — the header line's own `tg#42` doesn't count as a fresh mention.
+    history = {42: HistoryRecord(ts=1700000000, message_id=42, direction="user", from_="Alex", text="hi", pane=None)}
+    expanded = render_msgref_quotes("per tg#42 do X", history=history)
+    assert unquoted_msgrefs(expanded) == []
+
+
+def test_unquoted_msgrefs_excludes_a_not_found_placeholder():
+    # the whole design rests on this: an UNRESOLVABLE ref expanded with empty history still gets a
+    # "message not found" block carrying the provenance marker, so it counts as quoted and does NOT
+    # re-warn on every subsequent command. Verify the placeholder matches the block regex.
+    expanded = render_msgref_quotes("per tg#42 do X", history={})
+    assert "message not found" in expanded
+    assert unquoted_msgrefs(expanded) == []
+
+
+def test_unquoted_msgrefs_still_lists_a_partially_quoted_mix():
+    # tg#42 quoted, tg#99 still bare → only the bare one is unquoted.
+    history = {42: HistoryRecord(ts=1700000000, message_id=42, direction="user", from_="Alex", text="hi", pane=None)}
+    expanded = render_msgref_quotes("per tg#42 do X", history=history)
+    assert unquoted_msgrefs(expanded + " and also tg#99") == [99]

@@ -16,7 +16,7 @@ def _full_ticket() -> Ticket:
         acceptance=["toggle persists across reloads", "respects prefers-color-scheme"],
         screenshots=[Screenshot(ref="before.png", kind="creation", caption="current header")],
         labels=["ui"],
-        links={"PR": "https://github.com/x/y/pull/1", "Session": "session:abc"},
+        links={"PR": "https://github.com/x/y/pull/1", "Issue": "https://linear.app/x/issue/HYP-1"},
     )
 
 
