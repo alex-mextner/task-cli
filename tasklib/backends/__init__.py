@@ -55,6 +55,12 @@ class TicketBackend(Protocol):
         """List tickets carrying a ``session:<id>`` label (the backend-side session view)."""
         ...
 
+    def current_user(self) -> str | None:
+        """Best-effort identity (login/id) of the authenticated caller, or ``None`` if it
+        can't be determined. A filter hint only (issue #59's personal-scope stale-ticket nudge)
+        — never an authorization boundary, and never raises; failures degrade to ``None``."""
+        ...
+
 
 class BackendError(RuntimeError):
     """A backend call failed (HTTP error, auth error, not-found, malformed response)."""

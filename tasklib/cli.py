@@ -1157,18 +1157,54 @@ def _print_session_attention_after_mutation(args: argparse.Namespace, cfg, backe
         print(notice)
 
 
+def _scope_to_current_user(backend, tickets: list) -> list:
+    """Keep only tickets the current user actually reported/filed (issue #59, review P2): an
+    unqualified scan would nag about a COWORKER's stale ticket in a shared GitHub/Linear
+    project, contradicting this feature's "the user's own open tickets" framing. Reporter
+    (issue author / Linear creator), not assignee: `create()` never sets a native assignee on
+    either backend, so an assignee-based filter would exclude virtually every ticket task-cli
+    itself creates — the reporter is who actually ran task-cli.
+
+    Fails OPEN: if the backend can't determine "who am I" (`current_user()` -> None — a
+    transient hiccup, or simply unsupported), keep the unfiltered set rather than dropping every
+    ticket — parity with the pre-fix behavior, never worse.
+
+    Also fails OPEN if `current_user()` *raises* — a network hiccup a backend forgot to wrap in
+    `BackendError`, or `AttributeError` from a third-party backend that never implements it (the
+    protocol is structural, not ABC-enforced) — rather than a "normal" `None` return (review P1,
+    found independently by two reviewers). Left uncaught, that exception would propagate into
+    `_global_stale_notice_block`'s single broad `except Exception`, which swallows the ENTIRE
+    nudge (and skips `mark_checked`) — silently hiding a real stale ticket that has nothing to do
+    with the identity lookup. Catching it HERE, at the scope-lookup's own boundary, keeps that
+    failure mode contained to "don't scope" instead of "don't nudge at all".
+    """
+    try:
+        me = backend.current_user()
+    except Exception as exc:
+        from .logging import log_event
+
+        log_event("global_stale.identity_lookup_failed", error=type(exc).__name__)
+        return tickets
+    if not me:
+        return tickets
+    return [t for t in tickets if t.reporter and t.reporter == me]
+
+
 def _global_stale_notice_block(args: argparse.Namespace, backend, coordinate: str) -> str:
     """Rate-limited nudge: ANY of the user's own active tickets stale >48h, not just this
     session's (issue #59 — `_session_attention_notice` above only ever sees session-touched
     tickets). Fail-soft end to end: a backend hiccup or a malformed cache file here must never
     break `task list`'s primary output, it's a bonus notice, not the command's job.
 
-    ALWAYS fetches its OWN unfiltered ticket set — never a caller's `--state`/`--label`-filtered
-    `tickets`. A caller in the all-tasks fallback branch already has a ticket list in hand, but
-    reusing it silently narrows "every open ticket" to whatever the user filtered for (e.g.
-    `task list --state done` would only ever see done tickets and could never flag a stale
-    active one). The extra backend round-trip this costs is bounded by the rate limit — at most
-    once per window, not once per invocation.
+    ALWAYS fetches its OWN unfiltered (by `--state`/`--label`) ticket set — never a caller's
+    already-filtered `tickets`. A caller in the all-tasks fallback branch already has a ticket
+    list in hand, but reusing it silently narrows "every open ticket" to whatever the user
+    filtered for (e.g. `task list --state done` would only ever see done tickets and could
+    never flag a stale active one). The extra backend round-trip this costs is bounded by the
+    rate limit — at most once per window, not once per invocation. It IS narrowed by
+    :func:`_scope_to_current_user` right after the fetch, to the current user's own tickets
+    (issue #59, review P2) — a shared GitHub/Linear project must not nag one user about a
+    coworker's stale ticket.
 
     Like `daemon.py`'s own polling loop, this reads at most `_LIMIT_INTERACTIVE` (100) tickets
     per backend page — a project with more than that many open tickets won't have the tail
@@ -1183,6 +1219,7 @@ def _global_stale_notice_block(args: argparse.Namespace, backend, coordinate: st
         if not stale_notice.should_check(coordinate):
             return ""
         tickets = backend.list(limit=_LIMIT_INTERACTIVE)
+        tickets = _scope_to_current_user(backend, tickets)
         stale = stale_notice.stale_tickets(tickets)
     except Exception as exc:
         from .logging import log_event

@@ -43,6 +43,21 @@ def test_stale_tickets_ignores_non_active_state():
     assert stale_notice.stale_tickets([ticket]) == []
 
 
+def test_stale_tickets_ignores_ticket_whose_provider_state_is_actually_closed():
+    # P2 (review): a GitHub issue closed OUTSIDE task-cli can keep a stale managed
+    # `status:todo`/`status:in-progress` label — `_derive_state` prioritizes that label over the
+    # provider's real open/closed state, so `ticket.state` can still read as an ACTIVE state for
+    # an issue that is genuinely closed. `provider_closed` is the backend's own truthful signal;
+    # it must override the (possibly stale) label-derived state when flagging staleness.
+    ticket = Ticket(
+        title="Closed on GitHub but mislabeled",
+        state=State.TODO,
+        updated_at=_iso_hours_ago(1000),
+        provider_closed=True,
+    )
+    assert stale_notice.stale_tickets([ticket]) == []
+
+
 def test_stale_tickets_ignores_malformed_timestamp():
     ticket = Ticket(title="Garbage timestamp", state=State.TODO, updated_at="not-a-date")
     assert stale_notice.stale_tickets([ticket]) == []
@@ -133,4 +148,20 @@ def test_read_last_checked_survives_non_dict_cache_content(tmp_path):
     path = stale_notice.cache_path("owner/repo", env=env)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("[]", encoding="utf-8")
+    assert stale_notice.should_check("owner/repo", env=env) is True
+
+
+def test_should_check_true_when_cache_has_a_non_finite_timestamp(tmp_path):
+    # P2 (review): a corrupted/hand-edited cache like {"last_checked_at": NaN} parses fine via
+    # json.loads + float() (NaN is a valid Python float) — under the old code `elapsed = now -
+    # nan` is `nan`, and BOTH `elapsed < 0` and `elapsed >= interval` are False for NaN, so
+    # `should_check` returned False forever: a PERMANENT silent suppression, worse than any other
+    # corrupted-cache case (which all degrade to "never checked" = due immediately). A non-finite
+    # cached value must degrade the same way, never wedge the check shut permanently.
+    import json
+
+    env = {"XDG_STATE_HOME": str(tmp_path)}
+    path = stale_notice.cache_path("owner/repo", env=env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"last_checked_at": float("nan")}), encoding="utf-8")
     assert stale_notice.should_check("owner/repo", env=env) is True

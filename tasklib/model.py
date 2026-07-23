@@ -131,6 +131,30 @@ class Ticket:
     # not ticket content), so ``render``/``parse`` never touch it.
     updated_at: str = ""
 
+    # Also appended last (same reasoning as ``due`` above). The backend-native identity of
+    # whoever FILED the ticket (GitHub issue ``user.login``, Linear issue ``creator.id``); ""
+    # means unknown (not-yet-created ticket, FakeBackend in a test that didn't set it, or a
+    # backend that can't supply it). task-cli's own ``create()`` never sets a native *assignee*
+    # on either backend, so an assignee-based filter would exclude virtually every ticket
+    # task-cli itself creates — the reporter/creator is the field that actually identifies "the
+    # user who ran task-cli" (issue #59's global stale nudge, review P2: scope the scan to the
+    # current user's own tickets, not every ticket in a shared project). Never part of the
+    # rendered body — operational metadata, not ticket content.
+    reporter: str = ""
+
+    # Also appended last (same reasoning as ``due`` above). Whether the backend's NATIVE
+    # open/closed state is closed, independent of the normalized ``state`` above. For GitHub this
+    # is ``row["state"] == "closed"``; for Linear it mirrors ``state`` itself (Linear's normalized
+    # state IS derived straight from its native workflow state, so there is no separate signal to
+    # capture — always consistent by construction). GitHub issues, by contrast, carry a managed
+    # ``status:<state>`` LABEL that ``_derive_state`` prioritizes over the native open/closed
+    # flag; an issue closed OUTSIDE task-cli (e.g. via the GitHub UI) can keep a stale
+    # ``status:todo``/``status:in-progress`` label, so ``state`` alone can lie about whether the
+    # ticket is still active. ``stale_notice.stale_tickets`` (issue #59, review P2) checks this
+    # field directly rather than trusting the derived ``state`` for that one purpose. Never part
+    # of the rendered body — operational metadata, not ticket content.
+    provider_closed: bool = False
+
     def __post_init__(self) -> None:
         # Coerce plain-string criteria to unchecked Criterion objects. This keeps construction
         # ergonomic (`Ticket(acceptance=["a", "b"])`) while the rest of the code — render, parse,

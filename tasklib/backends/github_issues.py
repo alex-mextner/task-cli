@@ -106,6 +106,7 @@ class GitHubIssuesBackend:
     def _row_to_ticket(self, row: dict) -> Ticket:
         labels = [lbl["name"] for lbl in row.get("labels", []) if isinstance(lbl, dict)]
         state = _derive_state(row, labels)
+        reporter = (row.get("user") or {}).get("login") or ""
         base = Ticket(
             title=row.get("title", ""),
             labels=[lbl for lbl in labels if not lbl.startswith("status:")],
@@ -113,6 +114,10 @@ class GitHubIssuesBackend:
             id=f"#{row.get('number')}",
             url=row.get("html_url", ""),
             updated_at=row.get("updated_at", "") or "",
+            reporter=reporter,
+            # the issue's own open/closed truth, independent of the (possibly stale)
+            # status:<state> label `_derive_state` prioritizes — see Ticket.provider_closed.
+            provider_closed=row.get("state") == "closed",
         )
         body = row.get("body") or ""
         return parse(body, base)
@@ -186,6 +191,17 @@ class GitHubIssuesBackend:
 
     def session_tickets(self, session_label: str, *, limit=30) -> list[Ticket]:
         return self.list(labels=[session_label], limit=limit)
+
+    def current_user(self) -> str | None:
+        """Best-effort login of this token's owner (issue #59's stale-nudge personal-scope
+        filter). ``None`` on any failure — never an authorization boundary, just a filter hint;
+        the caller (``cli.py``) falls back to an unfiltered scan when it can't be determined."""
+        try:
+            row = self._call(f"{_api_root()}/user")
+        except BackendError:
+            return None
+        login = row.get("login") if isinstance(row, dict) else None
+        return login if isinstance(login, str) and login else None
 
 
 # ── module helpers ──────────────────────────────────────────────────────────────────

@@ -37,6 +37,7 @@ share one cache file.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -98,6 +99,12 @@ def _read_last_checked(path: Path) -> float:
     ``json.loads`` can succeed on non-dict JSON (a bare ``5`` or ``[]``, e.g. a cache file
     corrupted or hand-edited) — ``.get`` on that would raise ``AttributeError``, which is NOT a
     parse error, so it must be checked explicitly rather than folded into the parse except.
+
+    A hand-edited/corrupted ``{"last_checked_at": NaN}`` parses fine through both ``json.loads``
+    and ``float()`` (NaN is a valid float) — but NaN compares False against everything, so
+    downstream in :func:`should_check` neither ``elapsed < 0`` nor ``elapsed >= interval`` would
+    ever be True, permanently wedging the check shut (never due again). ``math.isfinite`` catches
+    NaN and +/-inf alike; treat any of them the same as absent/malformed (0.0 = "never checked").
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -106,9 +113,10 @@ def _read_last_checked(path: Path) -> float:
     if not isinstance(data, dict):
         return 0.0
     try:
-        return float(data.get("last_checked_at", 0))
+        value = float(data.get("last_checked_at", 0))
     except (TypeError, ValueError):
         return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def _write_last_checked(path: Path, ts: float) -> None:
@@ -196,13 +204,19 @@ def stale_tickets(
     """Active tickets whose backend ``updated_at`` is older than the staleness threshold.
 
     Returns ``(ticket, age_seconds)`` pairs, oldest first. A ticket with no parseable
-    ``updated_at`` is skipped — never flag staleness we have no evidence for.
+    ``updated_at`` is skipped — never flag staleness we have no evidence for. A ticket whose
+    ``provider_closed`` is True is also skipped even if ``state`` reads as active: GitHub lets a
+    managed ``status:<state>`` label lag behind the issue's real open/closed state (an issue
+    closed outside task-cli keeps its old label), so ``state`` alone can lie about whether the
+    ticket is still active — the provider's own open/closed signal always wins.
     """
     now = time.time() if now is None else now
     threshold = stale_after_seconds() if stale_after is None else stale_after
     out: list[tuple[Ticket, int]] = []
     for ticket in tickets:
         if ticket.state not in _ACTIVE_STATES:
+            continue
+        if ticket.provider_closed:
             continue
         updated = _parse_updated_at(ticket.updated_at)
         if updated is None:

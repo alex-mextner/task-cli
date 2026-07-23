@@ -200,6 +200,75 @@ def test_github_row_to_ticket_defaults_updated_at_to_empty():
     assert be._row_to_ticket(row).updated_at == ""
 
 
+def test_github_row_to_ticket_maps_reporter_from_issue_author():
+    # issue #59 stale-nudge, review P2: the scan must scope to the current user's OWN tickets.
+    # GitHub's row carries the issue author as `user.login` — task-cli's own `create()` never
+    # sets a native assignee, so the AUTHOR (not assignee) is the field that actually identifies
+    # "the user who filed this via task-cli".
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {"number": 1, "title": "a", "state": "open", "labels": [], "body": "", "user": {"login": "alex"}}
+    assert be._row_to_ticket(row).reporter == "alex"
+
+
+def test_github_row_to_ticket_reporter_defaults_to_empty_when_missing():
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {"number": 1, "title": "a", "state": "open", "labels": [], "body": ""}
+    assert be._row_to_ticket(row).reporter == ""
+
+
+def test_github_row_to_ticket_marks_provider_closed_when_label_lags_native_state():
+    # P2 (review): an issue closed OUTSIDE task-cli can keep a stale `status:todo` label —
+    # `_derive_state` still reports `state=TODO` (label wins), so `provider_closed` must be the
+    # separate, always-truthful signal the stale-ticket nudge checks instead.
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {"number": 1, "title": "a", "state": "closed", "labels": [{"name": "status:todo"}], "body": ""}
+    ticket = be._row_to_ticket(row)
+    assert ticket.state.value == "todo"  # unchanged — label still wins for the derived state
+    assert ticket.provider_closed is True
+
+
+def test_github_row_to_ticket_provider_closed_false_when_open():
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    row = {"number": 1, "title": "a", "state": "open", "labels": [], "body": ""}
+    assert be._row_to_ticket(row).provider_closed is False
+
+
+def test_github_current_user_returns_login(monkeypatch):
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    seen = {}
+
+    def fake_call(url, **kw):
+        seen["url"] = url
+        return {"login": "alex"}
+
+    monkeypatch.setattr(be, "_call", fake_call)
+    assert be.current_user() == "alex"
+    assert seen["url"].endswith("/user")
+
+
+def test_github_current_user_returns_none_on_backend_error(monkeypatch):
+    from tasklib.backends import BackendError
+    from tasklib.backends.github_issues import GitHubIssuesBackend
+
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+
+    def raise_err(url, **kw):
+        raise BackendError("boom")
+
+    monkeypatch.setattr(be, "_call", raise_err)
+    assert be.current_user() is None
+
+
 def test_issue_number_removeprefix_not_lstrip():
     from tasklib.backends.github_issues import _issue_number
 
@@ -441,3 +510,140 @@ def test_linear_search_filters_results_to_team(monkeypatch):
     hits = be.search("anything")
     ids = {t.id for t in hits}
     assert ids == {"HYP-1"}  # the OTH team's hit is scoped out
+
+
+def test_linear_node_to_ticket_maps_reporter_from_creator():
+    # issue #59 stale-nudge, review P2: Linear's node carries the issue creator as `creator.id` —
+    # task-cli's own `create()` never sets a native assignee, so the creator identifies "the user
+    # who filed this via task-cli".
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "t",
+        "url": "https://linear/HYP-7",
+        "description": "",
+        "dueDate": None,
+        "updatedAt": "",
+        "state": {"type": "unstarted"},
+        "labels": {"nodes": []},
+        "creator": {"id": "user-123"},
+    }
+    assert be._node_to_ticket(node).reporter == "user-123"
+
+
+def test_linear_node_to_ticket_reporter_defaults_to_empty_when_missing():
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "t",
+        "url": "https://linear/HYP-7",
+        "description": "",
+        "dueDate": None,
+        "updatedAt": "",
+        "state": {"type": "unstarted"},
+        "labels": {"nodes": []},
+    }
+    assert be._node_to_ticket(node).reporter == ""
+
+
+def test_linear_list_query_requests_creator(monkeypatch):
+    # mirrors test_linear_list_query_requests_updated_at: prove the real list() query asks for
+    # `creator`, so a future edit dropping it from _ISSUE_FIELDS breaks a test, not just prod.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    seen: dict = {}
+
+    def fake_gql(query, variables=None):
+        seen["query"] = query
+        return {
+            "issues": {
+                "nodes": [
+                    {
+                        "identifier": "HYP-7",
+                        "title": "t",
+                        "url": "https://linear/HYP-7",
+                        "description": "",
+                        "dueDate": None,
+                        "updatedAt": "",
+                        "state": {"type": "unstarted"},
+                        "labels": {"nodes": []},
+                        "creator": {"id": "user-123"},
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    tickets = be.list()
+    assert "creator" in seen["query"]
+    assert tickets[0].reporter == "user-123"
+
+
+def test_linear_node_to_ticket_marks_provider_closed_from_completed_state():
+    # Linear's normalized state is derived straight from its native workflow state — no separate
+    # label-lag risk — so `provider_closed` simply mirrors "state.type is a closed type".
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "t",
+        "url": "https://linear/HYP-7",
+        "description": "",
+        "dueDate": None,
+        "updatedAt": "",
+        "state": {"type": "completed"},
+        "labels": {"nodes": []},
+    }
+    assert be._node_to_ticket(node).provider_closed is True
+
+
+def test_linear_node_to_ticket_provider_closed_false_for_active_state():
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "identifier": "HYP-7",
+        "title": "t",
+        "url": "https://linear/HYP-7",
+        "description": "",
+        "dueDate": None,
+        "updatedAt": "",
+        "state": {"type": "started"},
+        "labels": {"nodes": []},
+    }
+    assert be._node_to_ticket(node).provider_closed is False
+
+
+def test_linear_current_user_returns_viewer_id(monkeypatch):
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    seen = {}
+
+    def fake_gql(query, variables=None):
+        seen["query"] = query
+        return {"viewer": {"id": "user-123"}}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    assert be.current_user() == "user-123"
+    assert "viewer" in seen["query"]
+
+
+def test_linear_current_user_returns_none_on_backend_error(monkeypatch):
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+
+    def raise_err(query, variables=None):
+        raise BackendError("boom")
+
+    monkeypatch.setattr(be, "_gql", raise_err)
+    assert be.current_user() is None
