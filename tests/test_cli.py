@@ -1785,6 +1785,18 @@ def test_daemon_status_json_not_ours(capsys, _inject_fake, tmp_path, monkeypatch
     assert payload["pid"] == 4242
 
 
+class _FakePopen:
+    """Stands in for the real ``Popen`` ``daemon._spawn_detached`` returns — ``daemon.start()``
+    calls ``.poll()`` on it (see ``daemon._daemon_bootstrapped``)."""
+
+    def __init__(self, pid: int, *, returncode: int | None = None):
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
 def test_daemon_start_is_idempotent_no_double_spawn(capsys, _inject_fake, tmp_path, monkeypatch):
     import os
     from argparse import Namespace
@@ -1794,12 +1806,24 @@ def test_daemon_start_is_idempotent_no_double_spawn(capsys, _inject_fake, tmp_pa
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
+    # write the pid-file as part of the fake spawn (simulating run_loop) so the readiness poll
+    # resolves via genuine pid-file evidence instead of burning the full ready_timeout_s on the
+    # inconclusive-timeout path (Fable review finding).
+    cfg = _load(Namespace(cwd=".", backend=None, repo=None, config=None))
+    paths = _d.paths_for(_daemon_coordinate(cfg))
     spawned: list = []
-    monkeypatch.setattr(_d, "_spawn_detached", lambda *a, **k: spawned.append(1) or 4242)
+
+    def _fake_spawn_detached(*a, **k):
+        spawned.append(1)
+        _d._write_pid(paths.pid, 4242)
+        return _FakePopen(4242)
+
+    monkeypatch.setattr(_d, "_spawn_detached", _fake_spawn_detached)
     rc = main(["daemon", "start"])
     assert rc == 0
     assert "daemon started" in capsys.readouterr().out
     assert spawned == [1]
+    _d._clear_pid(paths.pid)  # the "already running" leg below stamps its own pid-file fresh
 
     # a second start while OUR daemon is alive must not spawn again. Stamp the pid-file with THIS
     # live process AND make its cmdline read as the daemon (pid_status is identity-aware now — #32 —
@@ -1826,6 +1850,77 @@ def test_daemon_disabled_does_not_start(capsys, _inject_fake, tmp_path, monkeypa
     assert rc == 0
     assert "disabled" in capsys.readouterr().out
     assert spawned == []
+
+
+def test_daemon_start_reports_failure_with_nonzero_exit_when_bootstrap_fails(capsys, _inject_fake, tmp_path, monkeypatch):
+    # task-cli#61 review finding: a bootstrap failure (e.g. an unsupported interpreter flag) must
+    # be a visible CLI error -- a nonzero exit code and a clear message -- not "daemon started".
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "_spawn_detached", lambda *a, **k: _FakePopen(4242, returncode=1))
+    rc = main(["daemon", "start"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "failed to start" in out
+    assert "daemon started" not in out
+
+
+def test_daemon_start_reports_unsupported_interpreter_without_a_bogus_log_path(capsys, _inject_fake, tmp_path, monkeypatch):
+    # Fable review finding: for the pre-3.11 refusal, start() returns pid=None and NEVER writes a
+    # log for this attempt -- the CLI must not print "pid None exited" or point at a nonexistent
+    # (or stale) log for this outcome; it must name the real reason (Python version) instead.
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "python_supports_safepath", lambda: False)
+    spawned: list = []
+    monkeypatch.setattr(_d, "_spawn_detached", lambda *a, **k: spawned.append(1))
+    rc = main(["daemon", "start"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert spawned == [], "must not attempt to spawn on an unsupported interpreter"
+    assert "Python 3.11+ required" in out
+    assert "pid None" not in out
+    assert "see log" not in out
+    assert "daemon started" not in out
+
+
+def test_daemon_start_reports_no_op_when_the_child_exits_clean_and_nothing_runs(capsys, _inject_fake, tmp_path, monkeypatch):
+    # the spawned child exits 0 without ever becoming the live daemon, and no OTHER daemon is
+    # running either -- must not print "daemon started" (nothing is actually running).
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    def _fake_spawn_detached(*, cwd, log_path, child_flags):
+        return _d.subprocess.Popen(
+            [_d.sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdout=_d.subprocess.DEVNULL,
+            stderr=_d.subprocess.DEVNULL,
+        )
+
+    monkeypatch.setattr(_d, "_spawn_detached", _fake_spawn_detached)
+    rc = main(["daemon", "start"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "did not start" in out
+    assert "daemon started" not in out
+
+
+def test_daemon_start_fails_closed_on_an_unrecognized_outcome(capsys, _inject_fake, tmp_path, monkeypatch):
+    # Fable review finding: an earlier version's fallthrough branch treated ANY outcome string
+    # daemon.start() didn't already handle as "started" -- a future new outcome would silently
+    # report success. The CLI must fail closed instead.
+    from tasklib import daemon as _d
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_d, "start", lambda *a, **k: ("some-future-outcome", 999))
+    rc = main(["daemon", "start"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unrecognized outcome" in out
+    assert "daemon started" not in out
 
 
 # ── mutation notifications (TG hook) ────────────────────────────────────────────────

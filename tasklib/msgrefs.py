@@ -170,6 +170,13 @@ class HistoryRecord:
     outbound-history call sites (task-cli#45 review raised this as a risk; confirmed safe by
     reading tg-cli's source directly rather than guessing). If tg-cli's history format ever
     changes units, :func:`_quote_line`'s ``datetime.fromtimestamp`` call needs updating to match.
+
+    ``chat_id`` (VERIFIED against ``history.ts``'s own ``HistoryRecord`` interface) is OPTIONAL —
+    absent on a legacy row written before the field existed. Telegram's ``message_id`` is unique
+    only PER CHAT, so ``chat_id`` is what :func:`load_history` scopes resolution by (task-cli#62
+    review finding, round 2: a bot serving MULTIPLE chats can collide on ``message_id`` WITHIN a
+    single ``tg-ctl.<botId>.history.jsonl`` file too, not just across different bots' files — the
+    first fix's per-FILE scoping wasn't fine-grained enough).
     """
 
     ts: int
@@ -178,6 +185,7 @@ class HistoryRecord:
     from_: str
     text: str
     pane: str | None
+    chat_id: int | None = None
 
 
 def _tg_cli_config_dir(env: dict[str, str] | None = None) -> Path:
@@ -198,13 +206,14 @@ def _parse_history_line(line: str) -> HistoryRecord | None:
         return None
     if not isinstance(data, dict):
         return None
-    ts, message_id, direction, text, from_, pane = (
+    ts, message_id, direction, text, from_, pane, chat_id = (
         data.get("ts"),
         data.get("message_id"),
         data.get("direction"),
         data.get("text"),
         data.get("from"),
         data.get("pane"),
+        data.get("chat_id"),
     )
     # bool is a subclass of int in Python (isinstance(True, int) is True) — reject it explicitly
     # so a malformed `"ts": true` / `"message_id": true` line doesn't silently pass as 1/0.
@@ -218,38 +227,129 @@ def _parse_history_line(line: str) -> HistoryRecord | None:
         return None
     if not (message_id is None or (isinstance(message_id, int) and not isinstance(message_id, bool))):
         return None
+    # Unlike message_id, a malformed chat_id does NOT invalidate the whole row: chat_id is a
+    # pure scoping REFINEMENT (added after the fact — every OTHER field here is one the record
+    # actually needs). Falling back to None degrades this row to the coarser legacy per-FILE
+    # scoping (see load_history's docstring) instead of discarding a row that parsed fine
+    # otherwise — review finding: rejecting outright would be a regression for any writer
+    # variant (a stray string/float chat_id) that used to resolve before chat_id existed here.
+    if not (chat_id is None or (isinstance(chat_id, int) and not isinstance(chat_id, bool))):
+        chat_id = None
     if direction not in ("user", "agent"):
         return None
     if not (isinstance(text, str) and isinstance(from_, str)):
         return None
     if not (pane is None or isinstance(pane, str)):
         return None
-    return HistoryRecord(ts=int(ts), message_id=message_id, direction=direction, from_=from_, text=text, pane=pane)
+    return HistoryRecord(
+        ts=int(ts), message_id=message_id, direction=direction, from_=from_, text=text, pane=pane, chat_id=chat_id
+    )
 
 
 def load_history(env: dict[str, str] | None = None) -> dict[int, HistoryRecord]:
     """Read every ``tg-ctl.*.history.jsonl`` in tg-cli's config dir into ``{message_id: record}``.
 
     Best-effort: a missing directory, no matching file, or a corrupt/partial line never raises —
-    ticket creation must never depend on tg-cli being installed or its history being intact. The
-    JSONL file is append-only chronological, so the LAST record for a given message id — within
-    one file, and across files in sorted-glob order — wins: a message that was resent/edited (the
-    same message_id appended again later) must resolve to its most recent text, not its first.
+    ticket creation must never depend on tg-cli being installed or its history being intact.
+
+    Telegram's ``message_id`` is unique only PER CHAT, so the SAME numeric id can legitimately
+    mean two unrelated messages: across two different bots' files, OR — a bot can serve MULTIPLE
+    chats — even WITHIN a single ``tg-ctl.<botId>.history.jsonl`` file (task-cli#62 review
+    finding, round 2: an earlier fix scoped by FILE only, which still let two chats sharing one
+    bot collide). So resolution is scoped by :data:`HistoryRecord.chat_id` when a row has one
+    (every modern row does); a legacy row written before that field existed falls back to
+    per-FILE scoping — the coarser, but only available, boundary for those rows.
+
+    ACCEPTED RESIDUAL: two legacy (``chat_id``-less) rows for DIFFERENT chats that happen to
+    share one bot's file, and a resend/edit that straddles the chat_id upgrade (a legacy row and
+    a later modern row for the SAME real message, now landing in two different scope keys), both
+    degrade to "ambiguous / not found" rather than resolving correctly — chat_id genuinely isn't
+    available to disambiguate those legacy rows. This is the deliberately safe direction
+    (under-resolving, never leaking one chat's text as another's) and is expected to self-resolve
+    as legacy history ages out of the ~5000-line retention window (review findings).
+
+    WITHIN one FILE, later lines unconditionally supersede earlier ones for the same message
+    id — a message that was resent/edited (the same message_id appended again later, in that
+    SAME file) resolves to its most recent line, not its first. This is a genuine chronological
+    continuation of one writer's own log, so it is trusted outright, independent of ``ts``
+    (review finding: an earlier version tried comparing ``ts`` here too, which broke on an edit
+    whose ``ts`` doesn't strictly increase — e.g. preserving an original send time).
+
+    ACROSS two DIFFERENT files landing in the SAME scope (a chat scope can legitimately span
+    multiple files — two bots both members of the same group both log it, and Telegram's
+    message_id is chat-scoped, not bot-scoped, so this is the SAME real message, not a
+    coincidence) — and ACROSS two different scopes colliding on message_id at all — the SAME
+    rule applies: compared by FULL record equality; anything not identical is treated as
+    AMBIGUOUS and dropped from the result (the id then resolves as "not found in local
+    history", the same safe fallback already used for an id that predates retention) rather than
+    resolved to an arbitrary source's content — erring toward under-resolving is the safe
+    direction for a privacy-sensitive local quote source. No attempt is made to arbitrate WHICH
+    of two differing cross-file/cross-scope records is "more authoritative" (e.g. via ``ts``) —
+    two independently-clocked writers make that guess unreliable (review finding), so a genuine
+    difference is always ambiguous, never guessed at.
     """
     out: dict[int, HistoryRecord] = {}
     try:
         paths = sorted(glob.glob(str(_tg_cli_config_dir(env) / "tg-ctl.*.history.jsonl")))
     except OSError:
         return out
+    # scope key: the chat_id when present (the real per-chat boundary), else this file's own
+    # path (the coarser fallback for a legacy chat_id-less row — see docstring).
+    #
+    # Two-level merge, keyed by (scope_key, message_id):
+    #  1. WITHIN one file: always overwrite (last line in that file wins outright).
+    #  2. ACROSS files contributing to the SAME (scope_key, message_id): compare records for
+    #     equality, same as a cross-SCOPE collision — different content is ambiguous and dropped;
+    #     identical content is a harmless no-op.
+    # `origin` tracks which file most recently supplied each (scope_key, message_id) entry, so we
+    # can tell "another line from the SAME file" (rule 1) apart from "a DIFFERENT file's claim"
+    # (rule 2) — the two need different resolution rules.
+    scoped: dict[tuple[object, int], HistoryRecord] = {}
+    origin: dict[tuple[object, int], str] = {}
+    dropped: set[tuple[object, int]] = set()
     for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     rec = _parse_history_line(line)
-                    if rec is not None and rec.message_id is not None:
-                        out[rec.message_id] = rec
+                    if rec is None or rec.message_id is None:
+                        continue
+                    scope_key: object = ("chat", rec.chat_id) if rec.chat_id is not None else ("file", path)
+                    key = (scope_key, rec.message_id)
+                    if key in dropped:
+                        continue
+                    if key not in scoped or origin[key] == path:
+                        scoped[key] = rec
+                        origin[key] = path
+                        continue
+                    if scoped[key] == rec:
+                        # A different file's harmless duplicate of the same content. Advance
+                        # `origin` to THIS file too — otherwise a later line in this SAME file
+                        # would still be classified as "a different file's competing claim"
+                        # (rule 2) rather than "the same file continuing" (rule 1), against a
+                        # value it never actually conflicted with (review finding).
+                        origin[key] = path
+                        continue
+                    dropped.add(key)
+                    del scoped[key]
+                    del origin[key]
         except OSError:
             continue
+    # Seed the final message_id-level ambiguity set from EVERY (scope_key, message_id) already
+    # dropped as a within-scope cross-file conflict — otherwise a message_id ambiguous in one
+    # scope but absent from `scoped` (because it was dropped) could resolve unopposed via a
+    # DIFFERENT scope's still-surviving record for the same message_id, silently making the
+    # collision MORE permissive instead of less (review finding: the exact leak this whole
+    # ambiguity mechanism exists to prevent).
+    ambiguous: set[int] = {message_id for (_scope_key, message_id) in dropped}
+    for (_scope_key, message_id), rec in scoped.items():
+        if message_id in ambiguous:
+            continue
+        if message_id in out and out[message_id] != rec:
+            ambiguous.add(message_id)
+            del out[message_id]
+            continue
+        out[message_id] = rec
     return out
 
 

@@ -332,6 +332,19 @@ def test_is_alive():
     assert daemon.is_alive(2**30) is False
 
 
+class _FakePopen:
+    """Stands in for the real ``Popen`` :func:`daemon._spawn_detached` now returns — ``start()``
+    calls ``.poll()`` on it (see :func:`daemon._daemon_bootstrapped`), so a bare mocked pid no
+    longer works as a stand-in."""
+
+    def __init__(self, pid: int, *, returncode: int | None = None):
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
 def test_start_is_idempotent_when_already_running(tmp_path, monkeypatch):
     # a live pid-file whose process IS our daemon → start is a no-op (never double-spawns). We point
     # the pid-file at this live test process and make its cmdline read as the daemon (pid_status is
@@ -342,8 +355,8 @@ def test_start_is_idempotent_when_already_running(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
 
     spawned: list = []
-    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: spawned.append(1) or 999)
-    outcome, pid = daemon.start("owner/repo", env=env)
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: spawned.append(1) or _FakePopen(999))
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=0)
     assert outcome == "already-running"
     assert pid == os.getpid()
     assert spawned == []  # the guard prevented a second spawn
@@ -370,8 +383,8 @@ def test_start_clears_recycled_foreign_pid_then_spawns(tmp_path, monkeypatch):
         return real_kill(p, sig)  # let the liveness probe work
 
     monkeypatch.setattr(daemon.os, "kill", _spy_kill)
-    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: 5555)
-    outcome, pid = daemon.start("owner/repo", env=env)
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: _FakePopen(5555))
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=0)
     assert outcome == "started"
     assert pid == 5555
     assert signalled == [], "start must not deliver a real signal to the recycled foreign pid"
@@ -385,8 +398,8 @@ def test_start_clears_stale_then_spawns(tmp_path, monkeypatch):
     paths = daemon.paths_for("owner/repo", env=env)
     daemon._write_pid(paths.pid, 2**30)  # stale
 
-    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: 4242)
-    outcome, pid = daemon.start("owner/repo", env=env)
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: _FakePopen(4242))
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=0)
     assert outcome == "started"
     assert pid == 4242
 
@@ -396,9 +409,9 @@ def test_start_forwards_child_flags_to_the_spawn(tmp_path, monkeypatch):
     env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
     captured: dict = {}
     monkeypatch.setattr(
-        daemon, "_spawn_detached", lambda **k: captured.update(k) or 7
+        daemon, "_spawn_detached", lambda **k: captured.update(k) or _FakePopen(7)
     )
-    daemon.start("owner/repo", env=env, child_flags=["--repo", "owner/repo"])
+    daemon.start("owner/repo", env=env, child_flags=["--repo", "owner/repo"], ready_timeout_s=0)
     assert captured["child_flags"] == ["--repo", "owner/repo"]
 
 
@@ -420,6 +433,145 @@ def test_spawn_detached_argv_includes_child_flags(tmp_path, monkeypatch):
     # to sys.path, closing the "managed project ships its own tasklib/" shadowing hole.
     assert argv[1:6] == ["-P", "-m", "tasklib", "daemon", "run"]
     assert argv[-2:] == ["--backend", "linear"]
+
+
+# ── task-cli#63: refuse to spawn at all on a pre-3.11 interpreter (-P needs 3.11+) ──
+
+
+def test_start_refuses_on_a_pre_311_interpreter_without_spawning(tmp_path, monkeypatch):
+    # A stray Python 3.10 symlink install must never reach _spawn_detached at all: passing -P
+    # unconditionally there would crash the child ("Unknown option: -P") -- the started-then-
+    # stopped flap task-cli#57/#58 fixed -- and OMITTING -P there would silently spawn the
+    # daemon without the cwd-shadowing protection -P exists to provide (task-cli#63 review
+    # finding: an earlier version chose that unsafe fallback). start() must refuse up front.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    spawned: list = []
+    monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: spawned.append(1))
+    monkeypatch.setattr(daemon, "python_supports_safepath", lambda: False)
+    outcome, pid = daemon.start("owner/repo", env=env)
+    assert outcome == "unsupported-interpreter"
+    assert pid is None
+    assert spawned == [], "must not attempt to spawn at all on an unsupported interpreter"
+
+
+def test_start_checks_already_running_before_the_interpreter_version(tmp_path, monkeypatch):
+    # Codex review finding: the version gate must not shadow "a daemon is already running" --
+    # start()'s idempotency contract ("already-running is always detected first") must hold
+    # even when invoked from a pre-3.11 interpreter that could never have spawned one itself.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    daemon._write_pid(paths.pid, os.getpid())
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
+    monkeypatch.setattr(daemon, "python_supports_safepath", lambda: False)
+    outcome, pid = daemon.start("owner/repo", env=env)
+    assert outcome == "already-running"
+    assert pid == os.getpid()
+
+
+def test_spawn_detached_always_passes_safepath_flag(tmp_path, monkeypatch):
+    # start() is the ONLY production caller and already refused on a pre-3.11 interpreter (see
+    # above), so by the time _spawn_detached runs, -P is always safe to pass unconditionally.
+    seen: dict = {}
+
+    class _FakeProc:
+        pid = 123
+
+    def fake_popen(argv, **kw):
+        seen["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=[])
+    assert seen["argv"][1] == "-P"
+
+
+# ── task-cli#64: no PYTHONPATH bootstrap for a pip/pipx (non-checkout) install layout ──
+
+
+def test_needs_pythonpath_bootstrap_true_for_a_checkout_with_bin_task(tmp_path):
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "task").write_text("#!/bin/sh\n", encoding="utf-8")
+    assert daemon._needs_pythonpath_bootstrap(tmp_path) is True
+
+
+def test_needs_pythonpath_bootstrap_false_for_a_pip_pipx_install_layout(tmp_path):
+    # no sibling bin/task -- this is what _repo_root() resolves to for an installed package
+    # (tasklib's parent directory, e.g. site-packages), which never has a bin/task shim.
+    assert daemon._needs_pythonpath_bootstrap(tmp_path) is False
+
+
+def test_spawn_detached_skips_repo_root_injection_for_a_pip_pipx_install(tmp_path, monkeypatch):
+    # no repo_root prepend and no bootstrap markers for this layout (task-cli#64) -- but the
+    # inherited PYTHONPATH is still present (sanitized, not dropped -- see the sanitization test
+    # right below, which proves it's not just passed through raw either).
+    seen: dict = {}
+
+    class _FakeProc:
+        pid = 123
+
+    def fake_popen(argv, **kw):
+        seen.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(daemon, "_repo_root", lambda: tmp_path)  # no bin/task under tmp_path
+    monkeypatch.setenv("PYTHONPATH", "/kept-as-is")
+    daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=[])
+    env = seen["env"]
+    assert env is not None
+    assert str(tmp_path) not in env["PYTHONPATH"]  # repo_root itself never injected
+    assert daemon._BOOTSTRAP_MARKER not in env
+    assert env["PYTHONPATH"] == "/kept-as-is"
+
+
+def test_spawn_detached_still_sanitizes_pythonpath_for_a_pip_pipx_install(tmp_path, monkeypatch):
+    # Fable/Codex review finding: an earlier version disabled PYTHONPATH sanitization ENTIRELY
+    # for this layout (passed env=None straight through), which let an inherited relative entry
+    # (e.g. ".") survive unresolved and reopen the cwd-shadowing hole for the TARGET repo -- the
+    # same class of hole -P closes for auto-prepended entries, just for explicit PYTHONPATH
+    # content instead. Sanitization (resolve-relative-against-parent-cwd + dedupe) must still run.
+    seen: dict = {}
+
+    class _FakeProc:
+        pid = 123
+
+    def fake_popen(argv, **kw):
+        seen.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(daemon, "_repo_root", lambda: tmp_path)  # no bin/task under tmp_path
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", f".{os.pathsep}.{os.pathsep}/kept")
+    daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=[])
+    env = seen["env"]
+    assert env["PYTHONPATH"] == f"{tmp_path}{os.pathsep}/kept"  # "." resolved + deduped
+
+
+def test_sanitized_child_env_drops_a_stale_inherited_bootstrap_marker(monkeypatch):
+    # review finding: if the PARENT process's own env happened to carry a bootstrap marker (e.g.
+    # a daemon relaunched from within an environment that itself was once bootstrap-injected),
+    # _sanitized_child_env must not let it survive into this non-injecting spawn's env -- a later
+    # _scrub_bootstrap_pythonpath call in that child would otherwise trust a stale marker and try
+    # to restore a snapshot that was never actually taken for THIS child.
+    base_env = {
+        "PYTHONPATH": "/kept",
+        daemon._BOOTSTRAP_MARKER: "/stale/repo/root",
+        daemon._BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER: "/stale/original",
+    }
+    env = daemon._sanitized_child_env(base_env=base_env)
+    assert daemon._BOOTSTRAP_MARKER not in env
+    assert daemon._BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER not in env
+    assert env["PYTHONPATH"] == "/kept"
+
+
+def test_sanitized_child_env_leaves_pythonpath_unset_when_the_caller_had_none(monkeypatch):
+    # Fable review finding: a pip/pipx install with NO PYTHONPATH at all must come out with none
+    # (the var popped entirely), not an empty string.
+    base_env = {"SOME_OTHER_VAR": "x"}
+    env = daemon._sanitized_child_env(base_env=base_env)
+    assert "PYTHONPATH" not in env
+    assert env["SOME_OTHER_VAR"] == "x"
 
 
 def _reap(pid: int, timeout: float = 8.0) -> int | None:
@@ -477,9 +629,9 @@ def test_spawn_detached_actually_launches_a_detached_process(tmp_path):
     # a real child that ran tasklib and exited 0. The spawned process IS this test's child (new
     # SESSION, not reparented), so we reap it with waitpid — os.kill(0) would see a zombie.
     _write_disabled_daemon_config(tmp_path)
-    pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
-    assert pid > 0
-    assert _reap(pid) == 0, "a disabled daemon should spawn, run tasklib, and exit 0"
+    proc = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
+    assert proc.pid > 0
+    assert _reap(proc.pid) == 0, "a disabled daemon should spawn, run tasklib, and exit 0"
 
 
 def test_spawn_detached_rejects_a_decoy_tasklib_in_the_target_cwd(tmp_path):
@@ -492,8 +644,8 @@ def test_spawn_detached_rejects_a_decoy_tasklib_in_the_target_cwd(tmp_path):
     _write_decoy_tasklib(tmp_path, sentinel)
     _write_disabled_daemon_config(tmp_path)
 
-    pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
-    rc = _reap(pid)
+    proc = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
+    rc = _reap(proc.pid)
 
     assert not sentinel.exists(), "the decoy tasklib/__main__.py ran — the cwd shadowed the real package"
     assert rc == 0, "the REAL tasklib (disabled daemon) should still spawn, run, and exit 0"
@@ -510,8 +662,8 @@ def test_spawn_detached_rejects_a_decoy_even_with_a_hostile_pythonpath(tmp_path,
     _write_disabled_daemon_config(tmp_path)
     monkeypatch.setenv("PYTHONPATH", f".{os.pathsep}{daemon._repo_root()}")
 
-    pid = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
-    rc = _reap(pid)
+    proc = daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "spawn.log", child_flags=[])
+    rc = _reap(proc.pid)
 
     assert not sentinel.exists(), "a hostile PYTHONPATH let the decoy win over the real tasklib"
     assert rc == 0, "the REAL tasklib (disabled daemon) should still spawn, run, and exit 0"
@@ -626,6 +778,101 @@ def test_run_loop_scrub_does_not_touch_the_calling_process_env_without_a_marker(
     paths = daemon.DaemonPaths(pid=tmp_path / "p.pid", state=tmp_path / "s.json", log=tmp_path / "l.log")
     daemon.run_loop(cfg, paths, max_ticks=1)
     assert os.environ["PYTHONPATH"] == repo_root
+
+
+# ── task-cli#60: byte-exact PYTHONPATH restoration across the full bootstrap/scrub round-trip ──
+
+
+def test_child_env_then_scrub_restores_caller_pythonpath_containing_repo_root_verbatim(monkeypatch):
+    # The regression: a caller-supplied PYTHONPATH that ITSELF already contains repo_root (e.g.
+    # an editable-checkout dev also has some other entry alongside it) must come back byte-exact
+    # after the daemon's bootstrap scrub — not have its repo_root segment silently dropped just
+    # because _child_env's own dedupe made it indistinguishable from the injected copy.
+    repo_root = daemon._repo_root()
+    original = f"{repo_root}{os.pathsep}/custom"
+    child_env = daemon._child_env(repo_root, base_env={"PYTHONPATH": original})
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+    daemon._scrub_bootstrap_pythonpath()
+    assert os.environ["PYTHONPATH"] == original
+
+
+def test_child_env_then_scrub_restores_unset_pythonpath(monkeypatch):
+    # The other side: a caller with NO PYTHONPATH at all must end up with none after the
+    # round-trip too (not an empty string, not a leftover entry).
+    repo_root = daemon._repo_root()
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    child_env = daemon._child_env(repo_root, base_env={})
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+    daemon._scrub_bootstrap_pythonpath()
+    assert "PYTHONPATH" not in os.environ
+
+
+def test_child_env_then_scrub_restores_a_relative_entry_as_its_resolved_absolute_form(monkeypatch, tmp_path):
+    # Codex review finding: restoring the RAW original string (e.g. literal ".") would UNDO the
+    # relative-to-absolute security resolution _sanitized_pythonpath_entries performs -- a caller
+    # PYTHONPATH="." must come back as the PARENT's cwd (frozen absolute), not literal ".", or a
+    # LATER subprocess (the notifier) inheriting this same env could reinterpret "." against ITS
+    # own cwd (the managed target repo) and reopen the cwd-shadowing hole.
+    monkeypatch.chdir(tmp_path)
+    repo_root = daemon._repo_root()
+    child_env = daemon._child_env(repo_root, base_env={"PYTHONPATH": "."})
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+    daemon._scrub_bootstrap_pythonpath()
+    assert os.environ["PYTHONPATH"] == str(tmp_path)
+    assert os.environ["PYTHONPATH"] != "."
+
+
+# ── task-cli#65/#66: normalized PYTHONPATH dedupe (trailing separator / symlink spelling) ──
+
+
+def test_child_env_dedupes_a_trailing_separator_variant_of_repo_root(monkeypatch):
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f"{repo_root}{os.sep}{os.pathsep}/kept"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/kept"
+
+
+def test_dedupe_key_falls_back_to_normpath_on_an_embedded_nul_byte(monkeypatch):
+    # Opus review finding: os.path.realpath raises ValueError (not OSError) for a path with an
+    # embedded NUL -- a garbage/malicious PYTHONPATH entry must not crash dedupe comparison.
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f"/tmp/\x00bad{os.pathsep}/kept"}
+    env = daemon._child_env(repo_root, base_env=base_env)  # must not raise
+    assert "/kept" in env["PYTHONPATH"]
+
+
+def test_child_env_dedupes_a_symlinked_checkout_alias_of_repo_root(tmp_path, monkeypatch):
+    real_repo = tmp_path / "real-checkout"
+    real_repo.mkdir()
+    alias = tmp_path / "alias-checkout"
+    alias.symlink_to(real_repo)
+    base_env = {"PYTHONPATH": f"{alias}{os.pathsep}/kept"}
+    env = daemon._child_env(real_repo, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{real_repo}{os.pathsep}/kept"
+
+
+def test_child_env_dedupes_exact_duplicate_absolute_entries(monkeypatch):
+    repo_root = daemon._repo_root()
+    base_env = {"PYTHONPATH": f"/a{os.pathsep}/a"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/a"
+
+
+def test_child_env_drops_a_relative_entry_when_the_parent_cwd_is_gone(monkeypatch):
+    # A long-lived daemon respawning from a worktree deleted out from under it must not crash
+    # resolving a relative PYTHONPATH entry against a nonexistent cwd — drop that one entry.
+    repo_root = daemon._repo_root()
+
+    def _raise_cwd():
+        raise OSError("cwd gone")
+
+    monkeypatch.setattr(daemon.Path, "cwd", staticmethod(_raise_cwd))
+    base_env = {"PYTHONPATH": f"relative/dir{os.pathsep}/kept"}
+    env = daemon._child_env(repo_root, base_env=base_env)
+    assert env["PYTHONPATH"] == f"{repo_root}{os.pathsep}/kept"
 
 
 def test_stop_not_running_clears_stale(tmp_path):
@@ -958,6 +1205,245 @@ def test_spawn_detached_argv_is_recognized_by_the_identity_matcher(tmp_path, mon
     monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
     daemon._spawn_detached(cwd=str(tmp_path), log_path=tmp_path / "l.log", child_flags=[])
     assert daemon.argv_is_task_daemon(seen["argv"]), seen["argv"]
+
+
+# ── task-cli#61: detect a bootstrap failure instead of reporting "started" on bare Popen success ──
+
+
+def test_daemon_bootstrapped_returns_false_when_the_child_exits_with_a_nonzero_code(tmp_path):
+    # the exact repro this ticket targets: a child that dies with a REAL error before it ever
+    # writes a pid-file (e.g. the -P-on-3.10 crash, task-cli#63) must be POSITIVELY detected,
+    # not misreported ready. Retaining `proc` (not just its pid) is what lets `.poll()` observe
+    # this deterministically instead of racing CPython's GC (task-cli#61 review finding).
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import sys; sys.exit(1)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    result = daemon._daemon_bootstrapped(proc, tmp_path / "does-not-exist.pid", timeout_s=2.0)
+    assert result == "error"
+
+
+def test_daemon_bootstrapped_returns_error_even_when_a_stale_matching_pid_file_exists(tmp_path):
+    # Codex review finding: a daemon that wrote its own pid-file and then immediately crashed
+    # must be reported "error", not "ready" -- a dead process is never "ready" no matter what a
+    # (now-stale) pid-file says. An earlier version let pid-file evidence override an observed
+    # nonzero exit when both were seen in the same poll iteration.
+    pid_path = tmp_path / "d.pid"
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import sys; sys.exit(1)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure it has actually exited before we ever poll -- no race with the pid-file write
+    daemon._write_pid(pid_path, proc.pid)  # simulates a stale file naming the now-dead pid
+    result = daemon._daemon_bootstrapped(proc, pid_path, timeout_s=2.0)
+    assert result == "error"
+
+
+def test_daemon_bootstrapped_returns_clean_exit_not_ready_when_a_matching_pid_file_exited_zero(tmp_path):
+    # Opus review finding: the docstring's own invariant is "exit status is checked, and trusted,
+    # BEFORE the pid-file -- a dead process is never reclassified as ready by anything the
+    # pid-file says". An earlier version's post-pid-file-match re-check still returned "ready"
+    # for a ZERO exit, contradicting that invariant -- it must be "clean-exit" instead, so
+    # start() re-resolves against the coordinate's current state rather than reporting "started"
+    # for an already-dead pid.
+    pid_path = tmp_path / "d.pid"
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    proc.wait()
+    daemon._write_pid(pid_path, proc.pid)  # simulates a stale file naming the now-dead pid
+    result = daemon._daemon_bootstrapped(proc, pid_path, timeout_s=2.0)
+    assert result == "clean-exit"
+
+
+def test_daemon_bootstrapped_treats_a_zero_exit_as_not_a_failure(tmp_path):
+    # a flock-loser (another `start` won the singleton race) or a `daemon.enabled: false` early
+    # exit are LEGITIMATE zero-exit early returns from run_loop, not bootstrap failures -- an
+    # earlier version conflated ANY early exit with failure, which would have misreported the
+    # race loser (Codex review finding).
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    result = daemon._daemon_bootstrapped(proc, tmp_path / "does-not-exist.pid", timeout_s=2.0)
+    assert result == "clean-exit"
+
+
+def test_daemon_bootstrapped_returns_true_once_the_pid_file_appears(tmp_path):
+    pid_path = tmp_path / "d.pid"
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    try:
+        daemon._write_pid(pid_path, proc.pid)
+        result = daemon._daemon_bootstrapped(proc, pid_path, timeout_s=2.0)
+        assert result == "ready"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_daemon_bootstrapped_is_inconclusive_true_when_neither_is_observed_before_timeout(tmp_path):
+    # still alive, no pid-file yet, timeout elapses -- must NOT be misreported as a failure; a
+    # slow-but-healthy bootstrap must never be flagged broken.
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    try:
+        result = daemon._daemon_bootstrapped(proc, tmp_path / "never-written.pid", timeout_s=0.2)
+        assert result == "timeout"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_start_reports_started_via_the_fast_ready_path(tmp_path, monkeypatch):
+    # the happy path reaching "started" via genuine pid-file readiness (not merely via the
+    # inconclusive "timeout" classification, which the other idempotency tests exercise since
+    # they use ready_timeout_s=0 and a mocked _spawn_detached that never writes a pid-file).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    spawned: list = []  # review finding: keep the Popen so we can reap it, not just kill by pid
+
+    def _fake_spawn_detached(*, cwd, log_path, child_flags):
+        proc = daemon.subprocess.Popen(
+            [daemon.sys.executable, "-c", "import time; time.sleep(5)"],
+            stdout=daemon.subprocess.DEVNULL,
+            stderr=daemon.subprocess.DEVNULL,
+        )
+        spawned.append(proc)
+        daemon._write_pid(paths.pid, proc.pid)  # simulates run_loop writing its own pid-file
+        return proc
+
+    monkeypatch.setattr(daemon, "_spawn_detached", _fake_spawn_detached)
+    try:
+        outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=2.0)
+        assert outcome == "started"
+        assert pid is not None
+    finally:
+        # review finding: an earlier version referenced the (possibly-unbound, on an early
+        # raise) `pid` local here and never reaped the child, leaking a zombie.
+        for proc in spawned:
+            proc.kill()
+            proc.wait()
+
+
+def test_start_reports_failed_when_the_spawned_child_exits_before_bootstrapping(tmp_path, monkeypatch):
+    # end-to-end through start(): a bootstrap failure is reported as an error outcome, not silently
+    # as "started" (the flap this ticket exists to close).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+
+    def _fake_spawn_detached(*, cwd, log_path, child_flags):
+        return daemon.subprocess.Popen(
+            [daemon.sys.executable, "-c", "import sys; sys.exit(1)"],
+            stdout=daemon.subprocess.DEVNULL,
+            stderr=daemon.subprocess.DEVNULL,
+        )
+
+    monkeypatch.setattr(daemon, "_spawn_detached", _fake_spawn_detached)
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=2.0)
+    assert outcome == "failed"
+    assert pid is not None
+
+
+def test_start_reports_already_running_when_the_spawned_child_is_a_flock_loser(tmp_path, monkeypatch):
+    # a race-losing `start` spawns a child that immediately sees another daemon already holds
+    # the singleton flock and exits 0 (see run_loop's "daemon.already-running" branch) -- that
+    # must NOT be reported as "failed" (Codex review finding), NOR as "started" (Fable review
+    # finding: the spawned pid is already dead; the WINNER, discovered via a pid-file re-check,
+    # is the one actually running).
+    #
+    # The winner must NOT be live yet at the INITIAL pid_status check (else start() would
+    # short-circuit to "already-running" before ever spawning, which would test plain idempotency
+    # instead of the post-spawn clean-exit recheck this test targets -- Codex review finding: an
+    # earlier version of this test pre-wrote the winner's pid-file up front and never actually
+    # exercised the recheck path). So the winner's pid-file is written only from the SECOND
+    # pid_status call onward, simulating it publishing mid-race, after our own spawn already
+    # started.
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
+
+    real_pid_status = daemon.pid_status
+    calls = {"n": 0}
+
+    def _fake_pid_status(pid_path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "stopped", None  # the INITIAL check: nothing running yet, so start() proceeds to spawn
+        daemon._write_pid(paths.pid, os.getpid())  # the winner publishes its pid-file just now
+        return real_pid_status(pid_path)
+
+    monkeypatch.setattr(daemon, "pid_status", _fake_pid_status)
+
+    def _fake_spawn_detached(*, cwd, log_path, child_flags):
+        return daemon.subprocess.Popen(
+            [daemon.sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdout=daemon.subprocess.DEVNULL,
+            stderr=daemon.subprocess.DEVNULL,
+        )
+
+    monkeypatch.setattr(daemon, "_spawn_detached", _fake_spawn_detached)
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=2.0)
+    assert outcome == "already-running"
+    assert pid == os.getpid()
+    assert calls["n"] >= 2, "must have re-checked pid_status after the clean exit, not just once up front"
+
+
+def test_start_reports_no_op_when_the_spawned_child_exits_clean_and_nothing_is_running(tmp_path, monkeypatch):
+    # the rarer legitimate zero-exit case (e.g. a config-disabled race): the child exits 0
+    # without ever owning the pid-file, and NO other daemon is running either -- this is neither
+    # "started" (nothing is actually running) nor "failed" (no real error).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+
+    def _fake_spawn_detached(*, cwd, log_path, child_flags):
+        return daemon.subprocess.Popen(
+            [daemon.sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdout=daemon.subprocess.DEVNULL,
+            stderr=daemon.subprocess.DEVNULL,
+        )
+
+    monkeypatch.setattr(daemon, "_spawn_detached", _fake_spawn_detached)
+    outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=0.2)
+    assert outcome == "no-op"
+    assert pid is None
+
+
+def test_start_reports_already_running_on_a_timeout_when_a_different_daemon_already_owns_the_pid_file(
+    tmp_path, monkeypatch
+):
+    # Opus review finding: the "timeout" branch (child still alive, never confirmed readiness)
+    # didn't re-check the pid-file at all -- if our own child lost a flock race and the WINNER
+    # already published its pid-file before our timeout fired, start() must report the real
+    # winner instead of "started" for a pid that's about to die (the same class of flap the
+    # "clean-exit" path already handles correctly).
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    paths = daemon.paths_for("owner/repo", env=env)
+    monkeypatch.setattr(daemon, "process_cmdline", lambda _pid: ["python", "-m", "tasklib", "daemon", "run"])
+    daemon._write_pid(paths.pid, os.getpid())  # the winner's pid-file, already published
+
+    proc = daemon.subprocess.Popen(
+        [daemon.sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=daemon.subprocess.DEVNULL,
+        stderr=daemon.subprocess.DEVNULL,
+    )
+    try:
+        monkeypatch.setattr(daemon, "_spawn_detached", lambda *a, **k: proc)
+        outcome, pid = daemon.start("owner/repo", env=env, ready_timeout_s=0.2)
+        assert outcome == "already-running"
+        assert pid == os.getpid()
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_stop_rechecks_identity_before_sigkill(tmp_path, monkeypatch):

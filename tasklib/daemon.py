@@ -747,27 +747,100 @@ def _install_stop_handlers() -> _StopFlag:
 # ── start / stop (the detached-spawn + teardown) ────────────────────────────────────
 
 
+_MIN_PYTHON_FOR_SAFEPATH = (3, 11)
+
+
+def python_supports_safepath() -> bool:
+    """``True`` when THIS interpreter (also what :func:`_spawn_detached` re-invokes, since it
+    always launches ``sys.executable``) is new enough for ``-P`` (PYTHONSAFEPATH, 3.11+).
+
+    The single source of truth for the daemon's version gate — :func:`start` calls this rather
+    than comparing ``sys.version_info`` inline, so the THRESHOLD itself lives in exactly one
+    place (:data:`_MIN_PYTHON_FOR_SAFEPATH`). ``start``'s CLI caller does not call this boolean
+    directly (it never needs to re-ask "is it supported" — that decision is already baked into
+    the outcome ``start`` returns); it instead formats the SAME threshold/found-version data via
+    :func:`_min_python_for_safepath_str`/:func:`_interpreter_version_str` below, which are the
+    actual cross-module surface (review finding: an earlier version of this docstring named the
+    boolean itself as the CLI's entry point, which the CLI never actually called).
+    """
+    return sys.version_info >= _MIN_PYTHON_FOR_SAFEPATH
+
+
+def _min_python_for_safepath_str() -> str:
+    """The :data:`_MIN_PYTHON_FOR_SAFEPATH` floor, formatted once here so the CLI's error message
+    and :func:`start`'s own ``log_event`` never need to duplicate that formatting (or the
+    threshold) themselves (review finding)."""
+    return ".".join(str(p) for p in _MIN_PYTHON_FOR_SAFEPATH)
+
+
+def _interpreter_version_str() -> str:
+    """THIS interpreter's version, formatted once here for the same reason as
+    :func:`_min_python_for_safepath_str` — the CLI's error message and ``start``'s ``log_event``
+    share this instead of each re-deriving it from ``sys.version_info`` (review finding)."""
+    return ".".join(str(p) for p in sys.version_info[:3])
+
+
 def start(
     coordinate: str,
     *,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
     child_flags: list[str] | None = None,
+    ready_timeout_s: float = 2.0,
 ) -> tuple[str, int | None]:
     """Idempotently bring up the detached daemon for ``coordinate``.
 
-    Returns ``(outcome, pid)`` where outcome is ``"already-running"`` (no-op, a live daemon was
-    found) or ``"started"`` (a fresh detached daemon was spawned). The liveness check BEFORE
-    spawning is what makes start idempotent — a second start while one is alive never
-    double-spawns. A stale pid-file (crashed daemon) is cleared and a fresh one started. The
-    ``daemon.enabled`` switch is enforced by the caller (``cmd_daemon``/``run_loop``), not here —
-    ``start`` is the pure spawn primitive.
+    Returns ``(outcome, pid)``:
+
+    - ``"already-running"`` — no-op, a live daemon was already found (either before spawning, or
+      discovered after the spawned child exited cleanly having lost the singleton-flock race).
+    - ``"started"`` — a fresh detached daemon was spawned AND proved it bootstrapped.
+    - ``"unsupported-interpreter"`` — refused to SPAWN at all (``pid`` is ``None``, no child, no
+      log file written for this attempt): the interpreter is too old for ``-P`` (see below). A
+      pre-existing STALE pid-file may still have been cleared before this refusal fires (the same
+      cleanup an ordinary start does) — "refuses to spawn" describes the spawn step specifically,
+      not a guarantee that literally nothing on disk changed.
+    - ``"failed"`` — the child was spawned but exited with a real (nonzero) error before proving
+      readiness (see :func:`_daemon_bootstrapped`).
+    - ``"no-op"`` — the child exited cleanly (code 0) WITHOUT ever becoming the live daemon and
+      no OTHER daemon is running either (e.g. a config-enabled/disabled race between this
+      launcher's own check and the child's independent re-read) — not an error, but also not
+      "started": nothing is actually running for the caller to report success about.
+
+    The liveness check BEFORE spawning is what makes start idempotent — a second start while one
+    is alive never double-spawns. A stale pid-file (crashed daemon) is cleared and a fresh one
+    started. The ``daemon.enabled`` switch is enforced by the caller (``cmd_daemon``/``run_loop``),
+    not here — ``start`` is the pure spawn primitive.
 
     ``child_flags`` are the backend-selecting global flags (``--backend``/``--repo``/``--config``)
     the CLI resolved the coordinate WITH; they are forwarded to the spawned ``daemon run`` so the
     child re-resolves to the SAME coordinate. Without them an override that changes resolution
     (e.g. ``--repo X``) would make the child write its pid/state under a different coordinate than
     the one ``start`` checked — breaking idempotency and ``stop``/``status``.
+
+    A bare ``Popen`` success is NOT enough to report "started": that reintroduces the exact
+    started-then-immediately-stopped regression the PYTHONPATH fix (task-cli#57/#58) was closing,
+    for any OTHER bootstrap failure mode. ``start`` waits briefly (``ready_timeout_s``) for the
+    child to either prove it's alive and running (its own pid-file appears), exit with a nonzero
+    code (a real failure), or exit with code 0 (NOT itself a failure — ``run_loop`` exits 0 for
+    two legitimate reasons that can fire before the pid-file appears: ``daemon.enabled: false``,
+    or losing the singleton-flock race to another ``start`` that won it). A zero exit is
+    re-resolved against the CURRENT pid-file: if some daemon is now live, that IS this
+    coordinate's real state (``"already-running"``, with the winner's pid — task-cli#61 review
+    finding: an earlier version reported the race LOSER's already-dead pid as "started"); if
+    nothing is running, that's ``"no-op"``, not "started" (an earlier version reported that as
+    "started" too, which is equally misleading — nothing is actually running).
+
+    We refuse to spawn at all (``"unsupported-interpreter"``, ``pid=None``, no child, no log file
+    touched) on a pre-3.11 interpreter, checked AFTER the already-running check (so a live daemon
+    is still reported correctly even from an old interpreter that could never have started one
+    itself — task-cli#63 review finding: an earlier version checked this FIRST, breaking the
+    idempotent-start contract for that case) but BEFORE spawning: ``-P`` (PYTHONSAFEPATH) is
+    required to close the cwd-shadowing hole documented on :func:`_spawn_detached`, is 3.11+
+    only, and ``pyproject.toml`` already declares that floor — silently omitting ``-P`` on an
+    older interpreter would spawn the daemon without that protection (task-cli#63 review
+    finding: an earlier version did exactly that, trading a loud failure for a silent security
+    downgrade).
     """
     paths = paths_for(coordinate, env=env)
     status, pid = pid_status(paths.pid)
@@ -780,20 +853,133 @@ def start(
     if status in ("stale", "not-ours"):
         _clear_pid(paths.pid)
 
-    child = _spawn_detached(cwd=cwd, log_path=paths.log, child_flags=child_flags or [])
+    if not python_supports_safepath():
+        log_event(
+            "daemon.start-failed",
+            level="ERROR",
+            reason="python-version",
+            required=_min_python_for_safepath_str(),
+            found=_interpreter_version_str(),
+        )
+        return "unsupported-interpreter", None
+
+    proc = _spawn_detached(cwd=cwd, log_path=paths.log, child_flags=child_flags or [])
     # The child writes its OWN pid-file in run_loop; we don't write the launcher's pid here (the
-    # launcher exits immediately). Return the spawned child's pid for the caller's report.
-    return "started", child
+    # launcher exits immediately).
+    result = _daemon_bootstrapped(proc, paths.pid, timeout_s=ready_timeout_s)
+    if result == "timeout":
+        # Still alive, no confirmed readiness within the window -- but if the pid-file already
+        # names a DIFFERENT live daemon (our own child lost a flock race and just hasn't exited
+        # yet), report the real winner instead of "started" for a pid that is about to die
+        # (review finding: this is the same flock-race family the "clean-exit" path already
+        # handles correctly; "timeout" was the one branch that didn't re-check).
+        live_status, live_pid = pid_status(paths.pid)
+        if live_status == "running" and live_pid != proc.pid:
+            return "already-running", live_pid
+        return "started", proc.pid
+    if result == "ready":
+        return "started", proc.pid
+    if result == "error":
+        log_event("daemon.start-failed", level="WARN", pid=proc.pid, log=str(paths.log))
+        return "failed", proc.pid
+    # result == "clean-exit": the child exited 0 without ever owning the pid-file (a flock-loser,
+    # or a config-disabled race). Re-resolve against the coordinate's CURRENT state rather than
+    # guessing -- but the WINNER of a flock race acquires the lock BEFORE writing its pid-file, so
+    # a single immediate check can race a winner that hasn't published yet. Poll for a FRESH
+    # ready_timeout_s window (review finding: an earlier version shared one deadline computed
+    # BEFORE the spawn between _daemon_bootstrapped's own poll and this recheck, so a clean exit
+    # occurring late in that shared window left this loop almost no budget — precisely the
+    # flock-winner-hasn't-published-yet race it exists to cover) before concluding "no-op".
+    recheck_deadline = time.monotonic() + ready_timeout_s
+    while True:
+        live_status, live_pid = pid_status(paths.pid)
+        if live_status == "running":
+            return "already-running", live_pid
+        if time.monotonic() >= recheck_deadline:
+            break
+        time.sleep(0.05)
+    log_event("daemon.start-noop", level="WARN", pid=proc.pid, log=str(paths.log))
+    return "no-op", None
+
+
+def _daemon_bootstrapped(proc: subprocess.Popen, pid_path: Path, *, timeout_s: float) -> str:
+    """Poll briefly after spawning ``proc``. Returns one of:
+
+    - ``"ready"`` — it is STILL ALIVE and its pid-file claims it (real readiness).
+    - ``"error"`` — it has EXITED with a NONZERO code (a real bootstrap failure — including a
+      daemon that wrote its own pid-file and then immediately crashed; a dead process is never
+      "ready" no matter what a pid-file says, since a clean shutdown removes that file and a
+      still-present one for a now-dead pid is itself the failure signature, not evidence of
+      health — review finding: an earlier version let a matching-but-stale pid-file override an
+      observed exit here).
+    - ``"clean-exit"`` — it EXITED with code ``0`` (NOT a failure — see :func:`start` for the two
+      legitimate reasons — but also not proof any pid is the running daemon; the caller must
+      re-resolve).
+    - ``"timeout"`` — still alive, no pid-file yet, ``timeout_s`` elapsed with nothing observed
+      (inconclusive — treated as healthy by the caller; a slow-but-fine bootstrap must never be
+      misreported as a failure).
+
+    Exit status (``proc.poll()``) is checked, and trusted, BEFORE the pid-file — a dead process
+    is never reclassified as ready by anything the pid-file says.
+
+    Takes the ``Popen`` object itself (not a bare pid) precisely so this can call ``proc.poll()``
+    — the caller retains a live reference for the whole poll window, so CPython's refcounting GC
+    can never finalize/reap it out from under us (the race a bare-pid + raw ``os.waitpid``
+    version of this function had to work around and still couldn't fully close — task-cli#61
+    review finding).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            return "error" if rc != 0 else "clean-exit"
+        if read_pid(pid_path) == proc.pid:
+            # Re-check exit status immediately after the pid-file match: closes (does not fully
+            # eliminate — a poll-based check always has SOME residual window) the case where the
+            # child writes its pid-file and then exits microseconds later, which would otherwise
+            # still be reported "ready" for an already-dead daemon (review finding). A NONZERO
+            # exit here is "error" same as anywhere else; a ZERO exit is "clean-exit" (NOT
+            # "ready" — the docstring's own invariant is "exit status is checked, and trusted,
+            # BEFORE the pid-file", so a confirmed-dead process is never "ready" even at zero —
+            # review finding: an earlier version of this exact re-check still returned "ready"
+            # for rc == 0, contradicting that invariant).
+            rc = proc.poll()
+            if rc is not None:
+                return "error" if rc != 0 else "clean-exit"
+            return "ready"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(0.05)
 
 
 def _repo_root() -> Path:
     """This file's own repo root (``tasklib/daemon.py`` -> two dirs up).
 
     In a checkout this is the directory ``bin/task`` lives in — the root the shim inserts into
-    ``sys.path`` by hand. In an installed-package layout it's just ``tasklib``'s own parent
-    (e.g. site-packages), which is already importable, so re-adding it is a harmless no-op.
+    ``sys.path`` by hand. In an installed-package layout it's just ``tasklib``'s own parent —
+    for a pip/pipx install that parent is the WHOLE ``site-packages`` directory, not a harmless
+    no-op to re-add: see :func:`_needs_pythonpath_bootstrap`, which is why the daemon spawn no
+    longer prepends this unconditionally (task-cli#64 review finding — the earlier docstring
+    here claiming "harmless no-op" was itself the bug).
     """
     return Path(__file__).resolve().parent.parent
+
+
+def _needs_pythonpath_bootstrap(repo_root: Path) -> bool:
+    """``True`` only for the checkout/symlink install layout, where ``bin/task``'s ``sys.path``
+    shim is the ONLY reason ``tasklib`` is importable in the parent process at all — so the
+    detached child genuinely needs ``repo_root`` on its own ``PYTHONPATH`` to find it (the bug
+    :func:`_child_env` exists to fix).
+
+    A pip/pipx install has ``tasklib`` already importable via ``site-packages`` with no shim
+    involved — ``_repo_root()`` there resolves to the site-packages directory ITSELF (the parent
+    of the installed ``tasklib`` package), and prepending that to ``PYTHONPATH`` changes the
+    child's import precedence for every package in site-packages, not just ``tasklib`` — a real
+    behavior change for zero benefit (task-cli#64 review finding). Detected by the presence of
+    the sibling ``bin/task`` shim script: it exists in every checkout/symlink install and in
+    none of the packaged distributions.
+    """
+    return (repo_root / "bin" / "task").exists()
 
 
 # The marker _child_env sets alongside its PYTHONPATH prepend, and _scrub_bootstrap_pythonpath
@@ -801,6 +987,113 @@ def _repo_root() -> Path:
 # contain repo_root") so the scrub can tell "WE injected this" apart from "the user's own env
 # already had it" — see both functions' docstrings for the two ways a value-based guess breaks.
 _BOOTSTRAP_MARKER = "_TASKLIB_DAEMON_BOOTSTRAP_PYTHONPATH"
+
+# Snapshot of the caller's PYTHONPATH as SANITIZED by _child_env (already resolved + deduped),
+# NOT the raw original string, so _scrub_bootstrap_pythonpath can restore it later instead of
+# trying to reverse-engineer which entries it added -- without also undoing the relative-entry
+# security resolution (see _child_env's docstring for why the raw string is unsafe to restore).
+# Set ONLY when the caller actually had PYTHONPATH; its absence (vs. an empty string) is itself
+# meaningful, so this is a separate marker rather than folding into _BOOTSTRAP_MARKER (task-cli#60
+# review finding — see both functions' docstrings).
+_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER = "_TASKLIB_DAEMON_BOOTSTRAP_ORIGINAL_PYTHONPATH"
+
+
+def _dedupe_key(path_str: str) -> str:
+    """Canonicalize a PYTHONPATH entry for DEDUPE COMPARISON ONLY — never for what actually goes
+    into PYTHONPATH. ``os.path.realpath`` collapses a trailing separator, ``..`` components, AND
+    a symlink-vs-real spelling of the same directory down to one canonical string, so e.g.
+    ``repo/`` and a symlinked alias of the same checkout are recognized as the SAME entry instead
+    of surviving as near-duplicate PYTHONPATH entries across a chain of respawns (task-cli#65/#66
+    review findings). Falls back to ``normpath`` on ``OSError`` (e.g. a component that
+    disappeared mid-resolve) OR ``ValueError`` (e.g. an embedded NUL byte in a garbage/malicious
+    PYTHONPATH entry — ``realpath`` raises ``ValueError`` for that, not ``OSError``; review
+    finding) rather than raising — dedupe comparison must never crash the spawn.
+    """
+    try:
+        return os.path.realpath(path_str)
+    except (OSError, ValueError):
+        return os.path.normpath(path_str)
+
+
+def _sanitized_pythonpath_entries(base_env: dict[str, str]) -> list[str]:
+    """Resolve + dedupe every entry of ``base_env``'s ``PYTHONPATH``, in order, keeping ANY
+    ``repo_root``-equal entry the caller had (callers that need to treat ``repo_root``
+    specially — :func:`_child_env` — filter it out of the result themselves; this function does
+    not know about ``repo_root`` at all, so both an injecting and a non-injecting spawn share
+    IDENTICAL sanitization — see :func:`_spawn_detached`'s docstring, task-cli#64 review finding:
+    an earlier version skipped this ENTIRELY for a non-injecting spawn).
+
+    A relative entry (e.g. inherited ``.``) resolves against the PROCESS cwd at import time —
+    which for the spawned child is the TARGET project being managed, not wherever the parent
+    (this CLI invocation) was run from. Left as-is, a target repo shipping its own e.g. ``yaml.py``
+    could shadow a stdlib/site import the moment the child does ``import yaml`` — same class of
+    hole ``-P`` closes for the auto-prepended cwd entry, but ``-P`` doesn't touch explicit
+    ``PYTHONPATH`` content (review finding). Rather than DROP a relative entry (which would
+    silently break a legitimate tox/CI/direnv-style ``PYTHONPATH=src`` config the parent process
+    relies on), it is resolved against the PARENT's cwd now, while it still means what the
+    caller intended — freezing it into an absolute path the child cwd can no longer reinterpret
+    (review finding). An empty entry (bare separator) has no such intent to preserve; dropped.
+    ``Path.cwd()`` is called lazily (only when a relative entry actually needs resolving, the
+    uncommon case) and guarded: a long-lived daemon's cwd can be a worktree deleted out from
+    under it, which would otherwise turn an unrelated respawn into a crash (review finding) —
+    fall back to dropping that one entry rather than raising.
+
+    Dedupe compares via :func:`_dedupe_key` (not the resolved string itself) so a
+    trailing-separator or symlink-vs-real spelling of the SAME directory is recognized as a
+    duplicate too, instead of surviving as a near-identical second entry that grows PYTHONPATH
+    across a chain of respawns (task-cli#65/#66 review findings).
+    """
+    existing = base_env.get("PYTHONPATH", "")
+    raw_entries = existing.split(os.pathsep) if existing else []
+    entries: list[str] = []
+    seen_keys: set[str] = set()
+    parent_cwd: Path | None = None
+    for e in raw_entries:
+        if not e:
+            continue
+        if Path(e).is_absolute():
+            resolved = e
+        else:
+            if parent_cwd is None:
+                try:
+                    parent_cwd = Path.cwd()
+                except OSError:
+                    continue  # cwd gone; can't resolve this entry, so drop it
+            resolved = str(parent_cwd / e)
+        key = _dedupe_key(resolved)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        entries.append(resolved)
+    return entries
+
+
+def _sanitized_child_env(*, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """The env for a detached spawn that does NOT need the ``PYTHONPATH``-injection bootstrap
+    (a pip/pipx install — see :func:`_needs_pythonpath_bootstrap`) but must still get the SAME
+    sanitization :func:`_child_env` applies: resolving an inherited relative entry against the
+    PARENT's cwd (so it can't be reinterpreted against the child's TARGET-repo cwd) and deduping.
+    No ``repo_root`` prepend, no bootstrap markers — those are the part a pip/pipx install
+    genuinely does not need (task-cli#64) — but skipping sanitization ENTIRELY for this layout
+    (an earlier version did) silently reopened the same cwd-shadowing hole ``-P`` closes for
+    auto-prepended entries, for explicit ``PYTHONPATH`` content instead (review finding).
+
+    Explicitly DROPS both bootstrap marker vars if the PARENT process's own env happened to carry
+    them (e.g. a daemon that itself got launched with a stale ``_TASKLIB_DAEMON_BOOTSTRAP_*`` from
+    some earlier, unrelated injection still set in its inherited environment) — this spawn is not
+    doing a repo_root injection, so nothing here should later look like one to
+    :func:`_scrub_bootstrap_pythonpath`, which would otherwise trust a stale marker and "restore" a
+    snapshot that was never actually taken for THIS child (review finding).
+    """
+    env = dict(base_env if base_env is not None else os.environ)
+    entries = _sanitized_pythonpath_entries(env)
+    if entries:
+        env["PYTHONPATH"] = os.pathsep.join(entries)
+    else:
+        env.pop("PYTHONPATH", None)
+    env.pop(_BOOTSTRAP_MARKER, None)
+    env.pop(_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER, None)
+    return env
 
 
 def _child_env(repo_root: Path, *, base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -818,55 +1111,38 @@ def _child_env(repo_root: Path, *, base_env: dict[str, str] | None = None) -> di
     entry (e.g. an inherited ``PYTHONPATH=.:...`` with ``.`` first) would still resolve ``.``
     against the child's cwd (the TARGET project, per :func:`_spawn_detached`) ahead of the real
     package, reopening the same shadowing hole ``-P`` closes for the auto-prepended entries —
-    ``PYTHONPATH`` itself is unaffected by ``-P``. So: drop any existing occurrence of
-    ``repo_root`` (this also caps growth across a chain of respawns) and unconditionally
-    prepend it, preserving the rest of the caller's ``PYTHONPATH`` order behind it. Also sets
-    :data:`_BOOTSTRAP_MARKER` to the exact value prepended, so :func:`_scrub_bootstrap_pythonpath`
-    can undo EXACTLY this injection later without guessing from the value alone (a user who
-    legitimately runs with ``PYTHONPATH=<repo_root>`` themselves must not have it stripped).
+    ``PYTHONPATH`` itself is unaffected by ``-P``. So: sanitize the caller's PYTHONPATH (see
+    :func:`_sanitized_pythonpath_entries`), drop any entry that matches ``repo_root`` (this also
+    caps growth across a chain of respawns), and unconditionally prepend ``repo_root``,
+    preserving the rest of the caller's order behind it.
+
+    Also sets :data:`_BOOTSTRAP_MARKER` to the exact value prepended, and — when the caller had
+    a ``PYTHONPATH`` at all — :data:`_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER` to the SANITIZED
+    (not raw) original value, so :func:`_scrub_bootstrap_pythonpath` can restore it later without
+    (a) guessing which entries it added (a user who legitimately runs with
+    ``PYTHONPATH=<repo_root>`` themselves must not have that entry silently dropped — task-cli#60
+    review finding: the dedupe above already collapses their own occurrence into the one we
+    prepend, so by scrub time the two are indistinguishable from the value alone), or (b)
+    reverting the relative-entry-to-absolute security resolution above (task-cli#60 review
+    finding: restoring the RAW original string undoes that resolution — e.g. a caller's own
+    ``PYTHONPATH=.`` would come back as literal ``.`` after scrub, which then resolves against
+    whatever cwd a LATER subprocess — the notifier — happens to run with, reopening the same
+    shadowing hole for that subprocess). The sanitized snapshot is safe to restore verbatim
+    because it is already fully resolved and deduped.
     ``base_env`` defaults to ``os.environ`` and exists so tests don't need to monkeypatch it.
     """
     env = dict(base_env if base_env is not None else os.environ)
-    existing = env.get("PYTHONPATH", "")
-    raw_entries = existing.split(os.pathsep) if existing else []
-    # A relative entry (e.g. inherited ".") resolves against the PROCESS cwd at import
-    # time — which for the spawned child is the TARGET project being managed, not
-    # wherever the parent (this CLI invocation) was run from. Left as-is, a target repo
-    # shipping its own e.g. yaml.py could shadow a stdlib/site import the moment the
-    # child does `import yaml` — same class of hole `-P` closes for the auto-prepended
-    # cwd entry, but `-P` doesn't touch explicit PYTHONPATH content (review finding).
-    # Rather than DROP a relative entry (which would silently break a legitimate
-    # tox/CI/direnv-style `PYTHONPATH=src` config the parent process relies on), resolve
-    # it against the PARENT's cwd now, while it still means what the caller intended —
-    # freezing it into an absolute path the child cwd can no longer reinterpret (review
-    # finding). An empty entry (bare separator) has no such intent to preserve; drop it.
-    # `Path.cwd()` is called lazily (only when a relative entry actually needs resolving,
-    # the uncommon case) and guarded: a long-lived daemon's cwd can be a worktree deleted
-    # out from under it, which would otherwise turn an unrelated respawn into a crash
-    # (review finding) — fall back to dropping that one entry rather than raising.
-    entries: list[str] = []
-    parent_cwd: Path | None = None
-    for e in raw_entries:
-        if not e:
-            continue
-        if Path(e).is_absolute():
-            resolved = e
-        else:
-            if parent_cwd is None:
-                try:
-                    parent_cwd = Path.cwd()
-                except OSError:
-                    continue  # cwd gone; can't resolve this entry, so drop it
-            resolved = str(parent_cwd / e)
-        # Dedupe on the RESOLVED value (not the raw entry) so e.g. a relative "." that
-        # resolves to repo_root is caught too — matching the raw entry alone would miss
-        # exactly the case (running from repo_root, PYTHONPATH=".") this fix targets
-        # (review finding).
-        if resolved == str(repo_root) or resolved in entries:
-            continue
-        entries.append(resolved)
-    env["PYTHONPATH"] = os.pathsep.join([str(repo_root), *entries])
+    had_pythonpath = "PYTHONPATH" in env
+    sanitized_entries = _sanitized_pythonpath_entries(env)
+    sanitized_pythonpath = os.pathsep.join(sanitized_entries)
+    repo_root_key = _dedupe_key(str(repo_root))
+    rest = [e for e in sanitized_entries if _dedupe_key(e) != repo_root_key]
+    env["PYTHONPATH"] = os.pathsep.join([str(repo_root), *rest])
     env[_BOOTSTRAP_MARKER] = str(repo_root)
+    if had_pythonpath:
+        env[_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER] = sanitized_pythonpath
+    else:
+        env.pop(_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER, None)
     return env
 
 
@@ -890,10 +1166,35 @@ def _scrub_bootstrap_pythonpath() -> None:
     A no-op whenever the marker is absent — which covers both cases above, plus the ordinary
     "not spawned via ``_spawn_detached``" launches (a real installed-package invocation, a
     direct foreground ``task daemon run``).
+
+    When :data:`_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER` is present (the normal path — set by
+    :func:`_child_env` whenever the caller had a ``PYTHONPATH``), restore that SANITIZED snapshot
+    verbatim rather than trying to remove "just the injected entry": ``_child_env`` already
+    deduped any pre-existing occurrence of ``repo_root`` into the single one it prepends, so a
+    caller-supplied ``PYTHONPATH=<repo_root>:/custom`` is indistinguishable, by value alone, from
+    "nothing of the caller's own was there" — removing every entry equal to the injected value
+    (the old behavior) silently dropped the caller's own ``repo_root`` segment too (task-cli#60
+    review finding). The snapshot is the SANITIZED value (already resolved + deduped), not the
+    raw original string — restoring the raw string would undo the relative-entry-to-absolute
+    resolution :func:`_sanitized_pythonpath_entries` performs, reopening the cwd-shadowing hole
+    for a LATER subprocess (the notifier) that inherits this same env (task-cli#60 review
+    finding). Falls back to the old value-based removal only when no snapshot was recorded —
+    e.g. a lower-level caller (or an older child) that set :data:`_BOOTSTRAP_MARKER` directly
+    without going through :func:`_child_env`.
     """
     injected = os.environ.pop(_BOOTSTRAP_MARKER, None)
+    # Pop the snapshot marker UNCONDITIONALLY, even if _BOOTSTRAP_MARKER itself is absent -- an
+    # orphaned snapshot (partial inheritance, or a future code path that clears only one of the
+    # pair) must never survive into a later subprocess spawned from this same os.environ (review
+    # finding).
+    snapshot = os.environ.pop(_BOOTSTRAP_ORIGINAL_PYTHONPATH_MARKER, None)
     if injected is None:
         return
+    if snapshot is not None:
+        os.environ["PYTHONPATH"] = snapshot
+        return
+    # No snapshot recorded (the branch above already handles the normal case where one was) --
+    # fall back to the old value-based removal.
     existing = os.environ.get("PYTHONPATH", "")
     entries = [e for e in existing.split(os.pathsep) if e != injected] if existing else []
     if entries:
@@ -902,8 +1203,11 @@ def _scrub_bootstrap_pythonpath() -> None:
         os.environ.pop("PYTHONPATH", None)
 
 
-def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) -> int:
-    """Spawn ``task daemon run`` fully detached (new session, stdio to the log). Returns its pid.
+def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) -> subprocess.Popen:
+    """Spawn ``task daemon run`` fully detached (new session, stdio to the log). Returns the
+    ``Popen`` object — the CALLER (:func:`start`) is expected to retain it live while it polls
+    readiness via :func:`_daemon_bootstrapped`, so CPython's GC can never reap it out from under
+    that poll (see that function's docstring).
 
     Detachment via ``start_new_session`` (setsid) so the daemon outlives the launching shell and
     is not in its process group — a parent exit can't take it down. stdout/stderr go to the log
@@ -922,13 +1226,23 @@ def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) 
     That leaves Python's own behavior of auto-prepending a ``-m`` invocation's process cwd to
     ``sys.path[0]``, AHEAD of ``PYTHONPATH``, as the actual hole: a managed project that happens
     to contain its own top-level ``tasklib/`` directory would shadow the real package and run
-    arbitrary code as this daemon. ``-P`` (``PYTHONSAFEPATH``, Python 3.11+, required by
-    ``pyproject.toml`` — though the checkout+shim install path this fix targets never actually
-    enforces that floor; on an older interpreter ``-P`` itself fails loudly with "unknown
-    option", which at least replaces a silent failure with a visible one instead of adding a
-    new one) suppresses exactly that auto-prepend WITHOUT touching ``PYTHONPATH`` — verified
-    empirically: with ``-P`` plus the ``PYTHONPATH`` from :func:`_child_env`, a decoy
-    ``tasklib/`` package in the child's cwd is ignored and the real one loads.
+    arbitrary code as this daemon. ``-P`` (``PYTHONSAFEPATH``) suppresses exactly that
+    auto-prepend WITHOUT touching ``PYTHONPATH`` — verified empirically: with ``-P`` plus the
+    ``PYTHONPATH`` from :func:`_child_env`, a decoy ``tasklib/`` package in the child's cwd is
+    ignored and the real one loads. ``-P`` is unconditional HERE: :func:`start` (the only
+    production caller) refuses to reach this function at all on a pre-3.11 interpreter, so by
+    the time we're here ``-P`` is always supported (task-cli#63 review finding: an earlier
+    version instead omitted ``-P`` on an old interpreter, spawning the daemon WITHOUT this
+    protection — a silent security downgrade, not an acceptable fallback).
+
+    ``PYTHONPATH`` bootstrap is likewise conditional — see :func:`_needs_pythonpath_bootstrap` —
+    so a pip/pipx install (where ``tasklib`` needs no shim-inserted path at all) does not get its
+    ``site-packages`` parent prepended for no reason (task-cli#64 review finding). Either way the
+    env still goes through the SAME sanitization (:func:`_sanitized_pythonpath_entries`) that
+    resolves an inherited relative entry against the parent's cwd and dedupes — only the
+    ``repo_root`` prepend + bootstrap markers are skipped for the non-checkout layout (an earlier
+    version skipped sanitization ENTIRELY there, reopening the same cwd-shadowing hole ``-P``
+    closes for auto-prepended entries, but for explicit ``PYTHONPATH`` content instead).
 
     ACCEPTED RESIDUAL RISK: this closes the concrete, demonstrated hole (a decoy ``tasklib/``),
     not every hole a fully hostile *inherited* ``PYTHONPATH`` could open — an entry such as
@@ -944,6 +1258,7 @@ def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) 
     repo_root = _repo_root()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     argv = [sys.executable, "-P", "-m", "tasklib", "daemon", "run", "-C", cwd or os.getcwd(), *child_flags]
+    child_env = _child_env(repo_root) if _needs_pythonpath_bootstrap(repo_root) else _sanitized_child_env()
     logf = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - handed to the child; closed below
     try:
         proc = subprocess.Popen(
@@ -953,11 +1268,11 @@ def _spawn_detached(*, cwd: str | None, log_path: Path, child_flags: list[str]) 
             stderr=logf,
             start_new_session=True,
             cwd=cwd or os.getcwd(),
-            env=_child_env(repo_root),
+            env=child_env,
         )
     finally:
         logf.close()
-    return proc.pid
+    return proc
 
 
 def stop(coordinate: str, *, env: dict[str, str] | None = None, timeout_s: float = 5.0) -> tuple[str, int | None]:

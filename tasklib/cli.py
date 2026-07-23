@@ -2075,9 +2075,42 @@ def _daemon_start(daemon, coordinate: str, cfg, args: argparse.Namespace) -> int
     outcome, pid = daemon.start(coordinate, cwd=str(cfg.repo_root), child_flags=_daemon_child_flags(args))
     if outcome == "already-running":
         print(_dim(f"daemon already running (pid {pid}) for {coordinate}"))
-    else:
+        return 0
+    if outcome == "unsupported-interpreter":
+        # Refused to spawn at all -- pid is None, no child, no log written for this attempt, so
+        # there is nothing on disk to point at (task-cli#61/#63 review finding: an earlier
+        # version pointed at a log path here that, for THIS outcome, was never written). Uses
+        # daemon's own public helpers (not private-constant/sys.version_info reconstruction) so
+        # this can never drift out of sync with the check start() itself made (review finding).
+        required = daemon._min_python_for_safepath_str()
+        found = daemon._interpreter_version_str()
+        print(_warn(f"daemon not started: Python {required}+ required (found {found}) for {coordinate}"))
+        return 1
+    if outcome == "failed":
+        # Bootstrap failure (e.g. an unsupported interpreter flag) — reported as an error instead
+        # of the started-then-immediately-stopped flap this readiness check exists to catch
+        # (task-cli#61 review finding). The daemon's own log has the real stderr.
+        paths = daemon.paths_for(coordinate)
+        print(_warn(f"daemon failed to start (pid {pid} exited before bootstrapping) for {coordinate}"))
+        print(_dim(f"  see log: {paths.log}"))
+        return 1
+    if outcome == "no-op":
+        # The spawned child exited cleanly without ever becoming the live daemon, and no OTHER
+        # daemon is running either -- not a crash, but nothing is running either: a nonzero exit
+        # (Fable review finding) so a `task daemon start && ...` script doesn't proceed on the
+        # false premise that a daemon is now up.
+        paths = daemon.paths_for(coordinate)
+        print(_warn(f"daemon did not start (exited without becoming active) for {coordinate}"))
+        print(_dim(f"  see log: {paths.log}"))
+        return 1
+    if outcome == "started":
         print(_ok(f"daemon started (pid {pid}) for {coordinate}  interval={dcfg.interval_s}s"))
-    return 0
+        return 0
+    # Defensive: an outcome daemon.start() didn't document above must never be reported as quiet
+    # success (Fable review finding: an earlier version's fallthrough branch treated ANY unknown
+    # outcome as "started").
+    print(_warn(f"daemon start returned an unrecognized outcome {outcome!r} for {coordinate}"))
+    return 1
 
 
 def _daemon_stop(daemon, coordinate: str) -> int:
