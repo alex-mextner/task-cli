@@ -29,6 +29,10 @@ class FakeBackend:
         self._next = 1
         self.comments: list[tuple[str, str]] = []
         self.attachments: list[tuple[str, str]] = []
+        # None = "this test never set an identity" (mirrors a real backend's current_user()
+        # returning None when it can't determine one) — set explicitly in tests that exercise
+        # the reporter-scoped stale-nudge filter (issue #59, review P2).
+        self.current_user_result: str | None = None
 
     def create(self, ticket: Ticket) -> Ticket:
         tid = f"#{self._next}"
@@ -89,6 +93,9 @@ class FakeBackend:
 
     def session_tickets(self, session_label: str, *, limit=30) -> list[Ticket]:
         return self.list(labels=[session_label], limit=limit)
+
+    def current_user(self) -> str | None:
+        return self.current_user_result
 
 
 @pytest.fixture

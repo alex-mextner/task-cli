@@ -144,19 +144,29 @@ class LinearBackend:
     def _node_to_ticket(self, node: dict) -> Ticket:
         labels = [lbl["name"] for lbl in node.get("labels", {}).get("nodes", [])]
         st_type = (node.get("state") or {}).get("type", "unstarted")
+        normalized_state = _TYPE_TO_STATE.get(st_type, State.TODO)
         base = Ticket(
             title=node.get("title", ""),
             labels=labels,
-            state=_TYPE_TO_STATE.get(st_type, State.TODO),
+            state=normalized_state,
             id=node.get("identifier", ""),
             url=node.get("url", ""),
             # Seed the native dueDate so a ticket created/edited in the Linear UI (no body
             # section) still carries its due date; parse() lets the body's Due section override.
             due=str(node.get("dueDate") or "").strip(),
+            updated_at=str(node.get("updatedAt") or ""),
+            reporter=str((node.get("creator") or {}).get("id") or ""),
+            # Unlike GitHub, Linear's normalized state IS derived straight from its native
+            # workflow state (no separate managed label to lag behind it), so there is no
+            # divergence to guard against — this simply mirrors the same derivation.
+            provider_closed=normalized_state in (State.DONE, State.CANCELLED),
         )
         return parse(node.get("description") or "", base)
 
-    _ISSUE_FIELDS = "id identifier url title description dueDate state{type name} labels{nodes{name}}"
+    _ISSUE_FIELDS = (
+        "id identifier url title description dueDate updatedAt state{type name} "
+        "labels{nodes{name}} creator{id}"
+    )
 
     # ── protocol ──────────────────────────────────────────────────────────────────
     def create(self, ticket: Ticket) -> Ticket:
@@ -290,6 +300,20 @@ class LinearBackend:
 
     def session_tickets(self, session_label: str, *, limit=30) -> list[Ticket]:
         return self.list(labels=[session_label], limit=limit)
+
+    def current_user(self) -> str | None:
+        """Best-effort id of this API key's owner (issue #59's stale-nudge personal-scope
+        filter). ``None`` on any failure — never an authorization boundary, just a filter hint;
+        the caller (``cli.py``) falls back to an unfiltered scan when it can't be determined."""
+        try:
+            data = self._gql("query{viewer{id}}")
+        except BackendError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        viewer = data.get("viewer")
+        viewer_id = viewer.get("id") if isinstance(viewer, dict) else None
+        return viewer_id if isinstance(viewer_id, str) and viewer_id else None
 
 
 def _file_url(file_path: str) -> str:

@@ -487,6 +487,262 @@ def test_list_json_omits_stale_task_warning(capsys, _inject_fake):
     assert payload[0]["id"] == "#1"
 
 
+# ── issue #59: global stale-ticket nudge (not scoped to THIS session) ──────────────
+
+
+def _iso_hours_ago(hours: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_list_warns_about_globally_stale_ticket_outside_session(capsys, _inject_fake):
+    """A ticket THIS session never touched (no session label at all) is invisible to
+    `_session_attention_notice` (session-scoped only). It must still surface here once it has
+    gone >48h without a backend update while active — the gap issue #59 closes."""
+    # keep `session_tickets` non-empty so `_list_session_scoped` takes the session-scoped branch,
+    # not the "no session tickets -> show everything" fallback — proving the global check looks
+    # beyond this session's own tickets, not just reusing the fallback's already-broad query.
+    _inject_fake.create(Ticket(title="Session work", labels=["session:testsess"], state=cli.State.TODO))
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+    assert "#2" in out
+    assert "Forgotten ticket" in out
+    # pins _stale_line's age-rendering unit: stale_tickets() returns age in SECONDS, and
+    # _stale_line feeds it straight into _age_text (also seconds) — 50h ago must render as
+    # "2d ago" (50h // 24 = 2), not a nonsense value from a unit mismatch (review finding).
+    assert "(updated 2d ago)" in out
+
+
+def test_list_does_not_warn_about_recently_updated_active_ticket(capsys, _inject_fake):
+    _inject_fake.create(Ticket(title="Session work", labels=["session:testsess"], state=cli.State.TODO))
+    fresh = _inject_fake.create(Ticket(title="Fresh ticket", state=cli.State.IN_PROGRESS))
+    fresh.updated_at = _iso_hours_ago(1)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" not in out.lower()
+
+
+def test_list_global_stale_warning_does_not_repeat_within_rate_limit_window(capsys, _inject_fake):
+    """Rate-limited: an immediate second `task list` must not re-nag (a local timestamp cache,
+    not per-process memory, since every CLI invocation is a fresh process)."""
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+
+    rc1 = main(["list"])
+    out1 = capsys.readouterr().out
+    rc2 = main(["list"])
+    out2 = capsys.readouterr().out
+
+    assert rc1 == 0 and rc2 == 0
+    assert "stale" in out1.lower()
+    assert "stale" not in out2.lower()
+
+
+def test_list_json_omits_global_stale_warning(capsys, _inject_fake):
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+
+    rc = main(["list", "--json"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" not in out.lower()
+
+
+def test_list_global_stale_check_failure_is_best_effort(capsys, _inject_fake, monkeypatch):
+    """A backend hiccup in the global stale check must never break `task list`'s own output —
+    it's a bonus nudge, not the command's job (see _global_stale_notice_block's fail-soft try)."""
+    from tasklib.backends import BackendError
+
+    _inject_fake.create(Ticket(title="Session work", labels=["session:testsess"], state=cli.State.TODO))
+    original_list = _inject_fake.list
+
+    def flaky_list(*args, **kwargs):
+        if kwargs.get("limit") == cli._LIMIT_INTERACTIVE:  # the global check's own fetch
+            raise BackendError("boom")
+        return original_list(*args, **kwargs)
+
+    monkeypatch.setattr(_inject_fake, "list", flaky_list)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Session work" in out
+    assert "stale" not in out.lower()
+
+
+def test_list_global_stale_check_failure_leaves_rate_limit_window_open(capsys, _inject_fake, monkeypatch):
+    """A transient backend failure must not consume the rate-limit window — mark_checked only
+    runs after a successful scan (see _global_stale_notice_block), so the NEXT invocation gets
+    a real retry instead of being silently rate-limited for the failed one."""
+    from tasklib.backends import BackendError
+
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+    original_list = _inject_fake.list
+    calls = {"n": 0}
+
+    def flaky_once(*args, **kwargs):
+        if kwargs.get("limit") == cli._LIMIT_INTERACTIVE:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise BackendError("boom")
+        return original_list(*args, **kwargs)
+
+    monkeypatch.setattr(_inject_fake, "list", flaky_once)
+
+    rc1 = main(["list"])
+    out1 = capsys.readouterr().out
+    rc2 = main(["list"])
+    out2 = capsys.readouterr().out
+
+    assert rc1 == 0 and rc2 == 0
+    assert "stale" not in out1.lower()  # the flaky first call swallowed the check
+    assert "stale" in out2.lower()  # window was NOT consumed — the retry actually ran
+
+
+def test_list_global_stale_notice_reflects_custom_threshold(capsys, _inject_fake, monkeypatch):
+    monkeypatch.setenv("TASK_GLOBAL_STALE_SECONDS", str(2 * 3600))
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(3)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "2h+" in out
+
+
+def test_list_global_stale_notice_formats_sub_hour_threshold_precisely(capsys, _inject_fake, monkeypatch):
+    # a naive `seconds // 3600` would print "1h+" for 90 minutes and "0h+" for any sub-hour
+    # value — both misleading (review finding: 5400s must read as "1.5h+", not floor to "1h+").
+    monkeypatch.setenv("TASK_GLOBAL_STALE_SECONDS", "5400")  # 90 minutes
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(2)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "1.5h+" in out
+    assert "0h+" not in out and "1h+" not in out
+
+
+def test_list_global_stale_check_ignores_tickets_reported_by_someone_else(capsys, _inject_fake):
+    """P2 (review): an unqualified `backend.list()` scans EVERY ticket in a shared GitHub/Linear
+    project, not just the current user's — contradicting issue #59's stated scope ("check ALL of
+    THE USER'S open tickets"). A stale ticket someone else filed must never surface in my nudge,
+    but MY stale ticket must still surface."""
+    _inject_fake.current_user_result = "alex"
+    _inject_fake.create(Ticket(title="Session work", labels=["session:testsess"], state=cli.State.TODO))
+    mine = _inject_fake.create(Ticket(title="My forgotten ticket", state=cli.State.IN_PROGRESS))
+    mine.updated_at = _iso_hours_ago(50)
+    mine.reporter = "alex"
+    theirs = _inject_fake.create(Ticket(title="Coworker forgotten ticket", state=cli.State.IN_PROGRESS))
+    theirs.updated_at = _iso_hours_ago(50)
+    theirs.reporter = "bob"
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+    assert "My forgotten ticket" in out
+    assert "Coworker forgotten ticket" not in out
+
+
+def test_list_global_stale_check_keeps_scanning_when_identity_is_unknown(capsys, _inject_fake):
+    """When the backend can't determine "who am I" (current_user() -> None, e.g. an
+    unauthenticated-for-that-endpoint token or a transient hiccup), the reporter filter must fail
+    OPEN — degrade to the prior unfiltered behavior — rather than silently disabling the whole
+    nudge. Worse-case parity with before this fix, never worse."""
+    _inject_fake.current_user_result = None
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+    stale.reporter = "someone"
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+    assert "Forgotten ticket" in out
+
+
+def test_list_global_stale_check_keeps_scanning_when_identity_lookup_raises(capsys, _inject_fake, monkeypatch):
+    """P1 (review, found independently by two reviewers): `backend.current_user()` can RAISE
+    (a network hiccup a backend forgot to wrap, or any other unexpected error) instead of just
+    returning None. Before this fix that exception propagated out of `_scope_to_current_user`
+    into `_global_stale_notice_block`'s single broad `except Exception`, which swallows the
+    ENTIRE nudge — worse than not scoping at all, because a real stale ticket that has nothing
+    to do with the identity lookup goes unreported, and `mark_checked` never runs either. The
+    reporter filter must fail OPEN on a raise exactly like it does on a None return."""
+
+    def raise_boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_inject_fake, "current_user", raise_boom)
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+    stale.reporter = "someone"
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+    assert "Forgotten ticket" in out
+
+
+def test_list_global_stale_check_keeps_scanning_when_current_user_is_missing(capsys, _inject_fake, monkeypatch):
+    """P1 (review): same fail-open contract when `current_user()` is missing entirely (a minimal
+    third-party ``TicketBackend`` — the protocol is structural, not ABC-enforced — that never
+    implements it), which raises ``AttributeError`` rather than a "normal" exception. Must
+    degrade the same way as a raise or a None return, not swallow the whole nudge."""
+    monkeypatch.delattr(type(_inject_fake), "current_user")
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+    stale.reporter = "someone"
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+    assert "Forgotten ticket" in out
+
+
+def test_list_global_stale_notice_survives_unwritable_cache(capsys, _inject_fake, monkeypatch):
+    """A failure to persist the rate-limit marker must not discard an already-computed finding
+    (see _global_stale_notice_block's separate try/except around mark_checked)."""
+    from tasklib import stale_notice
+
+    stale = _inject_fake.create(Ticket(title="Forgotten ticket", state=cli.State.IN_PROGRESS))
+    stale.updated_at = _iso_hours_ago(50)
+
+    def raise_mark(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(stale_notice, "mark_checked", raise_mark)
+
+    rc = main(["list"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "stale" in out.lower()
+
+
 def test_create_warns_about_stale_active_session_task(capsys, _inject_fake):
     stale = Ticket(title="Old active work", labels=["session:testsess"], state=cli.State.IN_PROGRESS)
     _inject_fake.create(stale)

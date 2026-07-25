@@ -139,32 +139,36 @@ def test_emit_list_drops_empty_blocks(monkeypatch):
 
 def test_explicit_limit_flows_into_backend(monkeypatch, _inject_fake):
     # `-n N` must reach the backend call (not just _effective_limit in isolation). Spy on .list.
-    seen = {}
+    # `seen` collects EVERY call (a list, not a dict) — issue #59's global stale-ticket check
+    # (cli.py's _global_stale_notice_block) makes its own follow-up `backend.list()` call with a
+    # fixed limit, independent of `-n`/interactivity, so the PRIMARY listing call is `seen[0]`.
+    seen = []
     orig = _inject_fake.list
 
     def spy(*, labels=None, state=None, limit=30):
-        seen["limit"] = limit
+        seen.append(limit)
         return orig(labels=labels, state=state, limit=limit)
 
     monkeypatch.setattr(_inject_fake, "list", spy)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)  # would pick 100 w/o -n
     # no agent session tickets → falls back to backend.list with the resolved limit
     main(["list", "--no-pager", "-n", "7"])
-    assert seen["limit"] == 7
+    assert seen[0] == 7
 
 
 def test_no_n_piped_uses_small_cap_in_backend(monkeypatch, _inject_fake):
-    seen = {}
+    # see test_explicit_limit_flows_into_backend above re: `seen` being a list of every call.
+    seen = []
     orig = _inject_fake.list
 
     def spy(*, labels=None, state=None, limit=30):
-        seen["limit"] = limit
+        seen.append(limit)
         return orig(labels=labels, state=state, limit=limit)
 
     monkeypatch.setattr(_inject_fake, "list", spy)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: False, raising=False)
     main(["list"])
-    assert seen["limit"] == cli._LIMIT_PIPED == 30
+    assert seen[0] == cli._LIMIT_PIPED == 30
 
 
 def test_find_paged_through_pager_when_interactive(capsys, tmp_path, monkeypatch, _inject_fake):
