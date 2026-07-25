@@ -309,7 +309,10 @@ class LinearBackend:
             data = self._gql("query{viewer{id}}")
         except BackendError:
             return None
-        viewer_id = (data.get("viewer") or {}).get("id")
+        if not isinstance(data, dict):
+            return None
+        viewer = data.get("viewer")
+        viewer_id = viewer.get("id") if isinstance(viewer, dict) else None
         return viewer_id if isinstance(viewer_id, str) and viewer_id else None
 
 

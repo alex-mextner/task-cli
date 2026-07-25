@@ -194,8 +194,15 @@ def stale_after_seconds() -> int:
     Exposed so a caller formatting the nudge text (``cli.py``) can display the THRESHOLD THAT
     ACTUALLY APPLIED — a hardcoded "48h" in the message would be wrong under a configured
     override.
+
+    Unlike the check-interval sibling (where ``0`` is a meaningful "no rate limit" opt-out),
+    a non-positive staleness threshold has no sane meaning: ``0`` would flag every active
+    ticket as stale the instant it's created (age is always ``>= 0``). Treat
+    ``TASK_GLOBAL_STALE_SECONDS<=0`` the same as absent/garbage input and fall back to the
+    default rather than nagging on every ticket (review finding).
     """
-    return _env_seconds("TASK_GLOBAL_STALE_SECONDS", _STALE_AFTER_SECONDS_DEFAULT)
+    value = _env_seconds("TASK_GLOBAL_STALE_SECONDS", _STALE_AFTER_SECONDS_DEFAULT)
+    return value if value > 0 else _STALE_AFTER_SECONDS_DEFAULT
 
 
 def stale_tickets(

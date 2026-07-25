@@ -93,6 +93,16 @@ def test_stale_after_seconds_reflects_env_override(monkeypatch):
     assert stale_notice.stale_after_seconds() == 3600
 
 
+def test_stale_after_seconds_rejects_non_positive_override(monkeypatch):
+    """0 (or negative) has no sane meaning here: age is always >= 0, so a 0-second threshold
+    would flag every active ticket as stale the instant it's created (review finding) —
+    unlike the check-interval sibling, where 0 legitimately means "no rate limit"."""
+    monkeypatch.setenv("TASK_GLOBAL_STALE_SECONDS", "0")
+    assert stale_notice.stale_after_seconds() == stale_notice._STALE_AFTER_SECONDS_DEFAULT
+    monkeypatch.setenv("TASK_GLOBAL_STALE_SECONDS", "-10")
+    assert stale_notice.stale_after_seconds() == stale_notice._STALE_AFTER_SECONDS_DEFAULT
+
+
 def test_stale_tickets_sorts_oldest_first():
     older = Ticket(title="Older", state=State.TODO, updated_at=_iso_hours_ago(100))
     newer = Ticket(title="Newer", state=State.TODO, updated_at=_iso_hours_ago(60))

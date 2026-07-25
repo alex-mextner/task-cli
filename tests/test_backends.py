@@ -647,3 +647,32 @@ def test_linear_current_user_returns_none_on_backend_error(monkeypatch):
 
     monkeypatch.setattr(be, "_gql", raise_err)
     assert be.current_user() is None
+
+
+@pytest.mark.parametrize("bad_response", [None, [], "viewer", 42])
+def test_linear_current_user_returns_none_on_non_dict_response(monkeypatch, bad_response):
+    """`_gql` is typed to return a dict, but a malformed response or a third-party override
+    could hand back something else — mirror the `isinstance(row, dict)` guard the GitHub
+    backend already has for its own `/user` call (review finding: `current_user` must never
+    raise, per its own docstring, rather than relying on a caller's broad except). Parametrized
+    across a few non-dict shapes (not just `None`) so the guard's actual contract — ANY
+    non-dict, not one specific falsy value — is locked in (review finding, round 2)."""
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+
+    monkeypatch.setattr(be, "_gql", lambda query, variables=None: bad_response)
+    assert be.current_user() is None
+
+
+@pytest.mark.parametrize("bad_viewer", ["not-a-dict", 42, [], True])
+def test_linear_current_user_returns_none_on_non_dict_viewer(monkeypatch, bad_viewer):
+    """A dict root response with a truthy non-dict ``viewer`` value (e.g. a string) would crash
+    `.get("id")` if only the root were guarded — `"invalid" or {}` evaluates to `"invalid"`,
+    not `{}`, since the `or` fallback only fires on a FALSY viewer (review finding, round 3)."""
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+
+    monkeypatch.setattr(be, "_gql", lambda query, variables=None: {"viewer": bad_viewer})
+    assert be.current_user() is None
