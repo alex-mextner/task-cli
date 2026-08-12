@@ -93,8 +93,9 @@ def _add_create_args(p: argparse.ArgumentParser) -> None:
         "--force",
         dest="force_reason",
         metavar="REASON",
-        help="override the links / user-impact-quality gates with a recorded reason "
-        "(a false-positive link match, or a genuinely-N/A impact)",
+        help="override the links / user-impact-quality gates, or a detected close-duplicate "
+        "ticket, with a recorded reason (a false-positive link match, a genuinely-N/A impact, "
+        "or an intentional duplicate)",
     )
     _add_skip_flags(p)
 
@@ -667,6 +668,56 @@ def _apply_force(ticket: Ticket, cfg, phase, reason: str | None, forceable: set[
             ticket.skips.setdefault(v.gate, reason)
 
 
+def _session_dedup_candidates(backend, session) -> list[Ticket]:
+    """This session's tickets for a dedup scan, degrading to `[]` on ANY backend hiccup.
+
+    Shared by `_refuse_if_duplicate` and `_classify_create` so both dedup checks fail open the
+    same way. Catches BOTH `BackendError` and `AmbiguousBackendError`: this is a read-only GET,
+    so an ambiguous outcome here is harmless (nothing was mutated either way) — unlike
+    `AmbiguousBackendError` from a WRITE, which must never be silently swallowed. Missing
+    `AmbiguousBackendError` here was itself a review-caught bug: `session_tickets()` funnels
+    through the same `_call`/`_gql` wrappers as every other request, so a mid-read drop during
+    THIS lookup used to crash `create` with a raw traceback before the create was even attempted
+    — defeating the very guard meant to protect a retry after a flaky connection.
+    """
+    from .backends import AmbiguousBackendError, BackendError
+
+    try:
+        return backend.session_tickets(session.label, limit=30)
+    except (BackendError, AmbiguousBackendError):
+        return []
+
+
+def _refuse_if_duplicate(backend, session, force_reason: str | None, ticket: Ticket) -> None:
+    """Block `create` when a close-duplicate ticket already exists in this session.
+
+    Reuses `_best_dedup_match` — the SAME conservative title-similarity check `_classify_create`
+    already runs before creating from an inbound message — so `task new`/`create` gets the
+    identical guard. Without this, a caller retrying after ANY ambiguous result (e.g.
+    `AmbiguousBackendError`) could silently create a genuine duplicate ticket (task-cli review
+    finding).
+
+    `force_reason` (`--force "<reason>"`) overrides the block; the reason is recorded under
+    `policy.GATE_DUPLICATE` in the ticket's `skips` (renders in the `Skipped gates` section) ONLY
+    when it actually overrode a detected match — a force that found nothing to override never
+    pollutes the audit trail, mirroring `_apply_force`'s same rule for the policy gates.
+    """
+    from .policy import GATE_DUPLICATE
+
+    candidates = _session_dedup_candidates(backend, session)
+    match = _best_dedup_match(ticket.title, candidates)
+    if match is None:
+        return
+    if force_reason:
+        ticket.skips.setdefault(GATE_DUPLICATE, force_reason)
+        return
+    raise _UserError(
+        f"a close-duplicate ticket already exists: {match.id}  {match.title}\n"
+        f"  url: {match.url}\n"
+        f'  fix: pass --force "<reason>" to create anyway, or update/comment on {match.id} instead'
+    )
+
+
 def _derive_title_from_message(text: str) -> str:
     """Derive a ticket title from raw inbound text (the ``--from-message`` / ``classify
     --create`` hook path): first line, truncated to 72 chars — but with a leading tg-cli inbound-
@@ -880,14 +931,54 @@ def _attach_screenshots(backend, ticket_id: str, screenshots) -> None:
     must not undo a successful create/update, so a backend error is swallowed (the ref still
     lives in the body). Exercises the ``TicketBackend.attach`` contract rather than leaving it
     a dangling method.
+
+    Catches ``AmbiguousBackendError`` too, not just ``BackendError`` (review finding): the
+    ticket/comment this attaches to already exists by the time this runs, so an ambiguous attach
+    outcome carries none of the "did this create a duplicate?" risk the type exists to flag — it
+    is exactly the harmless-to-swallow case this function's own docstring already describes.
+    Missing this was itself a bug: a caller wrapping ``backend.create()`` + this in one ``try``
+    (``cmd_create``) would misreport a definitely-created ticket as merely "may have been
+    created" and never print its id, because this raised past its own best-effort contract.
     """
-    from .backends import BackendError
+    from .backends import AmbiguousBackendError, BackendError
 
     for shot in screenshots:
         try:
             backend.attach(ticket_id, shot.ref)
-        except BackendError:
+        except (BackendError, AmbiguousBackendError):
             continue
+
+
+def _create_ticket_or_ambiguous(backend, ticket: Ticket) -> tuple[Ticket | None, int | None]:
+    """Create ``ticket`` via ``backend``. Returns ``(created, None)`` on success, or
+    ``(None, exit_code)`` when the outcome is ambiguous — the caller returns ``exit_code``
+    immediately without further output (the message is already printed here).
+
+    Shared by ``cmd_create`` and ``_classify_create`` — the two paths that create a NEW ticket
+    and so share the exact same duplicate-on-retry hazard (review finding: only ``cmd_create``
+    handled ``AmbiguousBackendError``, leaving the inbound-message hook path — which is ALSO a
+    creation path — to crash with a raw traceback on the identical scenario).
+    """
+    from .backends import AmbiguousBackendError, BackendError
+
+    try:
+        return backend.create(ticket), None
+    except AmbiguousBackendError as exc:
+        # the connection dropped AFTER the backend already accepted the request (e.g. GitHub
+        # returned 201 and created the issue, then the read itself failed) — this is NOT the
+        # same as a clean, nothing-happened refusal (that's the BackendError/_UserError/exit-2
+        # path below), so it gets its own message and its own exit code rather than either a
+        # bare traceback or a misleadingly-clean "error:" line.
+        print(_err(f"ambiguous: {exc}"))
+        print(
+            _warn(
+                "  the ticket may have already been created — run `task list` (or check the "
+                "backend) before retrying, to avoid creating a duplicate."
+            )
+        )
+        return None, exc.exit_code
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
 
 
 # ── commands ────────────────────────────────────────────────────────────────────────
@@ -959,17 +1050,20 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     from .policy import GATE_LINKS, GATE_USER_IMPACT_QUALITY, Phase
 
-    _apply_force(ticket, cfg, Phase.CREATE, getattr(args, "force_reason", None), {GATE_LINKS, GATE_USER_IMPACT_QUALITY})
+    force_reason = getattr(args, "force_reason", None)
+    _apply_force(ticket, cfg, Phase.CREATE, force_reason, {GATE_LINKS, GATE_USER_IMPACT_QUALITY})
     _enforce_or_die(ticket, cfg, Phase.CREATE)
 
     backend = _backend(cfg)
-    from .backends import BackendError
+    _refuse_if_duplicate(backend, session, force_reason, ticket)
 
-    try:
-        created = backend.create(ticket)
-        _attach_screenshots(backend, created.id, screenshots)
-    except BackendError as exc:
-        raise _UserError(str(exc)) from exc
+    created, ambiguous_exit = _create_ticket_or_ambiguous(backend, ticket)
+    if ambiguous_exit is not None:
+        return ambiguous_exit
+    # `created` is set (not None) whenever ambiguous_exit is None — attach is best-effort and
+    # runs AFTER, in its own scope, so an attach hiccup (even an ambiguous one — see
+    # _attach_screenshots) can never suppress the fact that the ticket itself was created.
+    _attach_screenshots(backend, created.id, screenshots)
 
     from .session import record
 
@@ -1934,10 +2028,7 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
     from .backends import BackendError
 
     # dedup: same session + high title similarity
-    try:
-        candidates = backend.session_tickets(session.label, limit=30)
-    except BackendError:
-        candidates = []
+    candidates = _session_dedup_candidates(backend, session)
     match = _best_dedup_match(args.text, candidates)
     if match is not None:
         try:
@@ -1993,10 +2084,10 @@ def _classify_create(args: argparse.Namespace, cfg) -> int:
     # `enforce.msgref_quote: false` or the reference is waived (review finding).
     if _msgref_expand_enabled(ticket.skips, cfg):
         ticket.what = _expand_msgrefs(ticket.what, _load_msgref_history_if_needed(what_raw))
-    try:
-        created = backend.create(ticket)
-    except BackendError as exc:
-        raise _UserError(str(exc)) from exc
+
+    created, ambiguous_exit = _create_ticket_or_ambiguous(backend, ticket)
+    if ambiguous_exit is not None:
+        return ambiguous_exit
     from .session import record
 
     record(session.id, created.id, created.title)

@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 
 from ..model import State, Ticket
 from ..render import parse, render
-from . import BackendError
-from .http import HttpError, request_json
+from . import AmbiguousBackendError, BackendError
+from .http import AmbiguousHttpError, HttpError, request_json
 
 API_URL = "https://api.linear.app/graphql"
 
@@ -71,6 +71,10 @@ class LinearBackend:
         payload = {"query": query, "variables": variables or {}}
         try:
             result = request_json(API_URL, method="POST", headers=self._headers(), payload=payload)
+        except AmbiguousHttpError as exc:
+            # see the matching comment in github_issues.py: this must stay its own, distinctly-
+            # typed wrapper rather than falling through to the generic BackendError below.
+            raise AmbiguousBackendError(f"linear: {exc}") from exc
         except HttpError as exc:
             raise BackendError(f"linear: {exc} {exc.body}".strip()) from exc
         if isinstance(result, dict) and result.get("errors"):

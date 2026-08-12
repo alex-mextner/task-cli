@@ -69,6 +69,14 @@ GATE_MSGREF_QUOTE = "msgref-quote"
 # author can't retroactively fix in one step.
 GATE_LINKS_URL = "links-url"
 
+# NOT a content gate `check()`/`Phase` ever evaluates — the create-time duplicate guard
+# (`cli._refuse_if_duplicate`) is a separate, session-scoped title-similarity check, not a
+# ticket-content rule. Named here anyway (rather than a bare string literal in cli.py) so the
+# `ticket.skips` key it records lives in the SAME namespace as every other gate name — a review
+# finding: a magic string outside this module reads as "one more of these gates" without actually
+# being one.
+GATE_DUPLICATE = "duplicate"
+
 # The minimum number of acceptance criteria a ticket must declare (rule: a real ticket has
 # more than one provable outcome). Overridable via `enforce.acceptance_min`.
 DEFAULT_ACCEPTANCE_MIN = 2

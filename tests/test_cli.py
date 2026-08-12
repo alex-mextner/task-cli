@@ -201,6 +201,80 @@ def test_create_puts_session_in_labels_not_links(_inject_fake):
     assert "- (none)" in links_section
 
 
+# ── ambiguous backend failure after create (task-cli bug 1) ─────────────────────────
+
+
+def test_create_ambiguous_backend_error_prints_distinct_message_and_exit_code(capsys, monkeypatch, _inject_fake):
+    # a connection drop mid-read AFTER the fake provider "accepted" the create must NOT look
+    # like a bare traceback, and must NOT collide with the clean-refusal exit code (2) that
+    # _UserError / TransitionError already use — a caller needs to tell the two apart.
+    from tasklib.backends import AmbiguousBackendError, EXIT_AMBIGUOUS
+
+    def raise_ambiguous(ticket):
+        raise AmbiguousBackendError("github: connection interrupted while reading the response for POST url (status 201 was already returned)")
+
+    monkeypatch.setattr(_inject_fake, "create", raise_ambiguous)
+    rc = main(_create_argv())
+    out = capsys.readouterr().out
+    assert rc == EXIT_AMBIGUOUS
+    assert rc != 2
+    assert "ambiguous" in out
+    assert "duplicate" in out
+    assert len(_inject_fake.list()) == 0  # the fake never actually stored anything
+
+
+# ── create-time dedup (task-cli bug 2: `create` had no duplicate guard) ─────────────
+#
+# `_classify_create` (the inbound-message hook) already dedups against the session via
+# `_best_dedup_match`/`session_tickets()` before creating; `cmd_create`/`task new` had no such
+# guard, so a caller retrying after ANY ambiguous result (e.g. the AmbiguousBackendError tested
+# above) could silently create a genuine duplicate ticket. These pin the fix.
+
+
+def test_create_blocks_close_duplicate_title_without_force(capsys, _inject_fake):
+    rc1 = main(_create_argv())
+    assert rc1 == 0
+    capsys.readouterr()
+
+    rc2 = main(_create_argv())  # identical title, same session
+    out = capsys.readouterr().out
+
+    assert rc2 == 2  # a clean, no-network-call-made refusal — the _UserError class
+    assert "#1" in out  # identifies the matching existing ticket
+    assert "duplicate" in out
+    assert len(_inject_fake.list()) == 1  # no second ticket was created
+
+
+def test_create_force_bypasses_duplicate_block(capsys, _inject_fake):
+    main(_create_argv())
+    capsys.readouterr()
+
+    rc = main(_create_argv(**{"--force": "intentional duplicate, needed for X"}))
+    assert rc == 0
+    assert len(_inject_fake.list()) == 2  # --force let the second one through
+
+
+def test_create_distinct_title_is_not_flagged_as_duplicate(capsys, _inject_fake):
+    main(_create_argv())  # "Add a thing"
+    capsys.readouterr()
+
+    rc = main(_create_argv(**{"--title": "Completely unrelated feature request for the sidebar"}))
+    assert rc == 0
+    assert len(_inject_fake.list()) == 2  # a genuinely distinct title is never blocked
+
+
+def test_create_dedup_scoped_to_session_not_global(capsys, monkeypatch, _inject_fake):
+    # a same-title ticket from a DIFFERENT session must not block this one — dedup mirrors
+    # `_classify_create`'s scoping (session_tickets(), not a global search).
+    main(_create_argv())
+    capsys.readouterr()
+
+    monkeypatch.setenv("TASK_SESSION", "othersess")
+    rc = main(_create_argv())
+    assert rc == 0
+    assert len(_inject_fake.list()) == 2
+
+
 # ── `new` alias + `done` close verb (CTO-requested ergonomics, issue #8) ─────────────
 
 
@@ -349,7 +423,8 @@ def test_list_label_filters_session_view(capsys, _inject_fake):
     # the requested label is excluded. Regression for the codex finding that --label was ignored
     # whenever the current session had tickets.
     main(_create_argv())  # #1: session:testsess, no extra label
-    main(_create_argv() + ["--label", "urgent"])  # #2: session:testsess + urgent
+    # a distinct title so the create-time dedup guard doesn't fold this into a comment on #1
+    main(_create_argv(**{"--title": "Add a second, unrelated thing"}) + ["--label", "urgent"])  # #2
     capsys.readouterr()
     rc = main(["list", "--label", "urgent"])
     out = capsys.readouterr().out
@@ -863,9 +938,10 @@ def test_status_transition_does_not_record_ticket_from_another_session(capsys, _
 
 
 def test_gantt_renders_dated_and_undated(capsys, _inject_fake):
-    # #1: dated, in this session;  #2: undated, in this session
+    # #1: dated, in this session;  #2: undated, in this session (distinct title so the
+    # create-time dedup guard doesn't fold it into a comment on #1)
     main(_create_argv() + ["--due", "2026-07-01"])
-    main(_create_argv())
+    main(_create_argv(**{"--title": "Add a second, unrelated thing"}))
     capsys.readouterr()
     rc = main(["gantt", "--no-pager"])
     out = capsys.readouterr().out
@@ -875,8 +951,9 @@ def test_gantt_renders_dated_and_undated(capsys, _inject_fake):
 
 
 def test_gantt_json_timeline_shape(capsys, _inject_fake):
+    # distinct titles so the create-time dedup guard doesn't fold #2 into a comment on #1
     main(_create_argv() + ["--due", "2026-07-01"])
-    main(_create_argv())  # undated
+    main(_create_argv(**{"--title": "Add a second, unrelated thing"}))  # undated
     capsys.readouterr()
     rc = main(["gantt", "--json", "--width", "30"])
     out = capsys.readouterr().out
@@ -2177,7 +2254,6 @@ def test_notification_disabled_by_config(monkeypatch, _inject_fake):
     calls = _patch_notify(monkeypatch)
     # Inject notifications.on_mutation: false into the loaded config
     from tasklib import cli as _cli
-    from tasklib.config import LoadedConfig
 
     orig_load = _cli._load
 
