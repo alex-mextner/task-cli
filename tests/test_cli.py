@@ -243,6 +243,13 @@ def test_create_blocks_close_duplicate_title_without_force(capsys, _inject_fake)
     assert "#1" in out  # identifies the matching existing ticket
     assert "duplicate" in out
     assert len(_inject_fake.list()) == 1  # no second ticket was created
+    # Alex's explicit requirement (tg#10993): the block must not just say "a duplicate exists" —
+    # it must hand the caller the actual next command, not just prose ("update/comment on #1").
+    # The id is single-quoted (review finding, Fable): `task read #1` pasted bare into a shell
+    # has `#1` swallowed as a comment (`bash -c 'echo hi #1'` prints only "hi") — quoting keeps
+    # the suggested command actually copy-paste-safe while task-cli still receives plain `#1`.
+    assert "task change '#1' ..." in out  # the edit command, spelled out and paste-safe
+    assert "task read '#1'" in out  # the view command, spelled out and paste-safe
 
 
 def test_create_force_bypasses_duplicate_block(capsys, _inject_fake):
@@ -261,6 +268,175 @@ def test_create_distinct_title_is_not_flagged_as_duplicate(capsys, _inject_fake)
     rc = main(_create_argv(**{"--title": "Completely unrelated feature request for the sidebar"}))
     assert rc == 0
     assert len(_inject_fake.list()) == 2  # a genuinely distinct title is never blocked
+
+
+# ── "recent tickets" nicety after create (Alex tg#10993/#10995) ─────────────────────
+#
+# `task new` prints the 5 most recently created tickets from the last hour (this session's
+# sidecar, the same source `_refuse_if_duplicate`/`_session_attention_notice` already read),
+# including the just-created one. Time control follows this file's existing convention (see
+# `_write_session_touch` above / `test_list_future_sidecar_timestamp_is_not_recent`): compute a
+# deterministic offset from a single real `time.time()` read at test setup and assert
+# immediately — no sleep, no literal clock mock (none exists elsewhere in this file either).
+
+
+def _append_session_touch(session_id: str, ticket_id: str, title: str, ts: int) -> None:
+    """Append (not overwrite) one raw sidecar line — lets a test seed several entries with
+    distinct, explicit timestamps, unlike `_write_session_touch` above which replaces the
+    whole file (fine for its single-entry tests, not for these multi-entry ones)."""
+    import json
+
+    from tasklib.session import sidecar_path
+
+    path = sidecar_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"id": ticket_id, "title": title, "ts": ts}) + "\n")
+
+
+def test_create_prints_5_most_recent_tickets_including_the_new_one(capsys, _inject_fake):
+    import time
+
+    now = int(time.time())
+    for i, age in enumerate((100, 200, 300, 400), start=10):
+        _append_session_touch("testsess", f"#{i}", f"Old ticket {i}", now - age)
+
+    rc = main(_create_argv(**{"--title": "Newest ticket"}))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Recent tickets" in out
+    assert "last hour" in out
+    for i in (10, 11, 12, 13):
+        assert f"#{i}  Old ticket {i}" in out
+    assert "#1  Newest ticket" in out  # the just-created ticket itself, not just any "#1..." prefix
+    # newest-first: the just-created ticket (age ~0) leads, then oldest-to-newest among the
+    # seeded ones is age 100 < 200 < 300 < 400, so #10 comes right after #1 and #13 comes last.
+    assert (
+        out.index("#1  Newest ticket")
+        < out.index("#10  Old ticket 10")
+        < out.index("#11  Old ticket 11")
+        < out.index("#12  Old ticket 12")
+        < out.index("#13  Old ticket 13")
+    )
+
+
+def test_create_recent_tickets_breaks_same_second_ties_by_append_order(capsys, _inject_fake):
+    # Two tickets touched in the same wall-clock second (a fast agent batch, or a `create`
+    # whose own `int(time.time())` lands on the same second as a seeded entry) must not
+    # silently fall back to "whichever line happened to be appended first" for the "newest
+    # first" contract — the more-recently-APPENDED entry (later sidecar line) must lead.
+    import time
+
+    now = int(time.time())
+    _append_session_touch("testsess", "#10", "Older same-second ticket", now)
+    _append_session_touch("testsess", "#11", "Newer same-second ticket", now)
+
+    rc = main(_create_argv(**{"--title": "Newest ticket"}))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    section = out.split("Recent tickets", 1)[1]
+    # append order was #10 then #11 then the just-created ticket — reverse of that is the
+    # required display order despite every ts above tying at `now`.
+    assert (
+        section.index("#1  Newest ticket")
+        < section.index("#11  Newer same-second ticket")
+        < section.index("#10  Older same-second ticket")
+    )
+
+
+def test_create_recent_tickets_caps_at_5_even_with_more_in_window(capsys, _inject_fake):
+    import time
+
+    now = int(time.time())
+    # 6 old entries all within the hour + the new one = 7 candidates; only the 5 most recent
+    # (the new one + the 4 freshest olds) may show — #15 (the oldest of the 6) must be cut.
+    for i, age in enumerate((100, 200, 300, 400, 500, 600), start=10):
+        _append_session_touch("testsess", f"#{i}", f"Old ticket {i}", now - age)
+
+    rc = main(_create_argv(**{"--title": "Newest ticket"}))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    section = out.split("Recent tickets", 1)[1]
+    for i in (10, 11, 12, 13):
+        assert f"#{i}  Old ticket {i}" in section
+    assert "#14  Old ticket 14" not in section  # 5th-oldest — bumped past the 5-cap
+    assert "#15  Old ticket 15" not in section  # 6th-oldest — bumped past the 5-cap
+    assert "#1  Newest ticket" in section
+
+
+def test_create_recent_tickets_excludes_one_older_than_an_hour(capsys, _inject_fake):
+    import time
+
+    now = int(time.time())
+    _append_session_touch("testsess", "#10", "Within the window", now - 100)
+    _append_session_touch("testsess", "#11", "Also within the window", now - 200)
+    _append_session_touch("testsess", "#12", "Two hours old", now - 7200)  # outside the 1h window
+
+    rc = main(_create_argv(**{"--title": "Newest ticket"}))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    section = out.split("Recent tickets", 1)[1]
+    assert "#10" in section
+    assert "#11" in section
+    assert "#12" not in section  # older than 1h — excluded even though it'd fit in the top 5
+    assert "Two hours old" not in section
+
+
+def test_create_recent_tickets_shows_fewer_than_5_without_erroring(capsys, _inject_fake):
+    rc = main(_create_argv())  # nothing pre-seeded; only the ticket just created falls in the window
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Recent tickets" in out
+    section = out.split("Recent tickets", 1)[1]
+    assert "#1  Add a thing" in section
+    # exactly one entry line — no padding, no error
+    assert section.count("#1  Add a thing") == 1
+
+
+def test_create_recent_tickets_absent_when_session_undetected(capsys, tmp_path, monkeypatch, _inject_fake):
+    # No `TASK_SESSION` and `-C` points at a non-git dir → session.source == "none". An
+    # unresolved session always collapses to the SAME sidecar id ("default"), shared by every
+    # repo where detection fails — seed it with another "project"'s ticket to prove this
+    # create does NOT leak it (review finding: the first cut of this feature had no such
+    # guard, unlike `_session_attention_notice`'s pre-existing one for the same sidecar).
+    monkeypatch.delenv("TASK_SESSION", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_current_project_overlay",
+        lambda cfg: ("acme/here", {"backend": "github-issues", "github": {"repo": "acme/here"}}),
+    )
+    import time
+
+    _append_session_touch("default", "#99", "Unrelated project's ticket", int(time.time()) - 60)
+
+    rc = main(_create_argv(**{"-C": str(tmp_path)}))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Recent tickets" not in out
+    assert "#99" not in out
+
+
+def test_create_recent_tickets_fail_soft_on_sidecar_read_error(capsys, monkeypatch, _inject_fake):
+    # A sidecar read blowing up (corrupt file, permissions, whatever) must never turn a
+    # successful create into a reported failure — matches `_print_session_attention_after_
+    # mutation`'s existing fail-soft contract for the sibling sidecar-backed notice.
+    events = []
+    monkeypatch.setattr("tasklib.logging.log_event", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr("tasklib.session.read_entries", lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+
+    rc = main(_create_argv())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "created #1" in out
+    assert "Recent tickets" not in out
+    assert any(a[0] == "recent_tickets.skipped" for a, _k in events)
 
 
 def test_create_dedup_scoped_to_session_not_global(capsys, monkeypatch, _inject_fake):

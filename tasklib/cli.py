@@ -711,10 +711,17 @@ def _refuse_if_duplicate(backend, session, force_reason: str | None, ticket: Tic
     if force_reason:
         ticket.skips.setdefault(GATE_DUPLICATE, force_reason)
         return
+    # Quote the id (`'#1'`, not bare `#1`): pasted bare into a shell, `#1` is swallowed as a
+    # comment (`#` starts a comment wherever a new word may begin, e.g. `bash -c 'echo hi #1'`
+    # prints only "hi") — quoting keeps these suggestions actually copy-paste-safe while
+    # task-cli still receives the identical plain `#1` argument once the shell strips the quotes.
     raise _UserError(
         f"a close-duplicate ticket already exists: {match.id}  {match.title}\n"
         f"  url: {match.url}\n"
-        f'  fix: pass --force "<reason>" to create anyway, or update/comment on {match.id} instead'
+        f"  next steps:\n"
+        f"    task read '{match.id}'                    view it\n"
+        f"    task change '{match.id}' ...               edit it instead of creating a new one\n"
+        f'    task new ... --force "<reason>"          create anyway (records the override)'
     )
 
 
@@ -1079,6 +1086,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         print(json.dumps(_ticket_dict(created), ensure_ascii=False, indent=2))
     else:
         print(_ok(f"created {created.id}  {created.url}"))
+        _print_recent_tickets_after_create(session)
         _print_session_attention_after_mutation(args, cfg, backend, current_id=created.id)
     return 0
 
@@ -1091,6 +1099,8 @@ _STALE_WARNING_SECONDS = 4 * 60 * 60
 _RECENT_WARNING_SECONDS = 30 * 60
 _ATTENTION_STATES = {State.TODO, State.IN_PROGRESS, State.IN_REVIEW}
 _RECENT_PRIORITY_STATES = {State.IN_PROGRESS, State.IN_REVIEW}
+_RECENT_TICKETS_LIMIT = 5
+_RECENT_TICKETS_WINDOW_SECONDS = 60 * 60
 
 
 def _effective_limit(args: argparse.Namespace) -> int:
@@ -1214,6 +1224,69 @@ def _session_attention_notice(session, tickets: list[Ticket], *, priority_change
         lines.append(_dim("  recently touched active task: ask whether to continue it or park it before switching priorities:"))
         lines.extend(_dim(f"    - {_attention_line(ticket, age)}") for ticket, age in recent[:3])
     return "\n".join(lines)
+
+
+def _recent_tickets_block(session) -> str:
+    """The 'Recent tickets (last hour)' block printed after a successful `task new`/`create`
+    (Alex, tg#10993/#10995): up to 5 tickets created in this session within the last hour,
+    newest first, the just-created one included.
+
+    Reuses the session sidecar (:mod:`tasklib.session`) — the same local, offline record
+    `_refuse_if_duplicate` and `_session_attention_notice` already read — rather than a fresh
+    backend query, so this costs no extra network round-trip. Note the same caveat
+    `_session_attention_notice` already documents for this sidecar: ``SessionEntry.ts`` is when
+    task-cli last TOUCHED the ticket in this session, not a pure creation timestamp. In practice
+    an entry is written once, at `record()`-after-create time, and only moves if a later
+    `change`/`done`/`check` in the SAME session touches that SAME ticket again — an accepted
+    approximation, not a new one invented for this feature.
+
+    ``session.source == "none"`` (no `TASK_SESSION`/tmux pane/git branch resolved) short-
+    circuits to ``""``, mirroring `_session_attention_notice`'s own guard: an unresolved
+    session always collapses to the SAME ``id="default"`` sidecar file, shared by every repo
+    where detection fails — without this guard, "recent tickets" could leak a completely
+    unrelated project's tickets into this one's `create` output.
+
+    Bounded by BOTH the count (5) AND a genuinely fixed 1-hour window — deliberately NOT
+    configurable (an earlier `TASK_RECENT_TICKETS_WINDOW_SECONDS` override made the hardcoded
+    "(last hour)" header lie under a different value; Alex's ask was a fixed hour, so the
+    header just stays honest instead). Returns ``""`` when nothing falls in the window (never
+    happens right after a successful create: the ticket just created is always inside its own
+    window).
+    """
+    if session.source == "none":
+        return ""
+    from .session import read_entries
+
+    entries = read_entries(session.id)
+    now = int(time.time())
+    in_window = [e for e in entries if e.ts > 0 and 0 <= now - e.ts <= _RECENT_TICKETS_WINDOW_SECONDS]
+    # `entries` is oldest-appended-first (session.py: "newest-last"). At 1-second `ts`
+    # resolution, two touches in the same second are a real case (a fast create batch, or the
+    # just-created ticket landing in the same second as a seeded one) — a plain
+    # `sorted(..., reverse=True)` is stable and would keep ties in oldest-appended-first order,
+    # silently violating "newest first". Break ties by original (append) position instead.
+    by_recency = sorted(enumerate(in_window), key=lambda pair: (pair[1].ts, pair[0]), reverse=True)
+    recent = [entry for _, entry in by_recency][:_RECENT_TICKETS_LIMIT]
+    if not recent:
+        return ""
+    lines = [_dim("Recent tickets (last hour):")]
+    lines.extend(_dim(f"  {e.id}  {e.title}") for e in recent)
+    return "\n".join(lines)
+
+
+def _print_recent_tickets_after_create(session) -> None:
+    """Best-effort wrapper around `_recent_tickets_block`: a sidecar hiccup must never turn a
+    successful `create` into a failure — mirrors `_print_session_attention_after_mutation`'s
+    same fail-soft contract for the sibling session-sidecar-backed notice."""
+    try:
+        block = _recent_tickets_block(session)
+    except Exception as exc:
+        from .logging import log_event
+
+        log_event("recent_tickets.skipped", error=type(exc).__name__)
+        return
+    if block:
+        print(block)
 
 
 def _record_session_touch(cfg, ticket: Ticket) -> None:
