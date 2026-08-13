@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import pytest
 
-from tasklib.backends import BackendError
+from tasklib.backends import AmbiguousBackendError, BackendError, EXIT_AMBIGUOUS
 from tasklib.backends.github_issues import GitHubIssuesBackend, _api_root, _parse_remote
+from tasklib.backends.http import AmbiguousHttpError
 from tasklib.model import State, Ticket
 
 from .conftest import assert_protocol
@@ -676,3 +677,62 @@ def test_linear_current_user_returns_none_on_non_dict_viewer(monkeypatch, bad_vi
 
     monkeypatch.setattr(be, "_gql", lambda query, variables=None: {"viewer": bad_viewer})
     assert be.current_user() is None
+
+
+# ── ambiguous read failure (task-cli bug 1: a crash after a successful create) ──────────────
+
+
+def test_github_call_wraps_ambiguous_http_error(monkeypatch):
+    # request_json raising AmbiguousHttpError (the connection dropped mid-read after a 2xx —
+    # see test_http.py) must surface through _call as the distinctly-typed AmbiguousBackendError,
+    # not the generic BackendError every other failure funnels into.
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    monkeypatch.setattr(
+        "tasklib.backends.github_issues.request_json",
+        lambda *a, **kw: (_ for _ in ()).throw(AmbiguousHttpError("status 201 was already returned")),
+    )
+    with pytest.raises(AmbiguousBackendError) as exc:
+        be._call("https://api.github.com/repos/o/r/issues", method="POST")
+    assert "201" in str(exc.value)
+
+
+def test_github_call_ambiguous_error_is_not_caught_as_backend_error(monkeypatch):
+    # the whole point of the separate type: a bare `except BackendError` (used by nearly every
+    # other call site in cli.py) must NOT swallow this — that bucket means "nothing happened".
+    be = GitHubIssuesBackend(owner="o", repo="r", token="t")
+    monkeypatch.setattr(
+        "tasklib.backends.github_issues.request_json",
+        lambda *a, **kw: (_ for _ in ()).throw(AmbiguousHttpError("boom")),
+    )
+    try:
+        be._call("url", method="POST")
+    except BackendError:
+        pytest.fail("AmbiguousBackendError must not be catchable as BackendError")
+    except AmbiguousBackendError:
+        pass
+
+
+def test_linear_gql_wraps_ambiguous_http_error(monkeypatch):
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    monkeypatch.setattr(
+        "tasklib.backends.linear.request_json",
+        lambda *a, **kw: (_ for _ in ()).throw(AmbiguousHttpError("status 200 was already returned")),
+    )
+    with pytest.raises(AmbiguousBackendError):
+        be._gql("mutation { issueCreate { success } }")
+
+
+def test_exit_ambiguous_does_not_collide_with_agenttools_errors_contract():
+    # unlike EXIT_ILLEGAL_TRANSITION (which deliberately pins to the shared EXIT_USAGE), this
+    # code is deliberately NOT aliased to anything in agenttools_errors — review finding: the
+    # closest-sounding shared class, EXIT_NETWORK (7), documents itself as the safe-to-retry
+    # class ("DNS, timeout, 5xx"), and this exception means the opposite (verify before
+    # retrying). Assert no accidental collision with ANY shared code, not just EXIT_NETWORK, so a
+    # future contract addition can't silently start meaning "safe to retry" for this value too.
+    try:
+        from agenttools_errors import EXIT_CODES
+    except Exception:  # noqa: BLE001 - shared lib optional in this env
+        pytest.skip("agenttools_errors not installed")
+    assert EXIT_AMBIGUOUS not in EXIT_CODES

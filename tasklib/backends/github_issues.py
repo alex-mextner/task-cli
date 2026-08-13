@@ -16,8 +16,8 @@ from dataclasses import dataclass
 
 from ..model import State, Ticket
 from ..render import parse, render
-from . import BackendError
-from .http import HttpError, request_json
+from . import AmbiguousBackendError, BackendError
+from .http import AmbiguousHttpError, HttpError, request_json
 
 # Default to public GitHub; honor GITHUB_API_URL the same way gh/octokit do, so a GitHub
 # Enterprise host (https://ghe.example.com/api/v3) — or a hermetic mock server in a test
@@ -95,6 +95,11 @@ class GitHubIssuesBackend:
     def _call(self, url: str, *, method: str = "GET", payload=None):
         try:
             return request_json(url, method=method, headers=self._headers(), payload=payload)
+        except AmbiguousHttpError as exc:
+            # caught BEFORE HttpError on purpose: AmbiguousHttpError is not an HttpError
+            # subclass (see its docstring), so this branch only exists to give it its own,
+            # distinctly-typed wrapper rather than falling through to the generic one below.
+            raise AmbiguousBackendError(f"github: {exc}") from exc
         except HttpError as exc:
             raise BackendError(f"github: {exc} {exc.body}".strip()) from exc
 
