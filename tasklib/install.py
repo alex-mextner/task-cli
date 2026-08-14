@@ -99,6 +99,31 @@ task session                     # show current session + its tickets
 - **Paged like git**: `list`/`find` page through `less` only on an interactive terminal;
   piped/scripted output is plain text. Cap is 100 interactive / 30 piped (override with `-n`).
   Disable with `--no-pager`, `NO_PAGER`, or empty `$PAGER`. `--json` is never paged.
+- **Exit codes — don't treat every non-zero the same way**: **2 does not guarantee nothing
+  was sent to the backend.** Most of the time it's a clean policy-gate refusal (safe to fix the
+  message and retry), but `task new`/`task create` also map a `BackendError` to the same exit
+  2 (e.g. the backend rejected the request after receiving it) — if the message doesn't read
+  like a policy-gate refusal, check `task list` before blindly retrying, same caution as exit 9
+  below. **9** from `task new`/`task create` means the request to the backend was ambiguous
+  (the connection dropped while reading the response, AFTER the backend may already have
+  accepted it) — the ticket may already exist. On exit 9, always run `task list` (or check the
+  backend directly) before retrying, rather than assuming the create failed — a blind retry can
+  create a duplicate ticket. `task new` also refuses (exit 2) on a detected close-duplicate
+  title in the current session; the refusal message names the matching ticket's id/title/url
+  and the exact follow-up commands, IDs quoted since a bare `#N` is a shell comment unquoted
+  (`task read '#N'`, `task change '#N' ...`, or `task new ... --force "<reason>"` to create
+  anyway).
+- **"Recent tickets (last hour)"**: best-effort, not guaranteed — after a successful `task
+  new`/`create` (non-`--json`) with a detected, readable session, the CLI prints up to 5
+  tickets *touched* in this session within the last hour, newest first, including the one just
+  created; an older ticket you just revisited (`change`/`done`/`check`) can appear here too, not
+  only ones freshly created. Silently absent when session detection fails or the sidecar can't
+  be read. Treat it as a human nicety, not a stable machine format.
+- **No host harness's own in-session/ephemeral task list is a substitute for a task-cli
+  ticket**, in any harness — it is never a source of truth for whether external work
+  succeeded; a ticket in task-cli is the durable record of work. In Claude Code specifically,
+  the built-in in-session tracker is called **TaskList** — name it by that name there, not a
+  vague "internal list/tracker of tasks".
 """
 
 # One-line SessionStart blurb, same shape the siblings (draw/tg/review) use. The hook cats
