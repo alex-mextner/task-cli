@@ -35,6 +35,21 @@ RIG_CONFIG_FILENAME = "rig.yaml"
 
 VALID_BACKENDS = {"github-issues", "linear"}
 
+# How a screenshot/file gets attached to a Linear ticket (tg#11652, CTO decision):
+#   "native" — upload the bytes through Linear's OWN authenticated GraphQL API
+#              (fileUpload + attachmentCreate; see backends/linear.py) so the ticket carries a
+#              real Linear attachment object with an inline preview. This is the DEFAULT: it is
+#              the properly-fixed path (no 401 — see the module docstring on backends/linear.py
+#              for why the earlier "any non-browser consumer 401s" finding does NOT apply here).
+#   "link"   — never touch Linear's upload API for a local file. If the ref is ALREADY a hosted
+#              URL (e.g. a GitHub PR asset, or a PR's `#screenshots` anchor) it is registered as
+#              an external-link attachment as-is. A bare local path in this mode has nothing to
+#              link to and is skipped (best-effort, see `_attach_screenshots`'s existing swallow).
+#              hyperide pins this mode (HYP-1248): raw pasted-image `uploads.linear.app` URLs are
+#              session-scoped and 401 for a non-browser viewer, so hyperide's own mitigation is to
+#              link out to the PR's `#screenshots` section instead of embedding/uploading an image.
+VALID_ATTACHMENT_MODES = {"link", "native"}
+
 
 class ConfigError(ValueError):
     """Raised on a malformed/invalid config (fail-closed before any backend call)."""
@@ -57,11 +72,13 @@ def rig_config_path(repo_root: Path) -> Path:
 # Aliases in the rig.yaml ``task:`` block → the dotted path they map onto in task-cli's own
 # config shape. The block is intentionally flat (a CTO drops `task: {backend: linear, team:
 # HYP}` into rig.yaml without learning task-cli's nesting), so we translate the shorthands.
-# ``team``/``project`` are Linear coordinates; ``repo`` is the GitHub coordinate.
+# ``team``/``project`` are Linear coordinates; ``repo`` is the GitHub coordinate;
+# ``attachment_mode`` is the Linear screenshot-attach strategy (see ``VALID_ATTACHMENT_MODES``).
 _RIG_TASK_ALIASES: dict[str, tuple[str, ...]] = {
     "team": ("linear", "team"),
     "project": ("linear", "project"),
     "repo": ("github", "repo"),
+    "attachment_mode": ("linear", "attachment_mode"),
 }
 # Keys passed through verbatim (same name in both shapes): the backend selector + the nested
 # sections a power user might want to override straight from rig.yaml. ``version`` is
@@ -154,7 +171,7 @@ DEFAULTS: dict[str, Any] = {
     "version": 1,
     "backend": "github-issues",
     "github": {"repo": "auto", "default_labels": ["agent"]},
-    "linear": {"team": "", "project": ""},
+    "linear": {"team": "", "project": "", "attachment_mode": "native"},
     "enforce": {
         "acceptance_criteria": "required",
         "motivation": "required",
@@ -296,6 +313,12 @@ class LoadedConfig:
         return str(self.section("classify").get("bias", "change"))
 
     @property
+    def linear_attachment_mode(self) -> str:
+        """``"native"`` (real Linear attachment upload) or ``"link"`` (never re-host a local
+        file; only register an already-hosted URL). See :data:`VALID_ATTACHMENT_MODES`."""
+        return str(self.section("linear").get("attachment_mode", "native"))
+
+    @property
     def session_detect(self) -> tuple[str, ...]:
         raw = self.section("session").get("detect")
         if isinstance(raw, list) and raw:
@@ -406,3 +429,12 @@ def validate(data: dict[str, Any]) -> None:
     for key in ("github", "linear", "enforce", "classify", "session"):
         if key in data and not isinstance(data[key], dict):
             raise ConfigError(f"'{key}' must be a mapping")
+
+    linear = data.get("linear")
+    if isinstance(linear, dict) and "attachment_mode" in linear:
+        mode = linear["attachment_mode"]
+        # Same isinstance-before-membership guard as `backend` above: a malformed
+        # `linear.attachment_mode` (dict/list) must fail-closed with a clean ConfigError, not a
+        # raw TypeError from the `in` check against the (unhashable-safe) set.
+        if not isinstance(mode, str) or mode not in VALID_ATTACHMENT_MODES:
+            raise ConfigError(f"linear.attachment_mode must be one of {sorted(VALID_ATTACHMENT_MODES)}, got {mode!r}")

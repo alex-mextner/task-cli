@@ -148,8 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
     # read / view
     rp = sub.add_parser("read", parents=[common], help="show a full ticket")
     rp.add_argument("id", help="ticket id (#123 or HYP-456)")
+    rp.add_argument(
+        "--save-attachments",
+        metavar="DIR",
+        help="download each native attachment's bytes into DIR (Linear only; "
+        "authenticates the fetch so a uploads.linear.app asset doesn't 401 — see "
+        "backends/linear.py:fetch_attachment_bytes)",
+    )
     vp = sub.add_parser("view", parents=[common], help="alias of read")
     vp.add_argument("id", help="ticket id")
+    vp.add_argument("--save-attachments", metavar="DIR", help="see `task read --help`")
 
     # find
     fp = sub.add_parser("find", parents=[common], help="search tickets (title+body)")
@@ -572,7 +580,7 @@ def _print_tickets_json(tickets: list[Ticket]) -> None:
 
 
 def _ticket_dict(t: Ticket) -> dict:
-    return {
+    d = {
         "id": t.id,
         "title": t.title,
         "state": t.state.value,
@@ -581,6 +589,15 @@ def _ticket_dict(t: Ticket) -> dict:
         "what": t.what,
         "due": t.due,
     }
+    # Only emitted when the backend actually returned any (Linear; GitHub never populates this)
+    # — keeps the JSON shape unchanged for every existing consumer that doesn't care about it.
+    if t.attachments:
+        d["attachments"] = [{"id": a.id, "title": a.title, "url": a.url, "subtitle": a.subtitle} for a in t.attachments]
+        # review finding: human output already warns about the 250-item cap — a JSON consumer
+        # (`--json`) must get the SAME signal, not silently treat a capped list as complete.
+        if t.attachments_truncated:
+            d["attachments_truncated"] = True
+    return d
 
 
 # ── policy enforcement helper (shared by create + change/close) ─────────────────────
@@ -1715,6 +1732,175 @@ def cmd_gantt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sanitize_attachment_basename(title: str) -> str:
+    """Strip ``title`` (tracker-owned, untrusted data) down to a safe, bare filename component
+    — no path traversal possible, on ANY platform, into ``--save-attachments DIR``.
+
+    review finding: a naive ``title.replace(os.sep, "_")`` only strips the CURRENT platform's
+    separator — on POSIX that's ``/`` (safe), but on Windows ``os.sep`` is ``\\`` while ``/`` is
+    ALSO a valid separator there (``os.altsep``), so a title like ``../outside.txt`` would
+    survive untouched and ``os.path.join(dest_dir, "../outside.txt")`` would escape ``dest_dir``.
+    Fixed by hardcoding BOTH slash characters (not deriving from the running platform's
+    ``os.sep``/``os.altsep`` — the title could theoretically be crafted on one platform and read
+    back on another, e.g. a synced dotfiles-style config) and by rejecting the bare
+    ``.``/``..``/empty results a slash-strip alone can still produce (a title of exactly ``".."``
+    has no separator to strip, but would still resolve to ``dest_dir``'s PARENT as a path).
+
+    Also strips NUL and other C0 control characters (review finding, 2nd round): a title like
+    ``"\\0"`` isn't a traversal attempt, but NUL is illegal in a POSIX filename and ``os.link``
+    raises ``ValueError`` (not ``OSError``) for it — a value ``_write_attachment_exclusive``'s
+    caller specifically wasn't catching, so it would crash the command instead of being reported
+    as one failed attachment.
+    """
+    stripped = title.replace("/", "_").replace("\\", "_").strip()
+    stripped = "".join(c for c in stripped if ord(c) >= 0x20 and c != "\x7f")
+    if stripped in ("", ".", ".."):
+        return ""
+    return stripped
+
+
+def _unique_attachment_filenames(attachments, existing: frozenset = frozenset()) -> dict:
+    """``{id(attachment): filename}`` with a ``-2``/``-3``/… suffix on any REPEATED title
+    (review finding: two attachments can share a title — e.g. two screenshots both named
+    ``screenshot.png`` — and writing both to the same bare filename silently drops the first).
+
+    Guards against a SECOND review finding on top of that: a naive "count occurrences of this
+    title" scheme can itself collide when a later attachment's OWN title happens to equal an
+    earlier DEDUPED name (titles in order ``screenshot.png``, ``screenshot-2.png``,
+    ``screenshot.png`` would naively produce ``screenshot.png``, ``screenshot-2.png``,
+    ``screenshot-2.png`` — the 2nd and 3rd collide). Fixed by tracking the set of names ACTUALLY
+    assigned so far and bumping the suffix until the candidate is free, not just counting how
+    many times the original title has been seen.
+
+    ``existing`` (review finding, 3rd round): filenames ALREADY present in the destination
+    directory before this run — a tracker-controlled attachment title matching a pre-existing
+    file in the user's chosen directory must not silently overwrite it. Those names are seeded
+    into the same "already taken" set, so a colliding title gets a ``-N`` suffix exactly like an
+    in-batch collision, rather than reusing the exact target name.
+
+    Keyed by ``id()`` rather than the ``Attachment`` object itself: it's a plain (unfrozen)
+    dataclass, so it's unhashable — this is only ever looked up against the SAME list within one
+    ``_save_attachments`` call, so identity is a safe, cheap key.
+    """
+    import os
+
+    assigned: set[str] = set(existing)
+    names: dict = {}
+    for a in attachments:
+        # review finding: `a.id` is ALSO tracker-controlled data (the same trust boundary as
+        # `a.title`) — falling back to it raw would bypass the sanitizer entirely and reopen the
+        # exact traversal hole it exists to close.
+        base = _sanitize_attachment_basename(a.title) or _sanitize_attachment_basename(a.id) or "attachment"
+        stem, ext = os.path.splitext(base)
+        candidate = base
+        n = 1
+        while candidate in assigned:
+            n += 1
+            candidate = f"{stem}-{n}{ext}"
+        assigned.add(candidate)
+        names[id(a)] = candidate
+    return names
+
+
+def _write_attachment_exclusive(dest_dir: str, dest_path: str, data: bytes) -> None:
+    """Publish ``data`` at ``dest_path`` atomically: write it COMPLETE to a temp file in
+    ``dest_dir`` first, then hard-link the temp file to ``dest_path`` (fails with
+    ``FileExistsError`` if anything — a file, a symlink, a race since the caller's
+    pre-existing-name scan — already sits at that name; never overwrites, never follows a
+    symlink), and always remove the temp file afterward.
+
+    review finding: writing straight to ``dest_path`` with ``open(..., "xb")`` means a write
+    that fails PARTWAY (e.g. disk-full mid-write) leaves a truncated, corrupt file already
+    claiming ``dest_path``'s name — a retry would then treat that name as "already taken" and
+    save the real bytes under a spurious ``-2`` name instead of the intended one. Publishing via
+    a hard link only after the FULL write succeeded means a failed write leaves no trace at
+    ``dest_path`` at all.
+    """
+    import os
+    import tempfile
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".attach-")
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            f.write(data)
+        os.link(tmp_path, dest_path)
+    finally:
+        os.unlink(tmp_path)
+
+
+def _save_attachments(backend, ticket, dest_dir: str) -> list[str]:
+    """Download each of ``ticket.attachments`` into ``dest_dir``, via the backend's own
+    authenticated fetch (Linear's ``fetch_attachment_bytes`` — the actual "read" half of
+    ``attachment_mode: native": a plain unauthenticated GET against a ``uploads.linear.app``
+    asset 401s, see ``backends/linear.py``'s module docstring). Returns one status line per
+    attachment (success or failure) for the caller to print; best-effort per-file, like
+    ``_attach_screenshots`` on the write side — one bad attachment (a fetch failure OR a local
+    filesystem error: permission denied, full disk) must not abort the rest.
+
+    Backends that don't implement the method (GitHub — no native-attachment dichotomy there)
+    are skipped with an explicit line rather than an ``AttributeError``.
+
+    Only fetches attachments the backend confirms as its OWN native asset
+    (``is_native_attachment_url``): an attachment's ``url`` is tracker-owned data, not something
+    this process constructed, so blindly fetching every attachment url would let a
+    malicious/compromised ticket make this CLI probe arbitrary hosts (or, without the scheme
+    check in `fetch_attachment_bytes`, read a local file). An external (``link``-mode)
+    attachment is reported, not fetched — the URL is already right there in the printed line for
+    the user to open directly. review finding (2nd round): a backend that implements
+    ``fetch_attachment_bytes`` but NOT ``is_native_attachment_url`` must NOT default to "trust
+    everything" (that inverts the whole point of the capability check) — it fails CLOSED
+    (nothing gets auto-fetched) until that backend explicitly opts in.
+    """
+    fetch = getattr(backend, "fetch_attachment_bytes", None)
+    if fetch is None:
+        return [f"  (backend {backend.name!r} has no native attachment fetch — nothing to save)"]
+    is_native = getattr(backend, "is_native_attachment_url", None)
+
+    import os
+
+    from .backends import AmbiguousBackendError, BackendError
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        # review finding: reserve names already on disk too, so a tracker-controlled attachment
+        # title matching a pre-existing file in the user's chosen directory doesn't overwrite it.
+        existing = frozenset(os.listdir(dest_dir))
+    except OSError as exc:
+        return [f"  ✗ cannot create/list {dest_dir}: {exc}"]
+
+    lines = []
+    to_fetch = []
+    for a in ticket.attachments:
+        if is_native is None or not is_native(a.url):
+            lines.append(f"  (skipped, external/unconfirmed link — open directly) {a.title}: {a.url}")
+        else:
+            to_fetch.append(a)
+    # review finding: naming ALL attachments (including skipped ones) let a skipped external
+    # attachment's title consume a name slot, giving a later NATIVE attachment a spurious `-2`
+    # suffix for no reason the user could see. Only the ones actually being fetched compete for
+    # names.
+    filenames = _unique_attachment_filenames(to_fetch, existing)
+    for a in to_fetch:
+        dest_path = os.path.join(dest_dir, filenames[id(a)])
+        try:
+            data = fetch(a.url)
+            _write_attachment_exclusive(dest_dir, dest_path, data)
+        # ValueError alongside OSError: review finding — os.link/open can raise ValueError (not
+        # OSError) for some illegal-filename byte sequences (a NUL that survived sanitization on
+        # a platform-specific edge case, say); belt-and-suspenders on top of
+        # `_sanitize_attachment_basename`'s own stripping, so a filesystem-level rejection is
+        # still reported as one failed attachment rather than crashing the whole command.
+        except (BackendError, AmbiguousBackendError, OSError, ValueError) as exc:
+            lines.append(f"  ✗ {a.title}: {exc}")
+            continue
+        lines.append(f"  ✓ {a.title} -> {dest_path} ({len(data)} bytes)")
+    # Deliberately NOT appending a truncation note here (review finding: it duplicated the one
+    # `cmd_read` already prints in the attachments listing) — `ticket.attachments_truncated` is
+    # the single source of truth, surfaced once in human output (cmd_read) and once in --json
+    # (`_ticket_dict`); a caller of this function directly can check the same field itself.
+    return lines
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     cfg = _load(args)
     backend = _backend_for_id(cfg, args.id)
@@ -1726,17 +1912,39 @@ def cmd_read(args: argparse.Namespace) -> int:
     except BackendError as exc:
         raise _UserError(str(exc)) from exc
 
+    save_dir = getattr(args, "save_attachments", None)
+    saved_lines = _save_attachments(backend, ticket, save_dir) if save_dir else []
+
     if args.json:
         import json
 
         d = _ticket_dict(ticket)
         d["body"] = render(ticket)
+        if save_dir:
+            d["saved_attachments"] = saved_lines
         print(json.dumps(d, ensure_ascii=False, indent=2))
         return 0
     print(_bold(f"{ticket.id}  {ticket.title}"))
     print(_dim(f"  state: {ticket.state.value}   {ticket.url}"))
     if ticket.labels:
         print(_dim(f"  labels: {', '.join(ticket.labels)}"))
+    if ticket.attachments:
+        # Real backend-native attachments (Linear "native" mode) — distinct from the body's
+        # `## Screenshots` section, which is only the local ref that was REQUESTED at attach
+        # time. `native` mode's own asset URL needs the same Authorization header any GraphQL
+        # call uses to fetch (see backends/linear.py's module docstring); a raw browser open of
+        # it will 401 like any other uploads.linear.app URL — that's expected, not a bug. Use
+        # `--save-attachments DIR` to fetch the real bytes through the authenticated path.
+        count_note = "+" if ticket.attachments_truncated else ""
+        print(_dim(f"  attachments ({len(ticket.attachments)}{count_note}):"))
+        for a in ticket.attachments:
+            print(_dim(f"    - {a.title}: {a.url}"))
+        if ticket.attachments_truncated:
+            print(_dim("    (more attachments exist beyond the 250-item cap — not all are listed)"))
+    if saved_lines:
+        print(_dim("  saved attachments:"))
+        for line in saved_lines:
+            print(_dim(line))
     print()
     print(render(ticket))
     return 0

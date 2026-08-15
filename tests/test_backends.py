@@ -339,6 +339,16 @@ def test_linear_node_to_ticket_maps_updated_at():
     assert be._node_to_ticket(node).updated_at == "2026-07-01T12:00:00.000Z"
 
 
+def test_linear_issue_fields_requests_attachments_beyond_default_page_size():
+    # review finding: Linear's `attachments` connection defaults to a 50-item page; without an
+    # explicit `first:`, a ticket with 51+ attachments would silently lose everything past the
+    # first page. Pin the query shape so a regression (someone drops the `first:250`) fails here
+    # rather than only manifesting as missing attachments in production.
+    from tasklib.backends.linear import LinearBackend
+
+    assert "attachments(first:250)" in LinearBackend._ISSUE_FIELDS
+
+
 def test_linear_list_query_requests_updated_at(monkeypatch):
     # test_linear_node_to_ticket_maps_updated_at above injects `updatedAt` directly into a hand
     # built node, so it would keep passing even if `_ISSUE_FIELDS` stopped requesting the field
@@ -736,3 +746,585 @@ def test_exit_ambiguous_does_not_collide_with_agenttools_errors_contract():
     except Exception:  # noqa: BLE001 - shared lib optional in this env
         pytest.skip("agenttools_errors not installed")
     assert EXIT_AMBIGUOUS not in EXIT_CODES
+
+
+# ── linear.attach — attachment_mode (link / native) and the fileUpload/attachmentCreate flow ──
+
+
+def _linear_gql_stub(monkeypatch, be, responses: dict[str, object]):
+    """Route ``be._gql`` calls to canned responses keyed by a substring of the query — mirrors
+    the file's existing ``fake_gql`` pattern but supports several distinct mutations in one test
+    (issueByIdentifier / attachmentCreate / fileUpload all fire inside a single ``attach()``)."""
+    calls = []
+
+    def fake_gql(query, variables=None):
+        calls.append((query, variables))
+        for needle, resp in responses.items():
+            if needle in query:
+                return resp
+        raise AssertionError(f"unexpected gql call: {query}")
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    return calls
+
+
+def test_linear_attach_hosted_url_registers_regardless_of_mode(monkeypatch):
+    # A ref that's already a URL (e.g. a GitHub PR asset) is always just registered as-is — no
+    # upload attempt, no mode branching — for BOTH attachment_mode values.
+    from tasklib.backends.linear import LinearBackend
+
+    for mode in ("link", "native"):
+        be = LinearBackend(api_key="k", team_key="HYP", attachment_mode=mode)
+        calls = _linear_gql_stub(
+            monkeypatch,
+            be,
+            {
+                "issue(id": {"issue": {"id": "internal-1"}},
+                "attachmentCreate": {"attachmentCreate": {"success": True}},
+            },
+        )
+        result = be.attach("HYP-1", "https://github.com/user-attachments/assets/abc")
+        assert result == "https://github.com/user-attachments/assets/abc"
+        create_calls = [v for q, v in calls if "attachmentCreate" in q]
+        assert create_calls == [{"input": {"issueId": "internal-1", "title": "abc", "url": "https://github.com/user-attachments/assets/abc"}}]
+
+
+def test_linear_attach_link_mode_local_path_raises_backend_error(monkeypatch):
+    # link mode has nothing to link a bare local path to — raise BackendError (the caller,
+    # cli._attach_screenshots, already swallows this as best-effort).
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="link")
+    _linear_gql_stub(monkeypatch, be, {"issue(id": {"issue": {"id": "internal-1"}}})
+    with pytest.raises(BackendError, match="attachment_mode=link"):
+        be.attach("HYP-1", "/tmp/shot.png")
+
+
+def test_linear_attach_hosted_url_registration_rejected_raises_backend_error(monkeypatch):
+    # review finding (missing test): attachmentCreate returning success=false for the
+    # ALREADY-HOSTED-URL path must raise, not silently report the ref as attached.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="link")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "attachmentCreate": {"attachmentCreate": {"success": False}},
+        },
+    )
+    with pytest.raises(BackendError, match="attachmentCreate"):
+        be.attach("HYP-1", "https://github.com/user-attachments/assets/abc")
+
+
+def test_linear_from_config_default_attachment_mode_is_native():
+    # review finding (missing test): the main behavioral change this feature introduces for
+    # EXISTING users — a repo with no `attachment_mode` set at all must get the real upload
+    # path (not the old no-op file:// registration) by default.
+    from pathlib import Path
+
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.config import DEFAULTS, LoadedConfig
+
+    data = {**DEFAULTS, "linear": {**DEFAULTS["linear"], "team": "HYP"}}
+    cfg = LoadedConfig(data=data, repo_root=Path("."))
+    be = LinearBackend.from_config(cfg, env={"LINEAR_API_KEY": "k"})
+    assert be.attachment_mode == "native"
+
+
+def test_linear_attach_native_mode_uploads_and_registers(monkeypatch, tmp_path):
+    # The real native path: fileUpload -> PUT the bytes to the signed URL (with Linear's exact
+    # headers) -> attachmentCreate with the returned assetUrl.
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n fake bytes")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    calls = _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "fileUpload": {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "assetUrl": "https://uploads.linear.app/asset-1",
+                        "uploadUrl": "https://storage.googleapis.com/signed-put-url",
+                        "headers": [{"key": "x-goog-content-length-range", "value": "20,20"}],
+                    },
+                }
+            },
+            "attachmentCreate": {"attachmentCreate": {"success": True}},
+        },
+    )
+    put_calls = []
+
+    def fake_request_bytes(url, *, method="GET", headers=None, data=None, timeout=60, same_host_redirects_only=False):
+        put_calls.append((url, method, dict(headers or {}), data, same_host_redirects_only))
+        return b""
+
+    monkeypatch.setattr("tasklib.backends.linear.request_bytes", fake_request_bytes)
+
+    result = be.attach("HYP-1", str(png))
+
+    assert result == "https://uploads.linear.app/asset-1"
+    assert len(put_calls) == 1
+    put_url, put_method, put_headers, put_body, put_redirects_guarded = put_calls[0]
+    assert put_url == "https://storage.googleapis.com/signed-put-url"
+    assert put_method == "PUT"
+    assert put_headers["x-goog-content-length-range"] == "20,20"
+    assert put_headers["Content-Type"] == "image/png"
+    assert put_body == png.read_bytes()
+    # review finding: consistency with fetch_attachment_bytes — the upload PUT also refuses a
+    # cross-host/downgrade redirect, even though this request carries no Authorization header.
+    assert put_redirects_guarded is True
+    create_calls = [v for q, v in calls if "attachmentCreate" in q]
+    assert create_calls == [{"input": {"issueId": "internal-1", "title": "shot.png", "url": "https://uploads.linear.app/asset-1"}}]
+
+
+def test_linear_attach_native_mode_upload_put_failure_raises_backend_error(monkeypatch, tmp_path):
+    from tasklib.backends import BackendError
+    from tasklib.backends.http import HttpError
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"x")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "fileUpload": {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {"assetUrl": "https://uploads.linear.app/asset-1", "uploadUrl": "https://signed", "headers": []},
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "tasklib.backends.linear.request_bytes",
+        lambda *a, **kw: (_ for _ in ()).throw(HttpError(403, "HTTP 403", "expired")),
+    )
+    with pytest.raises(BackendError, match="upload PUT"):
+        be.attach("HYP-1", str(png))
+
+
+def test_linear_attach_native_mode_upload_put_ambiguous_failure_raises_ambiguous_backend_error(monkeypatch, tmp_path):
+    # the connection-dropped-mid-read case (status already landed, bytes may have uploaded
+    # server-side with nothing pointing at them since attachmentCreate never ran) must surface
+    # as AmbiguousBackendError, not the generic BackendError every other failure funnels into —
+    # the same distinction _gql's own ambiguous-read handling makes.
+    from tasklib.backends import AmbiguousBackendError
+    from tasklib.backends.http import AmbiguousHttpError
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"x")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "fileUpload": {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {"assetUrl": "https://uploads.linear.app/asset-1", "uploadUrl": "https://signed", "headers": []},
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "tasklib.backends.linear.request_bytes",
+        lambda *a, **kw: (_ for _ in ()).throw(AmbiguousHttpError("status 200 was already returned")),
+    )
+    with pytest.raises(AmbiguousBackendError, match="upload PUT"):
+        be.attach("HYP-1", str(png))
+
+
+@pytest.mark.parametrize(
+    "file_upload_response",
+    [
+        {"fileUpload": {"success": True, "uploadFile": None}},
+        {"fileUpload": {"success": True}},  # uploadFile key missing entirely
+        {"fileUpload": {"success": True, "uploadFile": {"assetUrl": "https://uploads.linear.app/x"}}},  # no uploadUrl
+        {"fileUpload": {"success": True, "uploadFile": {"uploadUrl": "https://signed"}}},  # no assetUrl
+        {"fileUpload": {"success": True, "uploadFile": "not-a-dict"}},
+    ],
+    ids=["null-uploadfile", "missing-uploadfile-key", "missing-uploadurl", "missing-asseturl", "non-dict-uploadfile"],
+)
+def test_linear_attach_native_mode_malformed_fileupload_response_raises_cleanly(monkeypatch, tmp_path, file_upload_response):
+    # review finding: `success: true` alone doesn't guarantee a well-formed `uploadFile` — a
+    # bare KeyError/TypeError from blindly indexing it would escape _attach_screenshots's
+    # BackendError-only best-effort catch and crash an already-successful create/update.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"x")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {"issue(id": {"issue": {"id": "internal-1"}}, "fileUpload": file_upload_response},
+    )
+    with pytest.raises(BackendError, match="malformed"):
+        be.attach("HYP-1", str(png))
+
+
+@pytest.mark.parametrize(
+    "bad_headers",
+    [
+        "not-a-list",  # a string is iterable char-by-char in Python — must still be rejected
+        [{"key": "x"}],  # missing "value"
+        [{"value": "y"}],  # missing "key"
+        [{"key": 1, "value": "y"}],  # non-string key
+        ["not-a-dict"],
+    ],
+    ids=["non-list", "missing-value", "missing-key", "non-string-key", "non-dict-entry"],
+)
+def test_linear_attach_native_mode_malformed_upload_headers_raises_cleanly(monkeypatch, tmp_path, bad_headers):
+    # `headers: null` is deliberately NOT in this list — _parse_upload_headers treats an absent/
+    # null headers value as "no extra headers" (valid, see test_parse_upload_headers_empty_and_
+    # none_are_valid), the same as an empty list; it is these genuinely malformed SHAPES that
+    # must raise. review finding: the previous `{h["key"]: h["value"] for h in upload_file.get("headers", [])}`
+    # blindly indexed each entry — a malformed `headers` value must raise BackendError, not a
+    # raw TypeError/KeyError that escapes _attach_screenshots's best-effort catch.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"x")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "fileUpload": {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "assetUrl": "https://uploads.linear.app/asset-1",
+                        "uploadUrl": "https://signed",
+                        "headers": bad_headers,
+                    },
+                }
+            },
+        },
+    )
+    with pytest.raises(BackendError, match="upload headers"):
+        be.attach("HYP-1", str(png))
+
+
+def test_parse_upload_headers_empty_and_none_are_valid():
+    from tasklib.backends.linear import _parse_upload_headers
+
+    assert _parse_upload_headers(None) == {}
+    assert _parse_upload_headers([]) == {}
+    assert _parse_upload_headers([{"key": "Content-Disposition", "value": 'attachment; filename="x"'}]) == {
+        "Content-Disposition": 'attachment; filename="x"'
+    }
+
+
+def test_linear_is_native_attachment_url():
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    assert be.is_native_attachment_url("https://uploads.linear.app/abc") is True
+    assert be.is_native_attachment_url("http://uploads.linear.app/abc") is False  # plaintext
+    assert be.is_native_attachment_url("https://github.com/user-attachments/assets/abc") is False
+    assert be.is_native_attachment_url("file:///etc/passwd") is False
+
+
+def test_linear_is_native_attachment_url_handles_unparseable_url():
+    # review finding: urlparse() itself raises ValueError on some malformed urls (e.g. invalid
+    # IPv6-bracket syntax) — an attachment's url is tracker-controlled data, so this must
+    # degrade to "not native" cleanly, not propagate a raw ValueError past a boolean predicate.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    assert be.is_native_attachment_url("https://[bad") is False
+
+
+def test_linear_is_native_attachment_url_normalizes_port_and_case():
+    # review finding: `.netloc` includes the port and preserves case — a genuine asset url with
+    # an explicit default port or different host casing must still classify as native
+    # (`.hostname` is lowercased and port-stripped; `.netloc` alone would wrongly say "no").
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    assert be.is_native_attachment_url("https://uploads.linear.app:443/asset-1") is True
+    assert be.is_native_attachment_url("https://UPLOADS.LINEAR.APP/asset-1") is True
+    # a genuinely DIFFERENT host is still rejected — this fix normalizes port/case, it does not
+    # loosen the host comparison itself.
+    assert be.is_native_attachment_url("https://not-uploads.linear.app/asset-1") is False
+
+
+def test_linear_fetch_attachment_bytes_handles_unparseable_url():
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    with pytest.raises(BackendError, match="unparseable"):
+        be.fetch_attachment_bytes("https://[bad")
+
+
+def test_safe_urlparse_returns_none_on_malformed_url():
+    from tasklib.backends.linear import _safe_urlparse
+
+    assert _safe_urlparse("https://[bad") is None
+    assert _safe_urlparse("https://uploads.linear.app/x") is not None
+
+
+@pytest.mark.parametrize("bad_scheme_url", ["file:///etc/passwd", "ftp://uploads.linear.app/x", "data:text/plain,hi"])
+def test_linear_fetch_attachment_bytes_rejects_non_http_schemes(bad_scheme_url):
+    # review finding (SSRF/local-file-read): an attachment url is tracker-owned data; urlopen
+    # also understands file:/ftp:/data: schemes, so a malicious/malformed attachment url must be
+    # refused BEFORE any network/file call, not merely stripped of its auth header.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    with pytest.raises(BackendError, match="scheme"):
+        be.fetch_attachment_bytes(bad_scheme_url)
+
+
+def test_linear_node_to_ticket_parses_attachments():
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.model import Attachment
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "id": "i1",
+        "identifier": "HYP-1",
+        "url": "https://linear.app/x/issue/HYP-1",
+        "title": "t",
+        "description": "",
+        "attachments": {
+            "nodes": [
+                {"id": "a1", "title": "shot.png", "url": "https://uploads.linear.app/asset-1", "subtitle": None},
+            ]
+        },
+    }
+    ticket = be._node_to_ticket(node)
+    assert ticket.attachments == [Attachment(id="a1", title="shot.png", url="https://uploads.linear.app/asset-1", subtitle="")]
+    assert ticket.attachments_truncated is False
+
+
+def test_linear_node_to_ticket_skips_null_entries_in_attachments_nodes():
+    # review finding: a null ENTRY inside `nodes` (the same "unusual but possible GraphQL
+    # response shape" class the container-level `or {}` guards defend against) must be skipped
+    # cleanly, not raise AttributeError on `.get(...)`.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "id": "i1",
+        "identifier": "HYP-1",
+        "url": "https://linear.app/x/issue/HYP-1",
+        "title": "t",
+        "description": "",
+        "attachments": {
+            "nodes": [
+                {"id": "a1", "title": "shot.png", "url": "https://uploads.linear.app/1", "subtitle": None},
+                None,
+            ]
+        },
+    }
+    ticket = be._node_to_ticket(node)
+    assert len(ticket.attachments) == 1
+    assert ticket.attachments[0].id == "a1"
+
+
+def test_linear_node_to_ticket_surfaces_attachment_truncation():
+    # review finding: `first:250` is a cap, not exhaustive pagination — when Linear's own
+    # pageInfo says there's more, the ticket must say so too, not silently present a partial
+    # list as "all of the attachments".
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    node = {
+        "id": "i1",
+        "identifier": "HYP-1",
+        "url": "https://linear.app/x/issue/HYP-1",
+        "title": "t",
+        "description": "",
+        "attachments": {
+            "nodes": [{"id": "a1", "title": "shot.png", "url": "https://uploads.linear.app/1", "subtitle": None}],
+            "pageInfo": {"hasNextPage": True},
+        },
+    }
+    ticket = be._node_to_ticket(node)
+    assert ticket.attachments_truncated is True
+
+
+def test_linear_issue_fields_requests_page_info_for_attachments():
+    from tasklib.backends.linear import LinearBackend
+
+    assert "pageInfo" in LinearBackend._ISSUE_FIELDS
+    assert "hasNextPage" in LinearBackend._ISSUE_FIELDS
+
+
+def test_linear_issue_fields_base_excludes_attachments():
+    # review finding: attachments only belong in the SINGLE-ticket field set — pulling up to 250
+    # attachment sub-objects per ticket into the bulk list/search path would be a real
+    # payload/latency regression almost no list consumer needs.
+    from tasklib.backends.linear import LinearBackend
+
+    assert "attachments" not in LinearBackend._ISSUE_FIELDS_BASE
+    assert "attachments" in LinearBackend._ISSUE_FIELDS
+
+
+def test_linear_list_and_search_queries_use_base_fields_without_attachments(monkeypatch):
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    queries = []
+
+    def fake_gql(query, variables=None):
+        queries.append(query)
+        return {"issues": {"nodes": []}} if "issues(" in query else {"searchIssues": {"nodes": []}}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    be.list()
+    be.search("q")
+
+    for q in queries:
+        assert "attachments(" not in q
+
+
+def test_linear_create_uses_base_fields_without_attachments(monkeypatch):
+    # a just-created issue has no attachments yet — nothing to fetch.
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.model import Ticket
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    be._team_id = "team-1"
+    be._states_by_type = {"unstarted": "state-1"}
+    queries = []
+
+    def fake_gql(query, variables=None):
+        queries.append(query)
+        return {
+            "issueCreate": {
+                "success": True,
+                "issue": {"id": "i1", "identifier": "HYP-1", "url": "https://x", "title": "t", "description": ""},
+            }
+        }
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    monkeypatch.setattr(be, "_label_ids", lambda names: [])
+    be.create(Ticket(title="t"))
+
+    assert "attachments(" not in queries[0]
+
+
+def test_linear_get_and_update_still_use_full_fields_with_attachments(monkeypatch):
+    # unlike list/search, a single-ticket fetch (get/update, via _issue_by_identifier) SHOULD
+    # still pull attachments — that's the whole point of this feature's read side.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    queries = []
+
+    def fake_gql(query, variables=None):
+        queries.append(query)
+        return {"issue": {"id": "i1", "identifier": "HYP-1", "url": "https://x", "title": "t", "description": ""}}
+
+    monkeypatch.setattr(be, "_gql", fake_gql)
+    be.get("HYP-1")
+
+    assert "attachments(" in queries[0]
+
+
+def test_linear_fetch_attachment_bytes_sends_authorization_header(monkeypatch):
+    # This IS the "no 401" fix for the read side: the SAME Authorization header every GraphQL
+    # call sends, applied to a plain GET against the attachment's asset URL.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="lin_api_secret", team_key="HYP")
+    seen = {}
+
+    def fake_request_bytes(url, *, method="GET", headers=None, data=None, timeout=60, same_host_redirects_only=False):
+        seen["url"] = url
+        seen["method"] = method
+        seen["headers"] = headers
+        seen["same_host_redirects_only"] = same_host_redirects_only
+        return b"\x89PNG..."
+
+    monkeypatch.setattr("tasklib.backends.linear.request_bytes", fake_request_bytes)
+    result = be.fetch_attachment_bytes("https://uploads.linear.app/asset-1")
+
+    assert result == b"\x89PNG..."
+    assert seen["url"] == "https://uploads.linear.app/asset-1"
+    assert seen["method"] == "GET"
+    assert seen["headers"]["Authorization"] == "lin_api_secret"
+    # the redirect guard MUST be on whenever the auth header is attached (review finding).
+    assert seen["same_host_redirects_only"] is True
+
+
+def test_linear_fetch_attachment_bytes_omits_auth_for_non_linear_host(monkeypatch):
+    # review finding: never send the Linear API key to an arbitrary attachment host (e.g. a
+    # `link`-mode external URL) — only uploads.linear.app gets the Authorization header.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="lin_api_secret", team_key="HYP")
+    seen = {}
+
+    def fake_request_bytes(url, *, method="GET", headers=None, data=None, timeout=60, same_host_redirects_only=False):
+        seen["headers"] = headers
+        seen["same_host_redirects_only"] = same_host_redirects_only
+        return b"data"
+
+    monkeypatch.setattr("tasklib.backends.linear.request_bytes", fake_request_bytes)
+    be.fetch_attachment_bytes("https://github.com/user-attachments/assets/abc")
+
+    assert "Authorization" not in seen["headers"]
+    assert seen["same_host_redirects_only"] is False
+
+
+def test_linear_fetch_attachment_bytes_omits_auth_for_plaintext_http_linear_host(monkeypatch):
+    # review finding: the hostname check alone isn't enough — a plain http://uploads.linear.app
+    # URL (spoofed/malformed, Linear itself never hands one out) must also NOT get the API key.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="lin_api_secret", team_key="HYP")
+    seen = {}
+
+    def fake_request_bytes(url, *, method="GET", headers=None, data=None, timeout=60, same_host_redirects_only=False):
+        seen["headers"] = headers
+        seen["same_host_redirects_only"] = same_host_redirects_only
+        return b"data"
+
+    monkeypatch.setattr("tasklib.backends.linear.request_bytes", fake_request_bytes)
+    be.fetch_attachment_bytes("http://uploads.linear.app/asset-1")
+
+    assert "Authorization" not in seen["headers"]
+    assert seen["same_host_redirects_only"] is False
+
+
+def test_linear_fetch_attachment_bytes_wraps_http_error(monkeypatch):
+    from tasklib.backends import BackendError
+    from tasklib.backends.http import HttpError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    monkeypatch.setattr(
+        "tasklib.backends.linear.request_bytes",
+        lambda *a, **kw: (_ for _ in ()).throw(HttpError(401, "HTTP 401", "unauthorized")),
+    )
+    with pytest.raises(BackendError, match="401"):
+        be.fetch_attachment_bytes("https://uploads.linear.app/asset-1")

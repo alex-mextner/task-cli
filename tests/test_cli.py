@@ -2738,3 +2738,442 @@ def test_disabling_msgref_quote_config_stops_expansion_and_history(capsys, _inje
     body = render(_inject_fake.get("#1"))
     assert "per tg#2 do the thing" in body  # raw text, no quote attached
     assert "msgref-quote:2" not in body
+
+
+# ── task read --save-attachments (tg#11652: task-cli must be able to READ native attachments) ──
+
+
+@pytest.mark.parametrize(
+    "title,expected_rejected",
+    [
+        ("../outside.txt", False),  # slash gets stripped -> ".._outside.txt", not rejected
+        ("..\\outside.txt", False),  # backslash also stripped, on ANY platform (not just Windows)
+        ("..", True),  # bare parent-dir reference with nothing to strip
+        (".", True),
+        ("", True),
+        ("   ", True),  # whitespace-only
+    ],
+)
+def test_sanitize_attachment_basename_blocks_traversal(title, expected_rejected):
+    # review finding: a naive `title.replace(os.sep, "_")` only strips the CURRENT platform's
+    # separator, so `../outside.txt` would survive untouched on Windows (os.sep is "\\", "/" is
+    # only os.altsep there) and escape --save-attachments DIR via os.path.join. Both slash
+    # characters are hardcoded here regardless of the running platform.
+    from tasklib.cli import _sanitize_attachment_basename
+
+    result = _sanitize_attachment_basename(title)
+    if expected_rejected:
+        assert result == ""
+    else:
+        assert result != ""
+        assert "/" not in result
+        assert "\\" not in result
+        assert result not in (".", "..")
+
+
+def test_unique_attachment_filenames_rejects_traversal_titles_via_sanitizer():
+    # end-to-end through the naming function: a bare ".." title must not resolve to dest_dir's
+    # own parent — it falls back to the attachment id.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a = Attachment(id="abc123", title="..", url="https://uploads.linear.app/1")
+    names = _unique_attachment_filenames([a])
+    assert names[id(a)] == "abc123"
+
+
+def test_ticket_dict_emits_attachments_truncated_flag():
+    # review finding: `--json` was missing the truncation signal the human output already had —
+    # a JSON consumer would silently treat a capped attachment list as the complete set.
+    from tasklib.cli import _ticket_dict
+    from tasklib.model import Attachment, Ticket
+
+    ticket = Ticket(
+        attachments=[Attachment(id="1", title="a.png", url="https://uploads.linear.app/1")],
+        attachments_truncated=True,
+    )
+    d = _ticket_dict(ticket)
+    assert d["attachments_truncated"] is True
+
+
+def test_ticket_dict_omits_truncated_flag_when_not_truncated():
+    from tasklib.cli import _ticket_dict
+    from tasklib.model import Attachment, Ticket
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="a.png", url="https://uploads.linear.app/1")])
+    d = _ticket_dict(ticket)
+    assert "attachments_truncated" not in d
+
+
+@pytest.mark.parametrize("title", ["shot\x00.png", "shot\x01\x02.png", "shot\x7f.png"])
+def test_sanitize_attachment_basename_strips_control_characters(title):
+    # review finding: NUL/control characters in a tracker-controlled title are illegal in a
+    # POSIX filename and raise ValueError from os.link — must be stripped, not just traversal
+    # sequences.
+    from tasklib.cli import _sanitize_attachment_basename
+
+    result = _sanitize_attachment_basename(title)
+    assert "\x00" not in result
+    assert "\x01" not in result
+    assert "\x7f" not in result
+    assert result != ""
+
+
+def test_unique_attachment_filenames_dedupes_repeated_titles():
+    # review finding: two attachments sharing a title (e.g. two screenshots both literally
+    # named "screenshot.png") must not silently collide on disk — the 2nd+ gets a `-N` suffix.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a1 = Attachment(id="1", title="screenshot.png", url="https://uploads.linear.app/1")
+    a2 = Attachment(id="2", title="screenshot.png", url="https://uploads.linear.app/2")
+    a3 = Attachment(id="3", title="other.png", url="https://uploads.linear.app/3")
+    names = _unique_attachment_filenames([a1, a2, a3])
+    assert names[id(a1)] == "screenshot.png"
+    assert names[id(a2)] == "screenshot-2.png"
+    assert names[id(a3)] == "other.png"
+    assert len(set(names.values())) == 3  # every destination filename is distinct
+
+
+def test_unique_attachment_filenames_avoids_collision_with_a_later_original_title():
+    # review finding: a naive "count occurrences of the ORIGINAL title" scheme can itself
+    # collide — titles in order screenshot.png, screenshot-2.png, screenshot.png would naively
+    # produce screenshot.png, screenshot-2.png, screenshot-2.png (2nd and 3rd collide), because
+    # the 3rd attachment's OWN title happens to equal the 2nd's already-deduped name.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a1 = Attachment(id="1", title="screenshot.png", url="https://uploads.linear.app/1")
+    a2 = Attachment(id="2", title="screenshot-2.png", url="https://uploads.linear.app/2")
+    a3 = Attachment(id="3", title="screenshot.png", url="https://uploads.linear.app/3")
+    names = _unique_attachment_filenames([a1, a2, a3])
+    assert len(set(names.values())) == 3  # no two attachments share a destination filename
+    assert names[id(a1)] == "screenshot.png"
+    assert names[id(a2)] == "screenshot-2.png"
+    assert names[id(a3)] == "screenshot-3.png"  # skips -2 (taken by a2's OWN title), takes -3
+
+
+def test_save_attachments_writes_bytes_and_reports_success(tmp_path):
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"pixel-data"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")])
+    lines = _save_attachments(_FakeBackend(), ticket, str(tmp_path))
+    assert len(lines) == 1
+    assert "shot.png" in lines[0]
+    assert (tmp_path / "shot.png").read_bytes() == b"pixel-data"
+
+
+def test_save_attachments_one_fetch_failure_does_not_abort_the_rest(tmp_path):
+    # best-effort per-attachment, mirroring _attach_screenshots on the write side.
+    from tasklib.backends import BackendError
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            if "bad" in url:
+                raise BackendError("boom")
+            return b"ok"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(
+        attachments=[
+            Attachment(id="1", title="good.png", url="https://uploads.linear.app/good"),
+            Attachment(id="2", title="bad.png", url="https://uploads.linear.app/bad"),
+        ]
+    )
+    lines = _save_attachments(_FakeBackend(), ticket, str(tmp_path))
+    assert any("good.png" in ln and "✓" in ln for ln in lines)
+    assert any("bad.png" in ln and "✗" in ln for ln in lines)
+    assert (tmp_path / "good.png").read_bytes() == b"ok"
+    assert not (tmp_path / "bad.png").exists()
+
+
+def test_save_attachments_local_write_failure_reported_not_raised(tmp_path):
+    # review finding: an OSError writing the file (permission denied, full disk) must be caught
+    # per-attachment like a backend fetch failure, not escape and crash `task read`.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"ok"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    # dest_dir itself is a FILE, not a directory — os.makedirs(exist_ok=True) on an existing
+    # file path raises NotADirectoryError/FileExistsError (both OSError subclasses).
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("occupied")
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")])
+
+    lines = _save_attachments(_FakeBackend(), ticket, str(blocked))
+    assert len(lines) == 1
+    assert "✗" in lines[0]
+
+
+def test_save_attachments_backend_without_fetch_method_reports_and_skips(tmp_path):
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeGithubLikeBackend:
+        name = "github-issues"
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://example.com/1")])
+    lines = _save_attachments(_FakeGithubLikeBackend(), ticket, str(tmp_path))
+    assert len(lines) == 1
+    assert "github-issues" in lines[0]
+    assert not (tmp_path / "shot.png").exists()
+
+
+def test_save_attachments_skips_external_urls_when_backend_says_not_native(tmp_path):
+    # review finding (SSRF): an attachment url is tracker-owned data — _save_attachments must
+    # NOT blindly fetch every url. A backend that exposes `is_native_attachment_url` gets to
+    # veto the fetch; a non-native (external `link`-mode) attachment is reported, not fetched.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    fetched = []
+
+    class _FakeLinearBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            fetched.append(url)
+            return b"bytes"
+
+        def is_native_attachment_url(self, url):
+            return url.startswith("https://uploads.linear.app/")
+
+    ticket = Ticket(
+        attachments=[
+            Attachment(id="1", title="native.png", url="https://uploads.linear.app/1"),
+            Attachment(id="2", title="external.png", url="https://github.com/user-attachments/assets/2"),
+        ]
+    )
+    lines = _save_attachments(_FakeLinearBackend(), ticket, str(tmp_path))
+
+    assert fetched == ["https://uploads.linear.app/1"]  # the external one was never fetched
+    assert (tmp_path / "native.png").read_bytes() == b"bytes"
+    assert not (tmp_path / "external.png").exists()
+    assert any("native.png" in ln and "✓" in ln for ln in lines)
+    assert any("external.png" in ln and "skipped" in ln and "https://github.com" in ln for ln in lines)
+
+
+def test_save_attachments_skipped_external_does_not_consume_a_name_slot(tmp_path):
+    # review finding: naming ALL attachments (including ones that get skipped) let a skipped
+    # external attachment's title steal a name slot from a later native attachment with the
+    # SAME title, giving it a spurious "-2" suffix for no reason visible to the user.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeLinearBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"native-bytes"
+
+        def is_native_attachment_url(self, url):
+            return url.startswith("https://uploads.linear.app/")
+
+    ticket = Ticket(
+        attachments=[
+            Attachment(id="1", title="shot.png", url="https://github.com/user-attachments/assets/1"),  # skipped
+            Attachment(id="2", title="shot.png", url="https://uploads.linear.app/2"),  # native, SAME title
+        ]
+    )
+    lines = _save_attachments(_FakeLinearBackend(), ticket, str(tmp_path))
+
+    # the native one landed at the CLEAN name, not "shot-2.png" — the skipped external never
+    # competed for a name.
+    assert (tmp_path / "shot.png").read_bytes() == b"native-bytes"
+    assert not (tmp_path / "shot-2.png").exists()
+    assert any("shot.png ->" in ln and "✓" in ln for ln in lines)
+
+
+def test_save_attachments_does_not_duplicate_the_truncation_notice(tmp_path):
+    # review finding: cmd_read's attachments listing already prints a truncation note whenever
+    # ticket.attachments_truncated is set — _save_attachments must not ALSO append its own copy
+    # of it into saved_lines (that would print it twice in the human `task read` output).
+    # `ticket.attachments_truncated` (surfaced once by cmd_read, and via --json) is the single
+    # source of truth; a caller checks that field directly rather than grepping saved_lines.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"ok"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(
+        attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")],
+        attachments_truncated=True,
+    )
+    lines = _save_attachments(_FakeBackend(), ticket, str(tmp_path))
+    assert not any("250-item cap" in ln or "truncat" in ln.lower() for ln in lines)
+
+
+def test_save_attachments_fails_closed_when_backend_lacks_native_predicate(tmp_path):
+    # review finding (2nd round): a backend with fetch_attachment_bytes but WITHOUT
+    # is_native_attachment_url must NOT default to "trust everything" — that inverts the whole
+    # SSRF guard. It fails CLOSED: nothing is auto-fetched until the backend explicitly opts in.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    class _FetchOnlyBackend:
+        name = "mystery-backend"
+
+        def fetch_attachment_bytes(self, url):
+            raise AssertionError("must not be called — no native-url predicate to authorize it")
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://example.com/1")])
+    lines = _save_attachments(_FetchOnlyBackend(), ticket, str(tmp_path))
+    assert len(lines) == 1
+    assert "skipped" in lines[0]
+    assert not (tmp_path / "shot.png").exists()
+
+
+def test_save_attachments_does_not_overwrite_a_pre_existing_file(tmp_path):
+    # review finding: a tracker-controlled attachment title matching a file the user already has
+    # in the destination directory must not silently clobber it — it gets a distinct `-N` name.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    (tmp_path / "shot.png").write_bytes(b"MY EXISTING FILE - DO NOT TOUCH")
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"downloaded-bytes"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")])
+    lines = _save_attachments(_FakeBackend(), ticket, str(tmp_path))
+
+    assert (tmp_path / "shot.png").read_bytes() == b"MY EXISTING FILE - DO NOT TOUCH"  # untouched
+    assert (tmp_path / "shot-2.png").read_bytes() == b"downloaded-bytes"  # the download landed here instead
+    assert any("shot-2.png" in ln and "✓" in ln for ln in lines)
+
+
+def test_save_attachments_refuses_to_write_through_a_symlink(tmp_path):
+    # review finding: a symlink planted at the destination name must not get written through
+    # (which would silently overwrite whatever it points at). Two independent layers guard this:
+    # (1) the pre-existing-name reservation (below) sees the symlink's OWN name in the directory
+    # listing and renames the download away from it entirely; (2) even if a symlink appeared
+    # AFTER that listing (a race), the "xb" exclusive-create open in _save_attachments refuses
+    # to follow it — pinned directly, at the os.open level, in the test right after this one.
+    import os
+
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    real_target = tmp_path / "outside-secret.txt"
+    real_target.write_bytes(b"SECRET - must not be overwritten")
+    trap = tmp_path / "shot.png"
+    os.symlink(real_target, trap)
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"downloaded-bytes"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")])
+    lines = _save_attachments(_FakeBackend(), ticket, str(tmp_path))
+
+    assert real_target.read_bytes() == b"SECRET - must not be overwritten"  # untouched
+    assert trap.is_symlink()  # the trap itself was never touched/replaced
+    # the download landed at a DIFFERENT name — the symlink's own filename was reserved as
+    # "already taken" by the pre-existing-name scan, so it never became the write target.
+    assert any("shot-2.png" in ln and "✓" in ln for ln in lines)
+
+
+def test_write_attachment_exclusive_refuses_to_follow_a_symlink(tmp_path):
+    # direct pin of the underlying primitive: os.link (used by _write_attachment_exclusive to
+    # publish) fails with FileExistsError if the destination NAME already exists for any reason
+    # — including a symlink — rather than following it to write through to its target. This is
+    # what protects a write even in the race window between the pre-existing-name listing and
+    # the actual write.
+    import os
+
+    from tasklib.cli import _write_attachment_exclusive
+
+    real_target = tmp_path / "outside-secret.txt"
+    real_target.write_bytes(b"SECRET")
+    trap = tmp_path / "trap.png"
+    os.symlink(real_target, trap)
+
+    with pytest.raises(FileExistsError):
+        _write_attachment_exclusive(str(tmp_path), str(trap), b"downloaded-bytes")
+    assert real_target.read_bytes() == b"SECRET"  # untouched
+
+
+def test_write_attachment_exclusive_leaves_no_partial_file_on_write_failure(tmp_path, monkeypatch):
+    # review finding: a straight `open(dest_path, "xb")` write that fails PARTWAY (disk-full
+    # mid-write) leaves a truncated file already claiming dest_path's name; a retry would then
+    # treat that name as taken and save the real bytes under a spurious "-2" name instead. The
+    # temp-file + hard-link publish means a failed write leaves NO trace at dest_path at all.
+    import os
+
+    from tasklib.cli import _write_attachment_exclusive
+
+    dest_path = os.path.join(str(tmp_path), "shot.png")
+
+    real_fdopen = os.fdopen
+
+    def failing_fdopen(fd, mode):
+        f = real_fdopen(fd, mode)
+        real_write = f.write
+
+        def boom(_data):
+            real_write(b"partial")  # some bytes DID get written to the temp file...
+            raise OSError("simulated disk full")
+
+        f.write = boom
+        return f
+
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    with pytest.raises(OSError, match="disk full"):
+        _write_attachment_exclusive(str(tmp_path), dest_path, b"full-content-that-never-lands")
+
+    assert not os.path.exists(dest_path)  # ...but dest_path itself was never created
+    # the temp file was cleaned up too — no orphaned ".attach-*" litter in dest_dir
+    assert [n for n in os.listdir(str(tmp_path)) if n.startswith(".attach-")] == []
+
+
+def test_write_attachment_exclusive_writes_full_bytes_on_success(tmp_path):
+    import os
+
+    from tasklib.cli import _write_attachment_exclusive
+
+    dest_path = os.path.join(str(tmp_path), "shot.png")
+    _write_attachment_exclusive(str(tmp_path), dest_path, b"the-real-bytes")
+    assert open(dest_path, "rb").read() == b"the-real-bytes"
+    assert [n for n in os.listdir(str(tmp_path)) if n.startswith(".attach-")] == []

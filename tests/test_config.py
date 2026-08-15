@@ -383,3 +383,65 @@ def test_rig_yaml_task_global_layer_carries(tmp_path, monkeypatch):
     cfg = load(tmp_path)
     assert cfg.backend == "linear"
     assert cfg.classify_bias == "justAsk"
+
+
+# ── linear.attachment_mode (tg#11652: link vs native Linear attach) ────────────────────────
+
+
+def test_attachment_mode_default_is_native(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    cfg = load(tmp_path)
+    assert cfg.linear_attachment_mode == "native"
+
+
+def test_task_yaml_sets_attachment_mode_link(tmp_path, monkeypatch):
+    # hyperide's own shape (HYP-1248 default): task.yaml pins attachment_mode: link.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "task.yaml").write_text(
+        "version: 1\nbackend: linear\nlinear:\n  team: HYP\n  attachment_mode: link\n",
+        encoding="utf-8",
+    )
+    cfg = load(tmp_path)
+    assert cfg.linear_attachment_mode == "link"
+
+
+def test_invalid_attachment_mode_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "task.yaml").write_text(
+        "version: 1\nlinear:\n  attachment_mode: carrier-pigeon\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError, match="attachment_mode"):
+        load(tmp_path)
+
+
+def test_malformed_attachment_mode_value_clean_error(tmp_path, monkeypatch):
+    # a dict/list value (malformed YAML) must fail-closed with ConfigError, not a raw TypeError
+    # from the `in` membership check — mirrors test_rig_yaml_malformed_backend_value_clean_error.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "task.yaml").write_text(
+        "version: 1\nlinear:\n  attachment_mode: {nested: true}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError, match="attachment_mode"):
+        load(tmp_path)
+
+
+def test_rig_yaml_task_attachment_mode_flat_alias(tmp_path, monkeypatch):
+    # the rig.yaml task: block's flat shorthand, mirroring team/project/repo.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "rig.yaml").write_text(
+        "task: {backend: linear, team: HYP, attachment_mode: link}\n", encoding="utf-8"
+    )
+    cfg = load(tmp_path)
+    assert cfg.linear_attachment_mode == "link"
+
+
+def test_rig_yaml_task_attachment_mode_nested_passthrough(tmp_path, monkeypatch):
+    # the nested shape (linear: {attachment_mode: ...}) also works, since `linear` is already
+    # a verbatim-passthrough key.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-global"))
+    (tmp_path / "rig.yaml").write_text(
+        "task:\n  backend: linear\n  linear: {team: HYP, attachment_mode: native}\n",
+        encoding="utf-8",
+    )
+    cfg = load(tmp_path)
+    assert cfg.linear_attachment_mode == "native"

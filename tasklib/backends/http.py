@@ -12,6 +12,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any
+from urllib.parse import urlparse
 
 
 class HttpError(RuntimeError):
@@ -97,6 +98,73 @@ def request_json(
         body = ""
         try:
             body = exc.read().decode("utf-8")[:500]
+        except Exception:  # noqa: BLE001
+            pass
+        raise HttpError(exc.code, f"HTTP {exc.code} for {method} {url}", body) from exc
+    except urllib.error.URLError as exc:
+        raise HttpError(0, f"connection failed for {method} {url}: {exc.reason}") from exc
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses to follow a redirect to a different host, OR a scheme downgrade (https -> http),
+    than the request that was actually made — used whenever the request carries a
+    caller-supplied auth header (review finding: urllib follows redirects by default, so a
+    malicious/compromised server could either 302 the request to an attacker-controlled host, or
+    302 it to a PLAINTEXT `http://` URL on the SAME host, and urllib would happily replay every
+    header, including ``Authorization``, onto it either way — a same-host-only check misses the
+    downgrade case)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802 - stdlib override name
+        old, new = urlparse(req.full_url), urlparse(newurl)
+        if new.netloc != old.netloc or (old.scheme == "https" and new.scheme != "https"):
+            raise urllib.error.HTTPError(
+                newurl, code, f"refused unsafe redirect from {req.full_url} to {newurl}", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAME_HOST_OPENER = urllib.request.build_opener(_SameHostRedirectHandler)
+
+
+def request_bytes(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: int = 60,
+    same_host_redirects_only: bool = False,
+) -> bytes:
+    """Raw binary request (no JSON encode/decode) — a signed-URL file PUT, or a GET that reads
+    the response body as bytes rather than parsing it. Same error contract as
+    :func:`request_json`: a non-2xx status raises :class:`HttpError`; a connection dropping mid
+    read after a 2xx status raises :class:`AmbiguousHttpError`. Auth headers are passed by the
+    caller and are NEVER logged here.
+
+    ``same_host_redirects_only=True`` MUST be set whenever ``headers`` carries a credential
+    (e.g. an ``Authorization`` header) and the URL is not a request this process itself
+    constructed end-to-end — otherwise a redirect can exfiltrate the credential to any host
+    (see :class:`_SameHostRedirectHandler`).
+    """
+    hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", "task-cli")
+
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    opener = _SAME_HOST_OPENER.open if same_host_redirects_only else urllib.request.urlopen
+    try:
+        with opener(req, timeout=timeout) as resp:  # noqa: S310 - trusted provider hosts
+            try:
+                return resp.read()
+            except _AMBIGUOUS_READ_EXCEPTIONS as exc:
+                raise AmbiguousHttpError(
+                    f"connection interrupted while reading the response for {method} {url} "
+                    f"(status {resp.status} was already returned) — the request may have "
+                    "completed server-side even though this process never saw a usable body"
+                ) from exc
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
         except Exception:  # noqa: BLE001
             pass
         raise HttpError(exc.code, f"HTTP {exc.code} for {method} {url}", body) from exc

@@ -137,3 +137,113 @@ def test_request_json_still_raises_http_error_for_a_normal_4xx(monkeypatch):
     with pytest.raises(HttpError) as exc:
         request_json("https://api.github.com/repos/o/r/issues", method="POST")
     assert exc.value.status == 422
+
+
+# ── request_bytes + the same-host redirect guard (credential-exfiltration hazard) ──────────
+
+
+def test_request_bytes_returns_raw_body(monkeypatch):
+    from tasklib.backends.http import request_bytes
+
+    class _FakeResp:
+        status = 200
+
+        def read(self):
+            return b"\x89PNG raw bytes"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResp())
+    assert request_bytes("https://uploads.linear.app/asset-1") == b"\x89PNG raw bytes"
+
+
+def test_same_host_redirect_handler_allows_same_host_redirect():
+    import urllib.request
+
+    from tasklib.backends.http import _SameHostRedirectHandler
+
+    handler = _SameHostRedirectHandler()
+    req = urllib.request.Request("https://uploads.linear.app/a")
+    # same host + path change → delegates to the stdlib handler (returns a new Request, doesn't raise)
+    result = handler.redirect_request(req, None, 302, "Found", {}, "https://uploads.linear.app/b")
+    assert result is not None
+    assert result.full_url == "https://uploads.linear.app/b"
+
+
+def test_same_host_redirect_handler_refuses_cross_host_redirect():
+    import urllib.error
+    import urllib.request
+
+    from tasklib.backends.http import _SameHostRedirectHandler
+
+    handler = _SameHostRedirectHandler()
+    req = urllib.request.Request("https://uploads.linear.app/a")
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 302, "Found", {}, "https://attacker.example.com/steal")
+
+
+def test_same_host_redirect_handler_refuses_https_to_http_downgrade_same_host():
+    # review finding: a same-HOST check alone misses a same-host SCHEME downgrade — a
+    # compromised uploads.linear.app could 302 https -> http on the identical hostname and a
+    # host-only guard would wave the Authorization header straight through onto plaintext.
+    import urllib.error
+    import urllib.request
+
+    from tasklib.backends.http import _SameHostRedirectHandler
+
+    handler = _SameHostRedirectHandler()
+    req = urllib.request.Request("https://uploads.linear.app/a")
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://uploads.linear.app/a")
+
+
+def test_same_host_redirect_handler_allows_http_to_https_upgrade_same_host():
+    # the inverse (http -> https) is a safe upgrade, not a downgrade — must still be allowed.
+    import urllib.request
+
+    from tasklib.backends.http import _SameHostRedirectHandler
+
+    handler = _SameHostRedirectHandler()
+    req = urllib.request.Request("http://uploads.linear.app/a")
+    result = handler.redirect_request(req, None, 302, "Found", {}, "https://uploads.linear.app/a")
+    assert result is not None
+
+
+def test_request_bytes_same_host_redirects_only_uses_guarded_opener(monkeypatch):
+    # request_bytes must route through the guarded opener (not plain urlopen) when the caller
+    # says the request carries a credential — this is the load-bearing wiring the review finding
+    # was about; a unit test on the handler alone can't catch a caller forgetting to opt in.
+    from tasklib.backends import http as http_mod
+
+    seen = {}
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            seen["used_guarded_opener"] = True
+
+            class _Resp:
+                status = 200
+
+                def read(self):
+                    return b"ok"
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc_info):
+                    return False
+
+            return _Resp()
+
+    monkeypatch.setattr(http_mod, "_SAME_HOST_OPENER", _FakeOpener())
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not use the plain opener")),
+    )
+    result = http_mod.request_bytes("https://uploads.linear.app/asset-1", same_host_redirects_only=True)
+    assert result == b"ok"
+    assert seen.get("used_guarded_opener") is True
