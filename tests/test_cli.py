@@ -2805,6 +2805,95 @@ def test_ticket_dict_omits_truncated_flag_when_not_truncated():
     assert "attachments_truncated" not in d
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "C:payload.py",  # the exact PoC from the review finding — no slash, drive-relative
+        "c:payload.py",  # lowercase drive letter
+        "C:\\payload.py",  # drive + backslash combined
+        "C:..\\..\\payload.py",
+    ],
+)
+def test_sanitize_attachment_basename_strips_windows_drive_prefix(title):
+    # review finding (P1, PR #90): a title with NO slash at all, like "C:payload.py", survives a
+    # slash-only sanitizer untouched. On Windows that's a DRIVE-RELATIVE path — ntpath.join
+    # sees the second component carries its own drive letter and discards the base directory
+    # entirely: ntpath.join("downloads", "C:payload.py") == "C:payload.py", not
+    # "downloads\\C:payload.py". Fixed by stripping ":" unconditionally (not just on Windows —
+    # hardcoded like the slash fix, since the title could be crafted on one platform and read
+    # back on another).
+    import ntpath
+
+    from tasklib.cli import _sanitize_attachment_basename
+
+    result = _sanitize_attachment_basename(title)
+    assert ":" not in result
+    # the load-bearing assertion: even using WINDOWS path-join semantics (regardless of the host
+    # platform this test suite actually runs on), the sanitized name can never discard dest_dir.
+    joined = ntpath.join("downloads", result)
+    assert joined.startswith("downloads"), f"{title!r} sanitized to {result!r}, escaped dest_dir: {joined!r}"
+
+
+def test_sanitize_attachment_basename_strips_trailing_dots_and_spaces():
+    # review finding (4th round): Windows silently drops trailing "."/" " from a path component
+    # at create time, so "shot.png" and "shot.png." are distinct Python strings here but the SAME
+    # file on that filesystem — must normalize to the same sanitized name.
+    from tasklib.cli import _sanitize_attachment_basename
+
+    assert _sanitize_attachment_basename("shot.png.") == _sanitize_attachment_basename("shot.png")
+    assert _sanitize_attachment_basename("shot.png   ") == _sanitize_attachment_basename("shot.png")
+    assert _sanitize_attachment_basename("shot.png. . .") == _sanitize_attachment_basename("shot.png")
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "CON",
+        "con",
+        "CON.png",
+        "NUL",
+        "aux.txt",
+        "COM0",
+        "COM1",
+        "com3.log",
+        "LPT0",
+        "LPT9.dat",
+        "CONIN$",
+        "CONOUT$",
+    ],
+)
+def test_sanitize_attachment_basename_rejects_windows_reserved_device_names(title):
+    # review finding (4th round): CON/PRN/AUX/NUL/COM0-9/LPT0-9/CONIN$/CONOUT$ refer to a DEVICE
+    # on Windows regardless of extension or case — a title that collides must be rejected (falls
+    # back to the attachment id in the caller), the same as "."/".." are, rather than producing a
+    # name that can never actually be created as a real file.
+    from tasklib.cli import _sanitize_attachment_basename
+
+    assert _sanitize_attachment_basename(title) == ""
+
+
+def test_sanitize_attachment_basename_rejects_reserved_name_with_interior_trailing_space():
+    # review finding (on the fix itself): "CON .png" splits (before the extension) to "CON " —
+    # the trailing space is INTERIOR to the full string, not at its very end, so the earlier
+    # `.rstrip(". ")` over the whole `stripped` value never touches it. Windows strips trailing
+    # space/dot from EACH path component before the device-name comparison, so "CON .png" still
+    # resolves to the CON device — the stem itself must be re-stripped before comparing.
+    from tasklib.cli import _sanitize_attachment_basename
+
+    assert _sanitize_attachment_basename("CON .png") == ""
+    assert _sanitize_attachment_basename("CON. .png") == ""
+
+
+def test_sanitize_attachment_basename_allows_non_reserved_names_with_similar_prefixes():
+    # a reserved-name check must match the WHOLE basename-before-extension, not merely a prefix —
+    # "console.png"'s stem is "console", not "CON".
+    from tasklib.cli import _sanitize_attachment_basename
+
+    assert _sanitize_attachment_basename("console.png") == "console.png"
+    assert _sanitize_attachment_basename("comedy.txt") == "comedy.txt"
+    assert _sanitize_attachment_basename("nullable.py") == "nullable.py"
+
+
 @pytest.mark.parametrize("title", ["shot\x00.png", "shot\x01\x02.png", "shot\x7f.png"])
 def test_sanitize_attachment_basename_strips_control_characters(title):
     # review finding: NUL/control characters in a tracker-controlled title are illegal in a
@@ -2851,6 +2940,105 @@ def test_unique_attachment_filenames_avoids_collision_with_a_later_original_titl
     assert names[id(a1)] == "screenshot.png"
     assert names[id(a2)] == "screenshot-2.png"
     assert names[id(a3)] == "screenshot-3.png"  # skips -2 (taken by a2's OWN title), takes -3
+
+
+def test_unique_attachment_filenames_dedupes_case_insensitively():
+    # review finding (P2, PR #90): "shot.png" and "SHOT.PNG" are distinct Python strings, so an
+    # exact-string dedup set lets both through unsuffixed — fine on a case-sensitive filesystem,
+    # but on the DEFAULT case-insensitive one (macOS/Windows) the destination filesystem treats
+    # them as the SAME file, so the second attachment's os.link() at write time would fail with
+    # FileExistsError and get reported as a failed attachment instead of saved under "-2".
+    # Collision tracking must be case-folded so this is caught here, as a normal suffix bump.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a1 = Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")
+    a2 = Attachment(id="2", title="SHOT.PNG", url="https://uploads.linear.app/2")
+    names = _unique_attachment_filenames([a1, a2])
+    assert names[id(a1)] == "shot.png"
+    assert names[id(a2)] != "SHOT.PNG"  # must NOT reuse the exact title verbatim
+    assert names[id(a2)].casefold() != "shot.png".casefold()  # and must not case-fold-collide either
+    assert len(set(names.values())) == 2
+
+
+def test_unique_attachment_filenames_dedupes_case_insensitively_against_existing_disk_file():
+    # same review finding, the "existing pre-scanned directory" variant: a case-insensitive
+    # filesystem also means a NEW attachment titled "SHOT.PNG" collides with an already-present
+    # "shot.png" on disk, not just another attachment in the same batch.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a1 = Attachment(id="1", title="SHOT.PNG", url="https://uploads.linear.app/1")
+    names = _unique_attachment_filenames([a1], existing=frozenset({"shot.png"}))
+    assert names[id(a1)].casefold() != "shot.png".casefold()
+
+
+def test_unique_attachment_filenames_dedupes_trailing_dot_variant():
+    # review finding: the sanitizer's trailing-dot/space normalization ("shot.png" and
+    # "shot.png." both sanitize to "shot.png") is only useful if names ACTUALLY collide once
+    # they reach the dedup stage — this puts both titles through _unique_attachment_filenames
+    # together (not just asserting sanitizer-level string equality in isolation) and confirms
+    # the second gets a "-2" suffix, the concrete behavior the trailing-dot fix claims.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a1 = Attachment(id="1", title="shot.png", url="https://uploads.linear.app/1")
+    a2 = Attachment(id="2", title="shot.png.", url="https://uploads.linear.app/2")
+    names = _unique_attachment_filenames([a1, a2])
+    assert names[id(a1)] == "shot.png"
+    assert names[id(a2)] == "shot-2.png"
+    assert len(set(names.values())) == 2
+
+
+def test_unique_attachment_filenames_id_fallback_goes_through_the_same_sanitizer():
+    # review finding: the `a.id` fallback (used when `a.title` sanitizes to "") is tracker-owned
+    # data on the SAME trust boundary as the title — if it bypassed the sanitizer, a hostile id
+    # like "CON" or "C:x" would reintroduce every bug this change fixes, one level down. Confirm
+    # both the title AND the id-fallback path reject a reserved/traversal-shaped value.
+    from tasklib.cli import _unique_attachment_filenames
+    from tasklib.model import Attachment
+
+    a = Attachment(id="CON", title="..", url="https://uploads.linear.app/1")
+    names = _unique_attachment_filenames([a])
+    assert names[id(a)] == "attachment"  # both title ("..") and id ("CON") were rejected
+
+
+def test_save_attachments_sanitizes_windows_drive_prefix_end_to_end(tmp_path):
+    # review finding (P1, PR #90) end to end: a tracker-controlled attachment title of
+    # "C:payload.py" must never let the saved file escape dest_dir, on ANY platform — this pins
+    # the sanitizer's actual effect through the real _save_attachments write path, not just the
+    # sanitizer function in isolation.
+    #
+    # review finding on the test itself (round 2): on POSIX, "C:payload.py" is an ordinary
+    # filename, so a containment check alone (saved file's parent == dest_dir) would pass even
+    # WITHOUT the fix — the real regression pin is that the saved name no longer contains ":" (a
+    # colon surviving here is exactly the precursor to the drive-relative-path escape on
+    # Windows; the Windows-path-semantics assertion lives in the ntpath-based sanitizer unit test
+    # above). dest_dir is a dedicated, not-pre-existing subdirectory (rather than bare tmp_path)
+    # so this test doesn't have to filter out the isolated_state fixture's own "home" side effect
+    # on tmp_path to count entries.
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    dest_dir = tmp_path / "downloads"
+
+    class _FakeBackend:
+        name = "linear"
+
+        def fetch_attachment_bytes(self, url):
+            return b"malicious-or-not-bytes"
+
+        def is_native_attachment_url(self, url):
+            return True
+
+    ticket = Ticket(attachments=[Attachment(id="1", title="C:payload.py", url="https://uploads.linear.app/1")])
+    lines = _save_attachments(_FakeBackend(), ticket, str(dest_dir))
+
+    saved = list(dest_dir.iterdir())
+    assert len(saved) == 1
+    assert saved[0].parent == dest_dir  # landed INSIDE dest_dir, not beside/above it
+    assert ":" not in saved[0].name
+    assert any("✓" in ln for ln in lines)
 
 
 def test_save_attachments_writes_bytes_and_reports_success(tmp_path):

@@ -53,16 +53,33 @@ _LINEAR_ASSET_HOSTS = frozenset({"uploads.linear.app"})
 
 
 def _safe_urlparse(url: str):
-    """``urlparse(url)``, or ``None`` on a malformed url. review finding: an attachment's ``url``
-    is tracker-controlled data — a value like ``"https://[bad"`` (invalid IPv6-bracket syntax)
-    makes ``urlparse`` itself raise ``ValueError``, which would otherwise escape every caller
-    that treats URL classification as infallible (``is_native_attachment_url``,
-    ``fetch_attachment_bytes``) and crash a command instead of cleanly refusing one bad
-    attachment."""
+    """``urlparse(url)`` — validated enough to actually be usable, or ``None`` on ANY
+    malformation. review finding: an attachment's ``url`` is tracker-controlled data, and there
+    are TWO distinct places a "successfully parsed" url can still be garbage:
+
+    - ``urlparse()`` itself raises ``ValueError`` at PARSE time for some malformed inputs (e.g.
+      invalid IPv6-bracket syntax like ``"https://[bad"``).
+    - ``.port`` is a LAZY property that validates at ACCESS time, not parse time — a
+      syntactically well-formed url with a non-numeric/out-of-range port
+      (``"https://host:bad/x"``) parses fine but raises ``ValueError`` the moment ``.port`` is
+      actually touched. (``.hostname`` does NOT have this hazard — verified against
+      ``urllib.parse``'s implementation, it never raises on access; only ``.port`` does the
+      int-cast/range check that can fail. Nothing else here needs eager-touching.)
+
+    review finding, round 2: these used to be two SEPARATE failure points every caller had to
+    defend against independently — a caller that only wrapped ``urlparse()`` itself (not the
+    later ``.port`` access) would still crash on a bad port, or worse, classify a malformed url
+    as usable before the crash. Touching ``.port`` eagerly here means every caller — the internal
+    ``fetch_attachment_bytes`` scheme check no less than ``is_native_attachment_url``'s host
+    comparison — gets the SAME single "None means unusable, for any reason" contract, instead of
+    each reimplementing its own try/except.
+    """
     try:
-        return urlparse(url)
+        parsed = urlparse(url)
+        _ = parsed.port  # property access validates port syntax (raises ValueError if malformed)
     except ValueError:
         return None
+    return parsed
 
 # Map a Linear workflow-state ``type`` onto our normalized State.
 _TYPE_TO_STATE = {
@@ -480,23 +497,29 @@ class LinearBackend:
         https only) — as opposed to an external URL a ``link``-mode attachment merely points at
         (a GitHub PR asset, say). Used by callers (``cli._save_attachments``) that want to fetch
         ONLY assets this process/tracker actually controls, not follow an arbitrary tracker-data
-        URL onto the open network (SSRF surface — review finding)."""
+        URL onto the open network (SSRF surface — review finding).
+
+        review finding (PR #90 round 2): a malformed authority like
+        ``https://uploads.linear.app:bad/asset`` has a perfectly valid ``.hostname`` (that
+        property alone doesn't validate the port), so this predicate used to classify it as a
+        genuine native asset even though nothing could ever actually fetch it — the caller would
+        then attach the ``Authorization`` header and the same-host-redirect guard to a request
+        that can never be made. ``_safe_urlparse`` now validates ``.port`` eagerly for every
+        caller, so a malformed authority already comes back as ``None`` here — it's correctly
+        treated as an unconfirmed external link (reported, not fetched) instead of a native
+        asset that mysteriously always fails.
+
+        review finding: ``.netloc`` includes the port and preserves case — a genuine (if
+        unusual) asset url like ``https://uploads.linear.app:443/...`` or a differently-cased
+        host would compare unequal to the frozenset and get wrongly classified as non-native
+        (safe direction — under-authenticates rather than over-authenticates — but still a real
+        misclassification). ``.hostname`` is lowercased and port-stripped, which is why the
+        comparison below uses it rather than ``.netloc``.
+        """
         parsed = _safe_urlparse(url)
         if parsed is None or parsed.scheme != "https":
             return False
-        try:
-            # review finding: `.netloc` includes the port and preserves case — a genuine (if
-            # unusual) asset url like `https://uploads.linear.app:443/...` or a differently-cased
-            # host would compare unequal to the frozenset and get wrongly classified as
-            # non-native (safe direction — under-authenticates rather than over-authenticates —
-            # but still a real misclassification). `.hostname` is lowercased and port-stripped.
-            # It's a lazily-computed property that can ITSELF raise ValueError on some malformed
-            # inputs `urlparse()` alone doesn't catch — hence the same defensive try/except
-            # `_safe_urlparse` already applies to the initial parse.
-            hostname = parsed.hostname
-        except ValueError:
-            return False
-        return hostname in _LINEAR_ASSET_HOSTS
+        return parsed.hostname in _LINEAR_ASSET_HOSTS
 
     def fetch_attachment_bytes(self, url: str) -> bytes:
         """Read back an attachment's raw bytes — the READ half of ``native`` mode.
@@ -528,9 +551,10 @@ class LinearBackend:
         # process constructed — `urlopen` also understands `file:`/`ftp:`/`data:` schemes, so
         # without a scheme allowlist a `file:///etc/passwd`-shaped attachment url would read a
         # LOCAL file instead of fetching anything. Reject outright before any network/file call.
-        # Also review finding: urlparse() itself can raise ValueError on a malformed url (e.g.
-        # invalid IPv6-bracket syntax) — `_safe_urlparse` never raises, so THIS is where that
-        # gets converted into the same clean BackendError as any other refusal.
+        # Also review finding: urlparse() itself (invalid IPv6-bracket syntax) OR the lazy
+        # `.port` property (a malformed port) can raise ValueError on a malformed url —
+        # `_safe_urlparse` catches both and never raises, so THIS is where either kind gets
+        # converted into the same clean BackendError as any other refusal.
         if parsed is None:
             raise BackendError(f"linear: refusing to fetch attachment with an unparseable url {url!r}")
         if parsed.scheme not in ("http", "https"):

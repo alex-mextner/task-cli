@@ -124,6 +124,16 @@ def test_api_root_rejects_cleartext_nonloopback(monkeypatch):
         _api_root()
 
 
+def test_api_root_rejects_bracket_malformed_override_cleanly(monkeypatch):
+    # review finding (PR #90 round 5, k3): a bracket-malformed GITHUB_API_URL ("https://[bad")
+    # makes urlparse() itself raise a bare ValueError — the exact ambient-override scenario the
+    # http.py InvalidURL hardening was motivated by, but this module's own direct urlparse() call
+    # was unguarded and would crash raw instead of a clean BackendError.
+    monkeypatch.setenv("GITHUB_API_URL", "https://[bad/api/v3")
+    with pytest.raises(BackendError, match="not a valid url"):
+        _api_root()
+
+
 def test_issues_url_uses_api_root_override(monkeypatch):
     monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
     be = GitHubIssuesBackend(owner="o", repo="r", token="t")
@@ -917,6 +927,44 @@ def test_linear_attach_native_mode_upload_put_failure_raises_backend_error(monke
         be.attach("HYP-1", str(png))
 
 
+def test_linear_attach_native_mode_malformed_upload_url_raises_backend_error_not_raw_crash(monkeypatch, tmp_path):
+    # review finding (PR #90 round 5, Fable/k3): the signed uploadUrl in fileUpload's response is
+    # LINEAR'S OWN data, not something this process fully controls either — a bracket-malformed
+    # value ("https://[bad") used to crash _upload_and_attach with a raw ValueError from
+    # urllib.request.Request()'s own IPv6-bracket parsing, escaping past the HttpError-only
+    # except clause below (InvalidURL alone doesn't cover a construction-time ValueError).
+    # request_bytes now catches that ValueError at construction time and wraps it as a clean
+    # HttpError, so this surfaces as the same "upload PUT ... failed" BackendError as any other
+    # upload failure. Exercised through the REAL request_bytes (no monkeypatch) since the fix
+    # lives there, not in this backend.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"x")
+
+    be = LinearBackend(api_key="k", team_key="HYP", attachment_mode="native")
+    _linear_gql_stub(
+        monkeypatch,
+        be,
+        {
+            "issue(id": {"issue": {"id": "internal-1"}},
+            "fileUpload": {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "assetUrl": "https://uploads.linear.app/asset-1",
+                        "uploadUrl": "https://[bad",
+                        "headers": [],
+                    },
+                }
+            },
+        },
+    )
+    with pytest.raises(BackendError, match="upload PUT"):
+        be.attach("HYP-1", str(png))
+
+
 def test_linear_attach_native_mode_upload_put_ambiguous_failure_raises_ambiguous_backend_error(monkeypatch, tmp_path):
     # the connection-dropped-mid-read case (status already landed, bytes may have uploaded
     # server-side with nothing pointing at them since attachmentCreate never ran) must surface
@@ -1081,11 +1129,71 @@ def test_linear_fetch_attachment_bytes_handles_unparseable_url():
         be.fetch_attachment_bytes("https://[bad")
 
 
+def test_linear_is_native_attachment_url_rejects_invalid_port():
+    # review finding (PR #90, round 2): ".hostname" alone doesn't validate the port, so
+    # "https://uploads.linear.app:bad/asset" used to classify as a genuine native asset even
+    # though nothing could ever fetch it. Validating ".port" too (it raises ValueError on a
+    # non-numeric port, same as ".hostname" can) means a malformed authority is classified as an
+    # unconfirmed external link instead — reported, not attempted as a trusted native fetch.
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    assert be.is_native_attachment_url("https://uploads.linear.app:bad/asset") is False
+    assert be.is_native_attachment_url("https://uploads.linear.app:443/asset") is True  # a VALID port still passes
+
+
+def test_linear_fetch_attachment_bytes_reports_invalid_port_as_backend_error():
+    # review finding (PR #90): a malformed-port attachment url must fail CLEANLY as a
+    # BackendError, not crash `task read --save-attachments` with a raw traceback. With
+    # `_safe_urlparse` now validating `.port` eagerly (see test_safe_urlparse_returns_none_on_
+    # invalid_port above), this is caught at the very first validation step — before any network
+    # call is even attempted — same clean "unparseable url" refusal as any other malformed url.
+    from tasklib.backends import BackendError
+    from tasklib.backends.linear import LinearBackend
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    with pytest.raises(BackendError, match="unparseable"):
+        be.fetch_attachment_bytes("https://uploads.linear.app:bad/asset")
+
+
+def test_save_attachments_reports_malformed_port_url_as_skipped_not_crashed(tmp_path):
+    # full stack (PR #90): `task read --save-attachments` against a ticket whose attachment url
+    # has a malformed port must never crash the whole command — with the classification fix
+    # above, is_native_attachment_url now correctly says "not native", so cli._save_attachments
+    # reports it as a skipped/external link and moves on, rather than attempting (and failing) a
+    # fetch. Exercised through the REAL LinearBackend, not a fake, so a future change to either
+    # side of this boundary can't drift silently.
+    from tasklib.backends.linear import LinearBackend
+    from tasklib.cli import _save_attachments
+    from tasklib.model import Attachment, Ticket
+
+    be = LinearBackend(api_key="k", team_key="HYP")
+    ticket = Ticket(
+        attachments=[Attachment(id="1", title="shot.png", url="https://uploads.linear.app:bad/asset")]
+    )
+    lines = _save_attachments(be, ticket, str(tmp_path))
+    assert any("skipped" in ln for ln in lines)
+    assert not any("✗" in ln for ln in lines)  # not treated as a failed fetch attempt either
+    assert list(tmp_path.iterdir()) == []  # nothing was written
+
+
 def test_safe_urlparse_returns_none_on_malformed_url():
     from tasklib.backends.linear import _safe_urlparse
 
     assert _safe_urlparse("https://[bad") is None
     assert _safe_urlparse("https://uploads.linear.app/x") is not None
+
+
+def test_safe_urlparse_returns_none_on_invalid_port():
+    # review finding (PR #90, round 2): urlparse() itself only raises at PARSE time (the case
+    # above) — ".hostname"/".port" are LAZY properties that raise ValueError at ACCESS time, a
+    # syntactically well-formed url with a non-numeric port parses fine but is still unusable.
+    # Every caller must get "None" for this too, not just for the parse-time failure.
+    from tasklib.backends.linear import _safe_urlparse
+
+    assert _safe_urlparse("https://uploads.linear.app:bad/asset") is None
+    assert _safe_urlparse("https://uploads.linear.app:99999999/asset") is None  # out of range
+    assert _safe_urlparse("https://uploads.linear.app:443/asset") is not None  # a VALID port is fine
 
 
 @pytest.mark.parametrize("bad_scheme_url", ["file:///etc/passwd", "ftp://uploads.linear.app/x", "data:text/plain,hi"])

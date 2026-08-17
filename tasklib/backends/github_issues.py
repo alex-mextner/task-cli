@@ -32,13 +32,22 @@ def _api_root() -> str:
     Security invariant: the bearer token is attached to every request, so a non-loopback host
     MUST be https — otherwise an ambient ``GITHUB_API_URL`` could exfiltrate the token over
     cleartext or to a foreign server. A loopback host (a local mock/test harness) may be http.
+
+    review finding (PR #90 round 5): a bracket-malformed override (``GITHUB_API_URL=https://[bad``)
+    makes ``urlparse()`` itself raise ``ValueError`` — this is the exact ambient-override scenario
+    the ``http.request_json``/``request_bytes`` ``InvalidURL`` hardening was motivated by, but
+    those fixes only cover the request functions; this module's OWN direct ``urlparse()`` call was
+    still unguarded and would crash raw instead of a clean :class:`BackendError`.
     """
     root = os.environ.get("GITHUB_API_URL", _DEFAULT_API_ROOT).rstrip("/")
     if root == _DEFAULT_API_ROOT:
         return root
     from urllib.parse import urlparse
 
-    parsed = urlparse(root)
+    try:
+        parsed = urlparse(root)
+    except ValueError as exc:
+        raise BackendError(f"GITHUB_API_URL is not a valid url ({root!r}): {exc}") from exc
     host = (parsed.hostname or "").lower()
     is_loopback = host in ("localhost", "127.0.0.1", "::1")
     if parsed.scheme != "https" and not is_loopback:

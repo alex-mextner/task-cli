@@ -139,7 +139,104 @@ def test_request_json_still_raises_http_error_for_a_normal_4xx(monkeypatch):
     assert exc.value.status == 422
 
 
+def test_request_json_wraps_invalid_url_port_as_http_error(monkeypatch):
+    # review finding: request_bytes's InvalidURL fix (below) applies verbatim to request_json —
+    # a malformed authority (e.g. an ambient GITHUB_API_URL override with a bad port) raises the
+    # identical bare http.client.InvalidURL here too, escaping the HTTPError/URLError-only
+    # except clauses and crashing the caller instead of a clean BackendError. InvalidURL always
+    # fires BEFORE anything is sent (constructing/validating the request), so it's unambiguously
+    # safe to classify as a clean, retryable HttpError — unlike a failure raised from reading
+    # back a response, which is a materially harder classification problem intentionally left
+    # out of scope (see the docstring and the "left deliberately unhandled" test below).
+    def fake_urlopen(req, timeout=None):
+        raise http.client.InvalidURL("nonnumeric port: 'bad'")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(HttpError):
+        request_json("https://ghe.corp:bad/api/v3/repos/o/r/issues", method="POST")
+
+
+def test_request_json_wraps_construction_time_valueerror_as_http_error():
+    # review finding (round 5): a bracket-malformed authority ("https://[bad") makes
+    # urllib.request.Request() itself raise a bare ValueError at CONSTRUCTION time — a step
+    # earlier than the connect-time InvalidURL the test above covers. Left unguarded, this
+    # escapes raw before urlopen is even reached (no monkeypatch needed here: construction fails
+    # before any network call would happen, so this is a real, hermetic exercise of the actual
+    # bug, not a simulation of it).
+    with pytest.raises(HttpError):
+        request_json("https://[bad/api/v3/repos/o/r/issues", method="POST")
+
+
+def test_request_json_leaves_bad_status_line_unhandled_by_design(monkeypatch):
+    # scope-boundary regression guard (round 2 → round 3 review history): an EARLIER version of
+    # this fix widened the catch to the whole http.client.HTTPException family and tried to
+    # split it into "clean" (pre-send) vs "ambiguous" (post-send) buckets. Three independent
+    # reviewers then found that split itself was unsound — http.client.RemoteDisconnected is
+    # simultaneously an OSError (→ urllib wraps it into URLError, a "clean" bucket) AND a
+    # BadStatusLine (→ the "ambiguous" bucket), so which bucket it lands in depends on
+    # CPython/urllib internals, not on anything this module controls; a raw OSError escaping
+    # getresponse() has the identical problem. Rather than chase that classification into
+    # CPython version-sensitive territory, the scope was pulled back to ONLY the unambiguous
+    # InvalidURL case (see request_json's/request_bytes's docstrings). This test pins that
+    # BadStatusLine is a PRE-EXISTING, deliberately-untouched crash mode — not a silent
+    # regression — so a future change doesn't "fix" it by accidentally reopening the unsound
+    # split.
+    def fake_urlopen(req, timeout=None):
+        raise http.client.BadStatusLine("garbage status line")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(http.client.BadStatusLine):
+        request_json("https://api.github.com/repos/o/r/issues", method="POST")
+
+
 # ── request_bytes + the same-host redirect guard (credential-exfiltration hazard) ──────────
+
+
+def test_request_bytes_wraps_invalid_url_port_as_http_error(monkeypatch):
+    # review finding (PR #90, task-cli): a tracker-controlled attachment url like
+    # "https://uploads.linear.app:bad/asset" parses fine at urlparse()-time — `.hostname` doesn't
+    # validate the port — but http.client raises a BARE http.client.InvalidURL the moment it
+    # tries to actually open the connection. That's neither urllib.error.HTTPError nor URLError,
+    # so left uncaught it propagates past every caller's HttpError-only `except` clause (e.g.
+    # LinearBackend.fetch_attachment_bytes) and crashes the whole `task read --save-attachments`
+    # command instead of failing just the one malformed attachment. Must be wrapped in HttpError.
+    from tasklib.backends.http import request_bytes
+
+    def fake_urlopen(req, timeout=None):
+        raise http.client.InvalidURL("nonnumeric port: 'bad'")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(HttpError) as exc:
+        request_bytes("https://uploads.linear.app:bad/asset")
+    assert "invalid url" in str(exc.value).lower()
+
+
+def test_request_bytes_wraps_invalid_url_port_through_guarded_opener(monkeypatch):
+    # same fix, through the OTHER opener path (same_host_redirects_only=True) — this is the one
+    # LinearBackend.fetch_attachment_bytes actually uses for a native asset url (it always passes
+    # same_host_redirects_only=is_linear_asset), so the plain-opener test above alone wouldn't
+    # catch a fix that only patched one of the two call paths.
+    from tasklib.backends import http as http_mod
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise http.client.InvalidURL("nonnumeric port: 'bad'")
+
+    monkeypatch.setattr(http_mod, "_SAME_HOST_OPENER", _FakeOpener())
+    with pytest.raises(HttpError):
+        http_mod.request_bytes("https://uploads.linear.app:bad/asset", same_host_redirects_only=True)
+
+
+def test_request_bytes_wraps_construction_time_valueerror_as_http_error():
+    # review finding (round 5): same construction-time ValueError as request_json's counterpart
+    # test above, through request_bytes — this is the function LinearBackend._upload_and_attach
+    # calls with Linear's OWN (not fully trusted) signed uploadUrl, so this gap was live in
+    # exactly the case the InvalidURL docstring already called out as "the live case today".
+    # Hermetic: construction fails before urlopen is reached, no monkeypatch needed.
+    from tasklib.backends.http import request_bytes
+
+    with pytest.raises(HttpError):
+        request_bytes("https://[bad/asset")
 
 
 def test_request_bytes_returns_raw_body(monkeypatch):

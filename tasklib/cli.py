@@ -1732,6 +1732,13 @@ def cmd_gantt(args: argparse.Namespace) -> int:
     return 0
 
 
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{i}" for i in range(10)}
+    | {f"LPT{i}" for i in range(10)}
+)
+
+
 def _sanitize_attachment_basename(title: str) -> str:
     """Strip ``title`` (tracker-owned, untrusted data) down to a safe, bare filename component
     — no path traversal possible, on ANY platform, into ``--save-attachments DIR``.
@@ -1751,10 +1758,46 @@ def _sanitize_attachment_basename(title: str) -> str:
     raises ``ValueError`` (not ``OSError``) for it — a value ``_write_attachment_exclusive``'s
     caller specifically wasn't catching, so it would crash the command instead of being reported
     as one failed attachment.
+
+    Also strips ``:`` (review finding, 3rd round — Windows drive-prefix traversal): a title with
+    no slash at all, like ``"C:payload.py"``, survives the slash-stripping above untouched. On
+    Windows that's a DRIVE-RELATIVE path — ``ntpath.join("downloads", "C:payload.py")`` sees the
+    second component carries its own drive letter, decides the base ("downloads") doesn't apply,
+    and collapses to ``"C:payload.py"`` alone (relative to whatever the CURRENT directory on
+    drive C: happens to be), silently discarding the requested ``dest_dir``. Same hardcode-not-
+    platform-derived reasoning as the slash fix above: a colon is stripped unconditionally, not
+    only when ``sys.platform`` says Windows, since the malicious title could be read back on a
+    different platform than it was written on. This also incidentally neutralizes NTFS
+    Alternate-Data-Stream syntax (``"file.txt:hidden"``), a related colon-in-filename hazard.
+
+    Also strips TRAILING dots/spaces, and rejects Windows-reserved device basenames (review
+    finding, 4th round — same bug class, different corner): Windows silently drops trailing
+    ``.``/`` `` characters from each path component when a file is actually created, so
+    ``"shot.png"`` and ``"shot.png."`` are distinct strings to this sanitizer (and to
+    ``_unique_attachment_filenames``'s case-fold dedup) but the SAME file on that filesystem —
+    exactly the write-time ``FileExistsError`` the case-fold fix above was meant to head off,
+    just via a different normalization Windows applies. Trimmed here so both attachments land on
+    one deduped name instead of colliding at ``os.link()`` time. Separately, ``CON``, ``PRN``,
+    ``NUL``, ``COM1``-``COM9``, ``LPT1``-``LPT9`` etc. refer to a DEVICE on Windows regardless of
+    extension (``"CON.png"`` still means the CON device) — a title matching one is rejected the
+    same way ``"."``/``".."`` are, so the caller falls back to the attachment id instead of a
+    name that would fail to ever create a real file.
     """
-    stripped = title.replace("/", "_").replace("\\", "_").strip()
+    stripped = title.replace("/", "_").replace("\\", "_").replace(":", "_").strip()
     stripped = "".join(c for c in stripped if ord(c) >= 0x20 and c != "\x7f")
-    if stripped in ("", ".", ".."):
+    # review finding (on the fix itself): `stripped.rstrip(". ")` below means a title consisting
+    # ENTIRELY of dots/spaces (".", "..", "...", " . ", …) always collapses all the way to "" —
+    # so an explicit "." / ".." check here would be dead code; a bare emptiness check covers
+    # every one of those cases already.
+    stripped = stripped.rstrip(". ")
+    if stripped == "":
+        return ""
+    # review finding: `.split(".", 1)[0]` alone can still carry an INTERIOR trailing space —
+    # "CON .png" splits to "CON " (the space is inside the first component, not at the very end
+    # of `stripped`, so the `.rstrip(". ")` above never touches it) — but Windows strips
+    # trailing space/dot from EACH path component before the device-name comparison, so "CON
+    # .png" still resolves to the CON device on that filesystem. Re-strip the stem itself.
+    if stripped.split(".", 1)[0].rstrip(" .").upper() in _WINDOWS_RESERVED_BASENAMES:
         return ""
     return stripped
 
@@ -1778,13 +1821,35 @@ def _unique_attachment_filenames(attachments, existing: frozenset = frozenset())
     into the same "already taken" set, so a colliding title gets a ``-N`` suffix exactly like an
     in-batch collision, rather than reusing the exact target name.
 
+    Collision tracking is CASE-FOLDED, not exact-string (review finding, 4th round): two titles
+    like ``shot.png`` and ``SHOT.PNG`` are distinct Python strings, so an exact-string ``assigned``
+    set lets both through with their original names — fine on a case-sensitive filesystem, but on
+    a case-insensitive one (default macOS/Windows) the destination filesystem itself treats them
+    as the SAME file, and the second attachment's ``os.link()`` at write time fails with
+    ``FileExistsError`` even though this function reported it as a clean, unique name. Folding
+    every membership check through ``.casefold()`` (Unicode-correct case folding, not just
+    ``.lower()``) makes the in-memory reservation agree with what the filesystem will USUALLY
+    enforce, catching the common case here as a normal ``-N`` suffix bump instead of a write-time
+    failure. This is deliberately conservative even on a genuinely case-sensitive filesystem
+    (Linux ext4/btrfs): worst case, two titles differing only by case get suffixed apart when
+    they technically didn't have to.
+
+    NOT a complete model of every filesystem's equivalence relation, though (review finding on
+    the fix itself — this docstring previously overclaimed "never wrong"): ``.casefold()`` alone
+    doesn't cover, e.g., Unicode-normalization-equivalent names on macOS APFS/HFS+ (NFC vs NFD
+    forms of the same accented filename are the same file there, but distinct casefolded Python
+    strings) or German ``ß``/``ss`` folding differences from the filesystem's own table. The
+    write-time ``FileExistsError → reported failure`` path in ``_save_attachments`` (not this
+    function) is still the LAST-resort backstop for whatever slips past this best-effort
+    reservation — do not remove it as "made redundant" by this fix.
+
     Keyed by ``id()`` rather than the ``Attachment`` object itself: it's a plain (unfrozen)
     dataclass, so it's unhashable — this is only ever looked up against the SAME list within one
     ``_save_attachments`` call, so identity is a safe, cheap key.
     """
     import os
 
-    assigned: set[str] = set(existing)
+    assigned: set[str] = {name.casefold() for name in existing}
     names: dict = {}
     for a in attachments:
         # review finding: `a.id` is ALSO tracker-controlled data (the same trust boundary as
@@ -1794,10 +1859,10 @@ def _unique_attachment_filenames(attachments, existing: frozenset = frozenset())
         stem, ext = os.path.splitext(base)
         candidate = base
         n = 1
-        while candidate in assigned:
+        while candidate.casefold() in assigned:
             n += 1
             candidate = f"{stem}-{n}{ext}"
-        assigned.add(candidate)
+        assigned.add(candidate.casefold())
         names[id(a)] = candidate
     return names
 
