@@ -130,6 +130,258 @@ def test_load_history_duplicate_message_id_keeps_the_last_record(tmp_path):
     assert hist[42].text == "edited later"
 
 
+def test_load_history_cross_bot_collision_is_ambiguous_not_silently_overwritten(tmp_path):
+    # task-cli#62: message ids are only unique PER bot/chat. Two DIFFERENT bots' history files
+    # sharing the same message_id with DIFFERING content is a real collision, not a resend --
+    # merging into one dict keyed only by message_id used to let "whichever file sorts last" win,
+    # leaking one bot's private text under the other bot's id. The collision must be surfaced
+    # (dropped, resolves as "not found") rather than silently resolved to an arbitrary file.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [{"ts": 1000, "message_id": 42, "direction": "user", "from": "Alex", "text": "bot A private text", "pane": None}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.999.history.jsonl",
+        [{"ts": 1000, "message_id": 42, "direction": "user", "from": "Bob", "text": "bot B different text", "pane": None}],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 42 not in hist
+
+
+def test_load_history_identical_cross_file_content_is_not_ambiguous(tmp_path):
+    # if two files happen to carry the SAME content for a colliding id, there's nothing to lose
+    # by resolving it -- only a genuine content mismatch is ambiguous.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    record = {"ts": 1000, "message_id": 7, "direction": "user", "from": "Alex", "text": "same text", "pane": None}
+    _write_history(config_dir / "tg-ctl.100.history.jsonl", [record])
+    _write_history(config_dir / "tg-ctl.200.history.jsonl", [record])
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[7].text == "same text"
+
+
+def test_load_history_scopes_by_chat_id_within_a_single_bot_file(tmp_path):
+    # task-cli#62 review finding, round 2: one bot can serve MULTIPLE chats, so two DIFFERENT
+    # chats' messages can land in the SAME tg-ctl.<botId>.history.jsonl file and still collide on
+    # message_id (Telegram ids are unique per-CHAT, not per-bot). Scoping by file alone (the
+    # first fix) misses this; chat_id is the real boundary.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 42, "direction": "user", "from": "Alex", "text": "chat A text", "pane": None, "chat_id": 1},
+            {"ts": 1000, "message_id": 42, "direction": "user", "from": "Bob", "text": "chat B different text", "pane": None, "chat_id": 2},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 42 not in hist  # cross-chat collision within one file, surfaced as ambiguous
+
+
+def test_load_history_resolves_normally_when_chat_ids_differ_but_ids_dont_collide(tmp_path):
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 1, "direction": "user", "from": "Alex", "text": "chat A", "pane": None, "chat_id": 1},
+            {"ts": 1000, "message_id": 2, "direction": "user", "from": "Bob", "text": "chat B", "pane": None, "chat_id": 2},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[1].text == "chat A"
+    assert hist[2].text == "chat B"
+
+
+def test_load_history_identical_text_but_different_chat_id_is_still_ambiguous(tmp_path):
+    # Fable review finding: the "identical content is not ambiguous" carve-out compares FULL
+    # record equality, including chat_id -- two DIFFERENT chats can never be judged "identical"
+    # even with coincidentally-matching text, so this collision is still surfaced as ambiguous
+    # (the safer default for a privacy-sensitive local quote source, documented on load_history).
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 3, "direction": "user", "from": "Alex", "text": "same text", "pane": None, "chat_id": 1},
+            {"ts": 1000, "message_id": 3, "direction": "user", "from": "Alex", "text": "same text", "pane": None, "chat_id": 2},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 3 not in hist
+
+
+def test_load_history_resend_within_the_same_chat_id_keeps_the_last_record(tmp_path):
+    # same chat_id, same message_id appended twice (a resend/edit) -- must still resolve to the
+    # LAST record, not be flagged ambiguous (it's the SAME scope, not a collision).
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 9, "direction": "user", "from": "Alex", "text": "original", "pane": None, "chat_id": 1},
+            {"ts": 2000, "message_id": 9, "direction": "user", "from": "Alex", "text": "edited later", "pane": None, "chat_id": 1},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[9].text == "edited later"
+
+
+def test_load_history_same_chat_id_spanning_two_files_with_differing_content_is_ambiguous(tmp_path):
+    # Opus review finding: a chat scope can span MULTIPLE files (two bots both members of the
+    # same group both log it -- Telegram's message_id is chat-scoped, so this is the SAME real
+    # message). An earlier version tried to arbitrate "which file is right" via ts, which is
+    # fragile (clock skew, an edit whose ts doesn't strictly increase, two files agreeing on ts).
+    # Two independently-clocked writers disagreeing on content for the same (chat, message_id) is
+    # therefore ambiguous -- exactly like a cross-scope collision -- never resolved by guessing.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [{"ts": 2000, "message_id": 20, "direction": "user", "from": "Alex", "text": "version A", "pane": None, "chat_id": 1}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.200.history.jsonl",
+        [{"ts": 1000, "message_id": 20, "direction": "user", "from": "Alex", "text": "version B", "pane": None, "chat_id": 1}],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 20 not in hist
+
+
+def test_load_history_same_chat_id_spanning_two_files_with_identical_content_resolves(tmp_path):
+    # the harmless mirror case: two files agree exactly on the same (chat, message_id) -- no
+    # ambiguity, resolves normally.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    record = {"ts": 2000, "message_id": 21, "direction": "user", "from": "Alex", "text": "mirrored", "pane": None, "chat_id": 1}
+    _write_history(config_dir / "tg-ctl.100.history.jsonl", [record])
+    _write_history(config_dir / "tg-ctl.200.history.jsonl", [record])
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[21].text == "mirrored"
+
+
+def test_load_history_same_file_update_after_a_cross_file_duplicate_still_supersedes(tmp_path):
+    # Opus review finding: after file B contributes a harmless DUPLICATE of file A's value for a
+    # (chat, message_id), a LATER line in file B updating that same id must still be treated as
+    # "the same file continuing" (rule 1: outright supersede), not misclassified as yet another
+    # competing cross-file claim -- an earlier version left `origin` pointing at file A after the
+    # duplicate, which would have wrongly dropped this as ambiguous.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [{"ts": 1000, "message_id": 30, "direction": "user", "from": "Alex", "text": "X", "pane": None, "chat_id": 1}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.200.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 30, "direction": "user", "from": "Alex", "text": "X", "pane": None, "chat_id": 1},
+            {"ts": 2000, "message_id": 30, "direction": "user", "from": "Alex", "text": "Y (edited)", "pane": None, "chat_id": 1},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[30].text == "Y (edited)"
+
+
+def test_load_history_a_within_scope_drop_does_not_let_a_different_scope_resolve_unopposed(tmp_path):
+    # Opus review finding: a message_id ambiguous WITHIN one chat scope (two files disagreeing)
+    # must not then resolve unopposed via a completely DIFFERENT chat's still-surviving record
+    # for the same numeric id -- that would make the collision MORE permissive, not less, exactly
+    # the leak the whole ambiguity mechanism exists to prevent.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [{"ts": 1000, "message_id": 42, "direction": "user", "from": "Alex", "text": "chat 1, file A", "pane": None, "chat_id": 1}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.200.history.jsonl",
+        [{"ts": 1000, "message_id": 42, "direction": "user", "from": "Bob", "text": "chat 1, file B (conflict)", "pane": None, "chat_id": 1}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.300.history.jsonl",
+        [{"ts": 1000, "message_id": 42, "direction": "user", "from": "Carl", "text": "chat 2 (unrelated)", "pane": None, "chat_id": 2}],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 42 not in hist
+
+
+def test_load_history_a_resend_with_an_earlier_ts_still_wins_within_the_same_file(tmp_path):
+    # Opus review finding: an edit/resend within ONE file must supersede outright regardless of
+    # ts (e.g. an edit that preserves the original send time) -- ts is never consulted for a
+    # same-file update, only for distinguishing "same file continuing" from "a different file's
+    # competing claim".
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 5000, "message_id": 22, "direction": "user", "from": "Alex", "text": "original", "pane": None, "chat_id": 1},
+            {"ts": 1000, "message_id": 22, "direction": "user", "from": "Alex", "text": "edited (earlier ts)", "pane": None, "chat_id": 1},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[22].text == "edited (earlier ts)"
+
+
+def test_load_history_a_dropped_ambiguous_id_is_not_resurrected_by_a_third_scope(tmp_path):
+    # once an id is dropped as ambiguous, a THIRD scope re-supplying content matching the FIRST
+    # scope must not resurrect it -- ambiguity is sticky, not "whichever matched most recently".
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [{"ts": 1000, "message_id": 5, "direction": "user", "from": "Alex", "text": "first", "pane": None, "chat_id": 1}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.200.history.jsonl",
+        [{"ts": 1000, "message_id": 5, "direction": "user", "from": "Bob", "text": "second (different)", "pane": None, "chat_id": 2}],
+    )
+    _write_history(
+        config_dir / "tg-ctl.300.history.jsonl",
+        [{"ts": 1000, "message_id": 5, "direction": "user", "from": "Alex", "text": "first", "pane": None, "chat_id": 3}],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 5 not in hist
+
+
+def test_load_history_legacy_and_modern_rows_for_the_same_id_are_ambiguous_not_leaked(tmp_path):
+    # Codex/Fable review finding: a message straddling the chat_id upgrade (a legacy row with no
+    # chat_id, later resent/edited by a modern tg-cli that DOES attach chat_id) scopes to two
+    # DIFFERENT keys (("file", path) vs ("chat", id)) and can never compare equal even when it's
+    # genuinely the same conversation -- an ACCEPTED residual (documented on load_history): this
+    # transitional case degrades to "ambiguous / not found" rather than resolving, which is the
+    # deliberately safe direction (under-resolving, never leaking one chat's text as another's).
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    _write_history(
+        config_dir / "tg-ctl.100.history.jsonl",
+        [
+            {"ts": 1000, "message_id": 11, "direction": "user", "from": "Alex", "text": "legacy row", "pane": None},
+            {"ts": 2000, "message_id": 11, "direction": "user", "from": "Alex", "text": "modern resend", "pane": None, "chat_id": 1},
+        ],
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert 11 not in hist
+
+
+def test_load_history_a_malformed_chat_id_degrades_to_legacy_scoping_not_a_dropped_row(tmp_path):
+    # Opus review finding: chat_id is a scoping REFINEMENT, not a required field like message_id
+    # -- a malformed value (a stray string from some writer variant) must not discard an
+    # otherwise-valid row; it falls back to None (the legacy per-file scoping path) instead.
+    config_dir = tmp_path / ".config" / "tg-cli"
+    config_dir.mkdir(parents=True)
+    (config_dir / "tg-ctl.100.history.jsonl").write_text(
+        '{"ts": 1000, "message_id": 55, "direction": "user", "from": "Alex", "text": "ok", "pane": null, "chat_id": "not-an-int"}\n',
+        encoding="utf-8",
+    )
+    hist = load_history(env={"HOME": str(tmp_path)})
+    assert hist[55].text == "ok"
+    assert hist[55].chat_id is None
+
+
 def test_load_history_rejects_bool_ts_and_message_id(tmp_path):
     # bool is a subclass of int in Python — a malformed `"ts": true` / `"message_id": true`
     # line must not silently pass validation as 1/0.
