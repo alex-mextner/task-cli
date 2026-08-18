@@ -73,6 +73,26 @@ class Screenshot:
 
 
 @dataclass
+class Attachment:
+    """A backend-native attachment object read back from the tracker (Linear only, for now).
+
+    Distinct from :class:`Screenshot`: a ``Screenshot`` is what THIS process asked to attach
+    (a local ref or a hosted URL, part of the create/update request); an ``Attachment`` is what
+    the backend actually has recorded, fetched on read (``TicketBackend.get``/``search``/…) so
+    ``task read`` can show real durable proof instead of only the local ref embedded in the
+    body. ``url`` is the backend's asset/link URL — for a Linear "native" attachment this is a
+    ``uploads.linear.app`` asset URL, which requires the SAME ``Authorization`` header as any
+    other Linear GraphQL call to fetch (see ``backends/linear.py:fetch_attachment_bytes``); it is
+    NOT a bare public URL.
+    """
+
+    id: str
+    title: str
+    url: str
+    subtitle: str = ""
+
+
+@dataclass
 class Criterion:
     """One acceptance criterion: its text, whether it is checked, and the proof for the check.
 
@@ -154,6 +174,21 @@ class Ticket:
     # field directly rather than trusting the derived ``state`` for that one purpose. Never part
     # of the rendered body — operational metadata, not ticket content.
     provider_closed: bool = False
+
+    # Also appended last (same reasoning as ``due`` above). Backend-native attachment objects
+    # read back on ``get``/``list``/``search`` (Linear only, for now — see :class:`Attachment`).
+    # Read-only: populated by the backend, never sent back on ``create``/``update`` (attaching
+    # is its own op, ``TicketBackend.attach``), and never part of the rendered/parsed body — the
+    # body's ``## Screenshots`` section is the local-ref request, this is the tracker's own
+    # record of what actually landed there.
+    attachments: list[Attachment] = field(default_factory=list)
+
+    # Also appended last (same reasoning as ``due`` above). True when the backend's attachment
+    # connection reported more pages than :attr:`attachments` fetched (Linear caps at 250 items
+    # per request, not exhaustive cursor pagination — see backends/linear.py's `_ISSUE_FIELDS`
+    # comment). Lets a caller (``cli._save_attachments``) surface "there are more, not all were
+    # fetched" instead of silently presenting a partial list as the complete set.
+    attachments_truncated: bool = False
 
     def __post_init__(self) -> None:
         # Coerce plain-string criteria to unchecked Criterion objects. This keeps construction
