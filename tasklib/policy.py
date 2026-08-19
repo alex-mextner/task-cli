@@ -587,7 +587,7 @@ def _is_valid_link_key(key: str) -> bool:
     return bool(key.strip()) and _safe_display(key) == key and key == key.strip() and ":" not in key
 
 
-def _is_http_url(value: str) -> bool:
+def is_http_url(value: str) -> bool:
     """A Links value is valid iff it is an absolute http/https URL with a real host and no
     embedded credentials. Uses :func:`urllib.parse.urlparse` (not a regex) so an odd-but-real
     URL — query strings, ports — is accepted while a bare token is not: ``session:2`` parses to
@@ -651,7 +651,7 @@ def links_url_violation(ticket: Ticket, cfg: EnforceConfig) -> Violation | None:
     # by render._parse_links, so a key with a control/bidi escape (terminal injection into `task
     # read`) or an embedded `:` (breaks the round-trip) is rejected even when its value is a valid
     # URL (review finding). See :func:`_is_valid_link_key`.
-    bad = [(k, v) for k, v in ticket.links.items() if not _is_http_url(v) or not _is_valid_link_key(k)]
+    bad = [(k, v) for k, v in ticket.links.items() if not is_http_url(v) or not _is_valid_link_key(k)]
     if not bad:
         return None
     # Strip control/format chars from BOTH the key and the value before echoing them: the value
