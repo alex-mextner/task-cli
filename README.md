@@ -47,6 +47,10 @@ task gantt        [--all] [--json] # read-only due-date timeline (Gantt) — see
 task read <id>     (alias: view)   # the full ticket — every section (works outside a repo)
 task find "<query>"                # search title+body (cross-project when outside a repo)
 task check <id> <n|text> --proof p # tick an acceptance criterion (needs a visual proof)
+task mark-shipped <id> --pr <url> [--commit <sha>]  # record a merged PR; NEVER closes the
+#   ticket (the `gh ship` post-merge hook — see agent-tools' ci/ship/ship.sh) — moves
+#   TODO/IN_PROGRESS to in-review, posts a durable comment, and prints what's still needed
+#   before a genuine `task done`.
 task done <id>    [--screenshot p] # close a ticket — runs the on-done gates (all criteria checked)
 task change <id>  [--due ...] [--done]  # update; --due sets/clears the due date; --done closes (gates)
 task status <id> [<new-state>]     # read or transition state (works outside a repo)

@@ -7,7 +7,8 @@ filesystem (sidecar). All pure logic lives in the sibling modules (``model``/``r
 the backends) are lazy so ``task --help`` stays fast and dependency-light.
 
 Subcommands: create/new · list · gantt (read-only due-date timeline) · read/view · find · change
-· status · done · classify · session · daemon (the due-date reminder watcher: start/stop/status/run).
+· status · done · check · mark-shipped (the `gh ship` post-merge hook — records a merge,
+never closes) · classify · session · daemon (the due-date reminder watcher: start/stop/status/run).
 Global flags: --backend, --repo, --config, --json, --yes, and per-gate --skip-<gate>.
 """
 
@@ -16,10 +17,11 @@ from __future__ import annotations
 import argparse
 import html
 import os
+import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -212,6 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="check WITHOUT a visual proof, recording why one is impossible/impractical",
     )
 
+    # mark-shipped — the `gh ship` post-merge hook entry (agent-tools ci/ship/ship.sh)
+    msp = sub.add_parser(
+        "mark-shipped",
+        parents=[common],
+        help="record a merged PR against a ticket; NEVER closes it (prints acceptance instructions)",
+    )
+    msp.add_argument("id", help="ticket id (#123 or HYP-456)")
+    msp.add_argument("--pr", required=True, metavar="URL", help="the merged PR's URL")
+    msp.add_argument(
+        "--commit", metavar="SHA", help="merge commit SHA (used to derive a commit link when the PR URL is GitHub's)"
+    )
+
     # classify
     clp = sub.add_parser("classify", parents=[common], help="classify a message change|justAsk (the tg hook entry)")
     clp.add_argument("text", help="the message text")
@@ -255,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "done": cmd_done,
         "check": cmd_check,
+        "mark-shipped": cmd_mark_shipped,
         "classify": cmd_classify,
         "session": cmd_session,
         "install-skill": cmd_install_skill,
@@ -2330,6 +2345,365 @@ def _select_criterion(ticket: Ticket, selector: str) -> Criterion:
     if not matches:
         raise _UserError(f"no acceptance criterion matches {selector!r}; use an index (1..{len(crits)})")
     raise _UserError(f"{len(matches)} criteria match {selector!r}; use an index (1..{len(crits)}) to disambiguate")
+
+
+# ── mark-shipped (the `gh ship` post-merge hook) ────────────────────────────────────
+
+# A GitHub PR URL's PATH ("/owner/repo/pull/123", optionally followed by more path segments —
+# a sub-page like "/files" or "/commits") — the single source of truth for "is this a GitHub
+# PR, and which one" used by BOTH `_normalize_pr_url` (to canonicalize away a query string,
+# fragment, sub-page, or trailing slash — review finding: those variants used to survive
+# normalization untouched, comparing as a DIFFERENT PR from the clean form and dropping a
+# still-valid "Merge commit" link) and `_commit_url_from_pr` (to derive a commit link for the
+# same repo). Matched against the PATH ONLY (via `urlsplit`), never the raw URL string, so a
+# query/fragment can never smuggle extra characters past the pattern.
+_GITHUB_PR_PATH_RE = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?$")
+
+# A git commit SHA (short or full hex). Guards `--commit` before it's ever interpolated into
+# a Links URL — an unvalidated value (whitespace, a pasted message) would build a malformed
+# "Merge commit" link that then fails the links-url gate later, at close time (review finding:
+# the command would poison a gate it later enforces). Case-folded to lowercase by the caller
+# (`_parse_mark_shipped_flags`) so `ABC1234`/`abc1234` compare equal for idempotency (review
+# finding: git SHAs are case-insensitive hex, but an un-folded mixed-case retry derived a
+# different "Merge commit" URL and was treated as new work — a duplicate comment + TG ping).
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _commit_url_from_pr(pr_url: str, commit_sha: str) -> str | None:
+    """Derive a GitHub commit URL from a GitHub PR URL + SHA, or ``None`` when ``pr_url``
+    isn't a recognizable GitHub PR URL (a different forge, or no SHA) — the caller then
+    records the bare SHA in the comment text only, never as a Links entry (which requires
+    an http(s) URL, see ``policy.links_url_violation``). ``pr_url`` is assumed already
+    normalized (:func:`_normalize_pr_url`) and ``commit_sha`` already shape-validated and
+    lowercased by the caller (:data:`_COMMIT_SHA_RE`)."""
+    if not commit_sha:
+        return None
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(pr_url)
+    if parts.netloc.lower() != "github.com":
+        return None
+    m = _GITHUB_PR_PATH_RE.match(parts.path)
+    if not m:
+        return None
+    owner, repo, _number = m.groups()
+    return f"https://github.com/{owner}/{repo}/commit/{commit_sha}"
+
+
+def _shipped_comment(ticket_id: str, pr_url: str, commit_sha: str, *, already_closed: bool) -> str:
+    """The durable backend comment recorded on a shipped ticket — the point of it is to make
+    the merge visible on the tracker itself (not just in task-cli's own state). For a ticket
+    that's already Done, the "this does NOT close" framing would be actively misleading (it's
+    already closed), so that ticket gets a plain reference note instead."""
+    lines = [f"Shipped: merged via {pr_url}."]
+    if commit_sha:
+        lines.append(f"Merge commit: {commit_sha}")
+    if already_closed:
+        lines.append("The ticket is already Done — recorded here for reference.")
+    else:
+        lines.append(
+            "This does NOT close the ticket — acceptance still needs proof. "
+            f"Run `task read {ticket_id}` for the outstanding criteria, then `task check`/`task done`."
+        )
+    return "\n".join(lines)
+
+
+def _acceptance_instructions(ticket: Ticket) -> list[str]:
+    """The human-readable checklist printed after `mark-shipped`: what still stands between
+    this merge and a genuine `task done` (strict-ticket-discipline rules 2/3 — a close needs
+    every criterion CHECKED with a visual proof; a merge alone proves nothing about that).
+
+    A ticket that's already Done gets a one-line reference note instead — printing "acceptance
+    needed" advice about a ticket that is, by definition, already accepted would be nonsense.
+    """
+    if ticket.state is State.DONE:
+        return [_dim(f"{ticket.id} is already Done — this merge was recorded for reference only.")]
+    unchecked = ticket.unchecked_criteria()
+    if not unchecked:
+        return [_dim(f"all acceptance criteria are already checked — if the other close gates pass, run `task done {ticket.id}`.")]
+    lines = [_warn(f"acceptance needed before this can be marked Done ({len(unchecked)} unchecked):")]
+    lines.extend(_dim(f"  [{i}] {c.text}") for i, c in enumerate(ticket.acceptance, start=1) if not c.checked)
+    if ticket.is_ui:
+        lines.append(_dim("  this ticket is UI-labeled — each criterion needs a visual proof (screenshot/recording), not just a passing test."))
+    lines.append(_dim(f'  next: task check {ticket.id} <N> --proof <path>   (or --force "<reason>" if a proof is genuinely impossible)'))
+    lines.append(_dim(f"  then: task done {ticket.id}"))
+    return lines
+
+
+def _record_shipped_pr(
+    backend, ticket: Ticket, pr_url: str, commit_sha: str, commit_url: str | None, existing_pr: str | None
+) -> tuple[Ticket, bool]:
+    """Post the shipped comment, persist the PR link (+ derived commit link), and move
+    TODO/IN_PROGRESS to IN_REVIEW. Returns ``(updated_ticket, moved_to_review)``.
+
+    Every OTHER state but DONE (IN_REVIEW/CANCELLED — CANCELLED is filtered out by the caller
+    before this runs) is left untouched for the transition itself — a merge is exactly the
+    kind of event a reviewer should look at, but it must never force-march a ticket already
+    past that point.
+
+    The comment is posted BEFORE the ticket is persisted (not after — a review finding on an
+    earlier version): if `update()` fails after a successful `comment()`, a retry cleanly
+    redoes both (one duplicate comment, which is recoverable) rather than the ordering used
+    originally, where a comment failing AFTER a successful update left `already_recorded` true
+    on retry and the comment was silently lost forever — worse, because it is the durable,
+    tracker-visible half of what this command promises. `validate_transition` runs BEFORE even
+    that comment (review finding): it's pure and free, so any future state it could reject
+    should fail closed before an irreversible side effect, not after one.
+
+    Builds a NEW ticket via `dataclasses.replace` instead of mutating ``ticket`` in place
+    (review finding): some backends' `get()` can hand back a live, shared object (the
+    in-memory FakeBackend does, to round-trip through render/parse like a real one) — mutating
+    it BEFORE `update()` actually persists would let a failed `update()` still leave the
+    in-memory object looking "already recorded", masking the very failure the comment-first
+    ordering above exists to survive.
+
+    ``existing_pr`` is the ticket's CURRENT normalized PR link (or ``None``), passed in by the
+    caller — which already computed it for the idempotency check — rather than recomputed here
+    (review finding: two call sites deriving the same fact from the same ticket is a needless
+    second source of truth).
+    """
+    from .backends import BackendError
+
+    moved_to_review = ticket.state in (State.TODO, State.IN_PROGRESS)
+    if moved_to_review:
+        validate_transition(ticket.state, State.IN_REVIEW)
+
+    already_closed = ticket.state is State.DONE
+    try:
+        backend.comment(ticket.id, _shipped_comment(ticket.id, pr_url, commit_sha, already_closed=already_closed))
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    new_links = dict(ticket.links)
+    pr_changed = existing_pr != pr_url
+    new_links["PR"] = pr_url
+    if commit_url:
+        new_links["Merge commit"] = commit_url
+    elif pr_changed:
+        # The PR is being REPLACED (a different PR than whatever was recorded before) and this
+        # call carries no fresh commit link — drop the stale one rather than leaving a "Merge
+        # commit" link that now points at the OLD PR's commit while "PR" points at the new one
+        # (review finding: a silently mismatched pair is worse than no link at all).
+        new_links.pop("Merge commit", None)
+    to_persist = replace(ticket, links=new_links, state=State.IN_REVIEW if moved_to_review else ticket.state)
+    try:
+        updated = backend.update(to_persist)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+    return updated, moved_to_review
+
+
+def _normalize_pr_url(pr_url: str) -> str:
+    """Canonicalize a PR URL for storage/comparison (review finding). Without this,
+    `https://github.com/a/b/pull/1`, `https://GitHub.com/a/b/pull/1/`,
+    `.../pull/1?diff=split`, and `.../pull/1/files` all compare as DIFFERENT PRs — defeating
+    idempotency, and worse, making `_record_shipped_pr` think the PR was REPLACED and drop a
+    still-valid "Merge commit" link (see its `pr_changed` handling).
+
+    For a GitHub PR URL (matched via `_GITHUB_PR_PATH_RE` against the PATH only), collapses
+    ENTIRELY to the exact canonical form `https://github.com/<owner>/<repo>/pull/<n>` —
+    dropping any query string, fragment, sub-page path, or trailing slash, and lowercasing the
+    host (the owner/repo PATH segments are left exactly as given; those ARE meaningfully
+    cased). For any other URL, only the scheme+host are lowercased and a trailing slash is
+    stripped — a lighter touch, since this command doesn't know that forge's URL grammar.
+
+    Applied to BOTH the freshly-validated `--pr` value (in `_parse_mark_shipped_flags`) AND
+    whatever is already stored in `ticket.links["PR"]` (via `_stored_pr_url` below) — a review
+    finding on an earlier version normalized only the former, so a value written out-of-band,
+    by an older version, or by a hand-edit (a documented, tested scenario — see
+    `test_mark_shipped_transitions_even_when_the_pr_link_was_set_out_of_band`) still compared
+    raw and could trip the same false-replace hazard this function exists to close."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(pr_url)
+    scheme, netloc = parts.scheme.lower(), parts.netloc.lower()
+    if netloc == "github.com":
+        m = _GITHUB_PR_PATH_RE.match(parts.path)
+        if m:
+            owner, repo, number = m.groups()
+            return f"{scheme}://github.com/{owner}/{repo}/pull/{number}"
+    normalized = parts._replace(scheme=scheme, netloc=netloc, path=parts.path.rstrip("/") or "/")
+    return urlunsplit(normalized)
+
+
+def _stored_pr_url(ticket: Ticket) -> str | None:
+    """The ticket's currently-recorded PR link, normalized — or ``None`` if it has none. The
+    single read point both `cmd_mark_shipped`'s idempotency/replace check and
+    `_record_shipped_pr`'s stale-commit-link check use, so they can never compare a raw stored
+    value against a normalized incoming one (see `_normalize_pr_url`'s docstring)."""
+    raw = ticket.links.get("PR")
+    return _normalize_pr_url(raw) if raw else None
+
+
+def _parse_mark_shipped_flags(args: argparse.Namespace) -> tuple[str, str]:
+    """Validate ``--pr``/``--commit`` up front, before any backend call.
+
+    Validating AFTER ``backend.get()`` reports the wrong error ("unknown ticket" instead of
+    "bad --pr") on a typo'd id + a bad flag together (review finding). An unvalidated value
+    would also poison the Links section with a non-URL entry that only fails later, at close
+    time, via ``policy.links_url_violation`` — this command must not create a violation it
+    later enforces.
+    """
+    pr_url = (args.pr or "").strip()
+    if not pr_url:
+        raise _UserError("--pr is required and must not be empty")
+    from .policy import is_http_url
+
+    if not is_http_url(pr_url):
+        raise _UserError(f"--pr must be a full http(s) URL (got {args.pr!r})")
+    pr_url = _normalize_pr_url(pr_url)
+    commit_sha = (args.commit or "").strip()
+    if commit_sha and not _COMMIT_SHA_RE.match(commit_sha):
+        raise _UserError(f"--commit must be a 7-40 character hex commit SHA (got {args.commit!r})")
+    return pr_url, commit_sha.lower()
+
+
+def _print_mark_shipped_cancelled(ticket: Ticket, as_json: bool) -> None:
+    """Output for the CANCELLED short-circuit — kept `--json`-aware (review finding: the
+    original version printed free human text and exited 0 regardless of `--json`, breaking a
+    scripted caller piping the output through a JSON parser)."""
+    if as_json:
+        import json
+
+        print(
+            json.dumps(
+                {"id": ticket.id, "url": ticket.url, "state": ticket.state.value, "recorded": False, "reason": "cancelled"},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    print(_warn(f"{ticket.id} is cancelled — not recording (a cancelled ticket is a deliberate dead end)."))
+
+
+def _print_mark_shipped_result(
+    updated: Ticket,
+    pr_url: str,
+    *,
+    already_recorded: bool,
+    moved_to_review: bool,
+    replaced_pr: str | None,
+    as_json: bool,
+    instructions: list[str],
+) -> None:
+    """The human/`--json` output for `mark-shipped` — split out of the command purely to keep
+    the command itself under the file's function-length target."""
+    if as_json:
+        import json
+
+        print(
+            json.dumps(
+                {
+                    "id": updated.id,
+                    "url": updated.url,
+                    "state": updated.state.value,
+                    "pr": pr_url,
+                    "already_recorded": already_recorded,
+                    "moved_to_review": moved_to_review,
+                    "replaced_pr": replaced_pr,
+                    "commit_url": updated.links.get("Merge commit"),
+                    "unchecked_criteria": [c.text for c in updated.unchecked_criteria()],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    if replaced_pr:
+        print(
+            _warn(
+                f"{updated.id} already had a different PR recorded ({replaced_pr}) — replaced with "
+                f"{pr_url} (a ticket shipped via more than one PR, e.g. a revert-and-reland, keeps "
+                "only the latest in Links; earlier ones remain visible in the comment history)."
+            )
+        )
+    if already_recorded:
+        note = " (already recorded)"
+    elif moved_to_review:
+        note = f" → state {updated.state.value}"
+    else:
+        # Recorded (link/comment), but the ticket was already past TODO/IN_PROGRESS, so no
+        # transition actually happened — the arrow would otherwise imply a move that didn't
+        # occur (review finding).
+        note = f" (state stays {updated.state.value})"
+    print(_ok(f"{updated.id} shipped — {pr_url}{note}"))
+    for line in instructions:
+        print(line)
+
+
+def cmd_mark_shipped(args: argparse.Namespace) -> int:
+    """Record a merged PR against a ticket — the `gh ship` post-merge hook entry point
+    (agent-tools ci/ship/ship.sh calls this so a ticket tracks its merge instead of drifting
+    out of sync, and so the merge surfaces acceptance instructions instead of the ticket
+    silently going quiet).
+
+    Deliberately NEVER closes the ticket: only PROPER acceptance (every criterion checked
+    with a visual proof — see `strict-ticket-discipline` rules 2/3) may set it Done. This
+    command only records the merge (a Links entry + a durable backend comment), nudges
+    TODO/IN_PROGRESS to IN_REVIEW, and prints what's still needed to close it for real. A
+    CANCELLED ticket is a deliberate dead end (mirrors `transitions.py`) and is skipped
+    entirely — no link, no comment, no notify.
+    """
+    pr_url, commit_sha = _parse_mark_shipped_flags(args)
+    cfg = _load(args)
+
+    backend = _backend_for_id(cfg, args.id)
+    from .backends import BackendError
+
+    try:
+        ticket = backend.get(args.id)
+    except BackendError as exc:
+        raise _UserError(str(exc)) from exc
+
+    if ticket.state is State.CANCELLED:
+        _print_mark_shipped_cancelled(ticket, args.json)
+        return 0
+
+    commit_url = _commit_url_from_pr(pr_url, commit_sha) if commit_sha else None
+    # Idempotency keys on the PR URL, when a commit was given whether its derived link is
+    # already recorded, AND the ticket already being past TODO/IN_PROGRESS:
+    #   - the commit clause: a review finding on an earlier version keyed on the PR URL alone,
+    #     so a RETRY that arrives with a commit SHA the first call didn't have would be silently
+    #     treated as already-recorded and never backfill the commit link. This is a
+    #     manual-recovery path (a human re-running the command after seeing a ship.sh WARNING)
+    #     — not something ship.sh's own single call triggers, since it resolves the PR url and
+    #     merge SHA together in one pass. NOTE: a backfill re-posts the FULL "Shipped" comment
+    #     and re-notifies (it re-runs `_record_shipped_pr` in full) rather than posting a
+    #     targeted "Merge commit: …" addendum — an accepted trade-off for a rare, human-triggered
+    #     path; not worth the extra state needed to special-case a comment-only patch.
+    #   - the state clause (review finding): without it, a ticket whose Links["PR"] was set
+    #     OUT-OF-BAND (not by this command — e.g. hand-edited, or reverted with `task status
+    #     ... todo --force` after a prior mark-shipped) would never actually transition to
+    #     IN_REVIEW even though it's still sitting in TODO/IN_PROGRESS — "already recorded"
+    #     would be true for the link, but the command's other promise (nudge toward review)
+    #     would silently never happen.
+    # Known residual gap (tracked, not fixed here — see #93): this key is still a proxy for
+    # "did mark-shipped actually run", not a dedicated marker — a crash in the narrow window
+    # AFTER a successful update() but BEFORE the TG notify below would leave `already_recorded`
+    # true on any retry and the notification permanently skipped (the durable link + comment
+    # survive either way, so the impact is a missed best-effort ping, not a lost record).
+    existing_pr = _stored_pr_url(ticket)
+    already_recorded = (
+        existing_pr == pr_url
+        and (commit_url is None or ticket.links.get("Merge commit") == commit_url)
+        and ticket.state not in (State.TODO, State.IN_PROGRESS)
+    )
+    if already_recorded:
+        updated, moved_to_review = ticket, False
+    else:
+        updated, moved_to_review = _record_shipped_pr(backend, ticket, pr_url, commit_sha, commit_url, existing_pr)
+        _record_session_touch(cfg, updated)
+        from .logging import log_event
+
+        log_event("ticket.shipped", ticket_id=updated.id, pr=pr_url, commit=commit_sha, moved_to_review=moved_to_review)
+        _notify_mutation(cfg, updated, "shipped")
+
+    replaced_pr = existing_pr if (existing_pr and existing_pr != pr_url) else None
+    _print_mark_shipped_result(
+        updated, pr_url, already_recorded=already_recorded, moved_to_review=moved_to_review,
+        replaced_pr=replaced_pr, as_json=args.json, instructions=_acceptance_instructions(updated),
+    )
+    return 0
 
 
 def cmd_classify(args: argparse.Namespace) -> int:
